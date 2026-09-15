@@ -48,3 +48,46 @@ fn low_cardinality_singletons_use_bitslices_and_high_cardinality_stay_postings()
         assert_eq!(stats.pages_touched, 0);
     }
 }
+
+#[test]
+fn sparse_pair_keyspaces_use_flat_postings() {
+    let d = tempfile::tempdir().unwrap();
+    let rows = 50_003usize;
+    let cards = vec![1_000_000u64, 1_000_000u64];
+    let mut data = Vec::with_capacity(rows * 2);
+    for r in 0..rows {
+        data.push(((r * 7919 + 17) % 1_000_000) as u32);
+        data.push(((r * 104729 + r / 7 + 31) % 1_000_000) as u32);
+    }
+
+    let cfg = BuildConfig {
+        columns: 2,
+        page_rows: 257,
+        cardinalities: cards,
+        hierarchies: vec![],
+        max_sort_records: 127,
+    };
+    build_u32_batches(vec![data], d.path(), &cfg).unwrap();
+    let manifest = add_exact_hierarchies(
+        d.path(),
+        &[HierarchySpec { columns: vec![0, 1] }],
+        113,
+    )
+    .unwrap();
+
+    assert_eq!(manifest.hierarchies.len(), 1);
+    assert_eq!(manifest.hierarchies[0].kind, "flatpost");
+
+    let engine = Engine::open(d.path()).unwrap();
+    for source in [0usize, 1, 777, 12_345, 49_999, rows - 1] {
+        let q = [
+            Predicate { column: 0, value: ((source * 7919 + 17) % 1_000_000) as u64 },
+            Predicate { column: 1, value: ((source * 104729 + source / 7 + 31) % 1_000_000) as u64 },
+        ];
+        let exact = engine.scan(&q);
+        let stats = engine.query(&q);
+        assert_eq!(stats.hits, exact.hits);
+        assert_eq!(stats.rows_checked, 0);
+        assert_eq!(stats.pages_touched, 0);
+    }
+}
