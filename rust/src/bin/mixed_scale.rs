@@ -31,24 +31,26 @@ fn recursive_bytes(path: &Path) -> u64 {
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
             if let Ok(meta) = entry.metadata() {
-                if meta.is_dir() {
-                    sum += recursive_bytes(&entry.path());
-                } else {
-                    sum += meta.len();
-                }
+                if meta.is_dir() { sum += recursive_bytes(&entry.path()); } else { sum += meta.len(); }
             }
         }
     }
     sum
 }
 
+fn rss_kb(field: &str) -> Option<u64> {
+    let text = fs::read_to_string("/proc/self/status").ok()?;
+    text.lines()
+        .find(|line| line.starts_with(field))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 fn percentile(mut values: Vec<f64>, p: f64) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    if values.is_empty() {
-        0.0
-    } else {
-        values[((values.len() - 1) as f64 * p).round() as usize]
-    }
+    if values.is_empty() { 0.0 } else { values[((values.len() - 1) as f64 * p).round() as usize] }
 }
 
 fn main() {
@@ -100,17 +102,12 @@ fn main() {
         let columns = patterns[i % patterns.len()];
         let q: Vec<_> = columns
             .iter()
-            .map(|&column| Predicate {
-                column,
-                value: value(source, column) as u64,
-            })
+            .map(|&column| Predicate { column, value: value(source, column) as u64 })
             .collect();
         let q0 = Instant::now();
         let result = engine.query(&q);
         latency.push(q0.elapsed().as_secs_f64() * 1000.0);
-        if i < 10 {
-            exact_ok += (result.hits == engine.scan(&q).hits) as usize;
-        }
+        if i < 10 { exact_ok += (result.hits == engine.scan(&q).hits) as usize; }
         assert_eq!(result.rows_checked, 0, "adaptive exact query touched canonical rows");
     }
 
@@ -133,6 +130,8 @@ fn main() {
             "index_amplification": (total_bytes - canonical_bytes) as f64 / canonical_bytes.max(1) as f64,
             "median_query_ms": percentile(latency.clone(), 0.50),
             "p95_query_ms": percentile(latency, 0.95),
+            "rss_kb": rss_kb("VmRSS:").unwrap_or(0),
+            "hwm_kb": rss_kb("VmHWM:").unwrap_or(0),
             "exact": format!("{exact_ok}/10")
         })
     );
