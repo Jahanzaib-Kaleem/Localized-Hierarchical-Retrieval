@@ -49,6 +49,16 @@ jobs:
             cargo run --release --bin scale -- 250000 50000 40 64 "$profile" | tee -a sweep.jsonl
           done
           cat sweep.jsonl >> "$GITHUB_STEP_SUMMARY"
+      - name: Sparse exact hierarchy graph sweep
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          : > graph-sweep.jsonl
+          for profile in graph7 graph12 graph16 exactpairs; do
+            cargo run --release --bin scale -- 1000000 100000 120 512 "$profile" | tee -a graph-sweep.jsonl
+          done
+          cat graph-sweep.jsonl >> "$GITHUB_STEP_SUMMARY"
       - name: 5M-row exact-pair stress benchmark under 1 GiB ceiling
         working-directory: rust
         shell: bash
@@ -60,8 +70,6 @@ jobs:
         working-directory: rust
         shell: bash
         run: |
-          # mmap reserves address space proportional to on-disk indexes, so RLIMIT_AS is not a
-          # meaningful proxy for a 1 GiB physical-RAM VPS at this scale. Gate measured peak RSS.
           cargo run --release --bin scale -- 10000000 100000 20 1024 exactpairs | tee benchmark-10m.json
           cat benchmark-10m.json >> "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY'
