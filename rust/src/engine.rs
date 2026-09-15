@@ -16,6 +16,7 @@ struct LoadedHierarchy { columns: Vec<usize>, data: Hierarchy }
 struct LoadedSegment { first_page: u32, data: Segment }
 
 pub struct Engine {
+    rows: u64,
     page_rows: usize,
     pages: u32,
     columns: usize,
@@ -42,7 +43,7 @@ impl Engine {
             }
             segments.push(LoadedSegment { first_page: s.first_page, data });
         }
-        Ok(Self { page_rows: m.page_rows, pages: m.pages, columns: m.columns, card: m.cardinalities, hier, segments })
+        Ok(Self { rows: m.rows, page_rows: m.page_rows, pages: m.pages, columns: m.columns, card: m.cardinalities, hier, segments })
     }
 
     fn query_map(&self, predicates: &[Predicate]) -> HashMap<usize, u64> {
@@ -97,6 +98,16 @@ impl Engine {
             }
         }
         stats
+    }
+
+    pub fn scan(&self, predicates: &[Predicate]) -> QueryStats {
+        if predicates.iter().any(|p| p.column >= self.columns || self.card.get(p.column).map_or(true, |&k| p.value >= k)) {
+            return QueryStats::default();
+        }
+        let pred: Vec<_> = predicates.iter().map(|x| (x.column, x.value)).collect();
+        let mut hits = 0u64;
+        for s in &self.segments { hits += s.data.count_page(0, s.data.rows(), &pred); }
+        QueryStats { hits, rows_checked: self.rows, pages_touched: self.pages as u64, hierarchy_lookups: 0 }
     }
 
     pub fn query_count(&self, predicates: &[Predicate]) -> (u64, u64) {
