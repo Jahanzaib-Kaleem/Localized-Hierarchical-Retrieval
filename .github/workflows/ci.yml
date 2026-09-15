@@ -56,10 +56,17 @@ jobs:
           ulimit -v 1048576
           cargo run --release --bin scale -- 5000000 100000 40 512 exactpairs | tee benchmark-5m.json
           cat benchmark-5m.json >> "$GITHUB_STEP_SUMMARY"
-      - name: 10M-row exact-pair stress benchmark under 1 GiB ceiling
+      - name: 10M-row exact-pair stress benchmark with 1 GiB RSS gate
         working-directory: rust
         shell: bash
         run: |
-          ulimit -v 1048576
+          # mmap reserves address space proportional to on-disk indexes, so RLIMIT_AS is not a
+          # meaningful proxy for a 1 GiB physical-RAM VPS at this scale. Gate measured peak RSS.
           cargo run --release --bin scale -- 10000000 100000 20 1024 exactpairs | tee benchmark-10m.json
           cat benchmark-10m.json >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json
+          d=json.load(open('benchmark-10m.json'))
+          assert d['exact']=='10/10', d
+          assert d['hwm_kb'] < 1048576, d
+          PY
