@@ -1,5 +1,7 @@
-use crate::{external::external_sort, manifest::{HierarchyMeta, Manifest, SegmentMeta}, Segment};
+use crate::{bitmap::BitmapHierarchy, external::external_sort, manifest::{HierarchyMeta, Manifest, SegmentMeta}, Segment};
 use std::{fs::{self, File}, io::{self, BufWriter, Write}, path::{Path, PathBuf}};
+
+const MAX_AUTO_BITMAP_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct HierarchySpec { pub columns: Vec<usize> }
@@ -16,6 +18,10 @@ pub struct BuildConfig {
 fn write_record<W: Write>(w: &mut W, key: u64, page: u32) -> io::Result<()> {
     w.write_all(&key.to_le_bytes())?;
     w.write_all(&page.to_le_bytes())
+}
+
+fn keyspace(spec: &HierarchySpec, card: &[u64]) -> io::Result<u64> {
+    spec.columns.iter().try_fold(1u64, |acc, &c| acc.checked_mul(card[c]).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hierarchy keyspace overflow")))
 }
 
 fn page_keys(page: &[u8], columns: usize, spec: &HierarchySpec, card: &[u64]) -> io::Result<Vec<u64>> {
@@ -97,10 +103,22 @@ where I: IntoIterator<Item = Vec<u8>> {
 
     let mut hierarchies = Vec::new();
     for (i, spec) in cfg.hierarchies.iter().enumerate() {
-        let file = format!("h{i:04}.bin");
-        let entries = external_sort(&spool_paths[i], routing.join(&file), cfg.max_sort_records)?;
+        let sparse_tmp = routing.join(format!("h{i:04}.sparse.tmp"));
+        let entries = external_sort(&spool_paths[i], &sparse_tmp, cfg.max_sort_records)?;
         let _ = fs::remove_file(&spool_paths[i]);
-        hierarchies.push(HierarchyMeta { file, columns: spec.columns.clone(), entries });
+        let space = keyspace(spec, &cfg.cardinalities)?;
+        let sparse_bytes = entries.saturating_mul(12);
+        let bitmap_bytes = BitmapHierarchy::estimated_bytes(space, page_id).unwrap_or(u64::MAX);
+        if bitmap_bytes < sparse_bytes && bitmap_bytes <= MAX_AUTO_BITMAP_BYTES {
+            let file = format!("h{i:04}.bit");
+            BitmapHierarchy::build_from_sparse(&sparse_tmp, routing.join(&file), space, page_id)?;
+            fs::remove_file(&sparse_tmp)?;
+            hierarchies.push(HierarchyMeta { file, columns: spec.columns.clone(), entries, kind: "bitmap".into(), keyspace: space });
+        } else {
+            let file = format!("h{i:04}.bin");
+            fs::rename(&sparse_tmp, routing.join(&file))?;
+            hierarchies.push(HierarchyMeta { file, columns: spec.columns.clone(), entries, kind: "sparse".into(), keyspace: space });
+        }
     }
 
     let manifest = Manifest { format: "LHR/1".into(), rows: row_start, columns: cfg.columns, page_rows: cfg.page_rows, pages: page_id, cardinalities: cfg.cardinalities.clone(), segments, hierarchies };
