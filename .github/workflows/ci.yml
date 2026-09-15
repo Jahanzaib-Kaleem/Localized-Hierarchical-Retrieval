@@ -1,0 +1,30 @@
+name: LHR CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test Rust engine
+        working-directory: rust
+        run: cargo test --release
+      - name: Compile release engine under 1 GiB virtual-memory ceiling
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          cargo test --release
