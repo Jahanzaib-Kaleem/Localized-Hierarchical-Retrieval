@@ -8,11 +8,17 @@ pub struct SegmentMeta {
     pub first_page: u32,
 }
 
+fn default_sparse() -> String { "sparse".into() }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HierarchyMeta {
     pub file: String,
     pub columns: Vec<usize>,
     pub entries: u64,
+    #[serde(default = "default_sparse")]
+    pub kind: String,
+    #[serde(default)]
+    pub keyspace: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
