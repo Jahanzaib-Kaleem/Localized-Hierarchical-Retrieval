@@ -1,5 +1,6 @@
 use lhr::{
-    add_exact_hierarchies, build_u8_batches, BuildConfig, Engine, HierarchySpec, Predicate,
+    add_exact_hierarchies, build_u32_batches, build_u8_batches, BuildConfig, Engine,
+    HierarchySpec, Predicate,
 };
 
 fn exact_count(rows: &[u8], cols: usize, q: &[Predicate]) -> u64 {
@@ -145,6 +146,48 @@ fn all_pair_postings_are_exact_and_skip_canonical_verification() {
         let (ids, id_stats) = engine.query_row_ids(&q, 31);
         assert_eq!(id_stats.rows_checked, 0);
         assert_eq!(ids, expected.iter().copied().take(31).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn u32_tokens_above_255_roundtrip_and_query_exactly() {
+    let d = tempfile::tempdir().unwrap();
+    let cards = vec![100_000u64, 70_000, 50_000];
+    let cols = cards.len();
+    let n = 12_007usize;
+    let mut rows = Vec::with_capacity(n * cols);
+    for r in 0..n {
+        rows.push(((r * 997 + 31) % cards[0] as usize) as u32);
+        rows.push(((r * 271 + r / 11 + 509) % cards[1] as usize) as u32);
+        rows.push(((r * 37 + r / 7 + 1009) % cards[2] as usize) as u32);
+    }
+    let cfg = BuildConfig {
+        columns: cols,
+        page_rows: 193,
+        cardinalities: cards,
+        hierarchies: vec![HierarchySpec { columns: vec![0] }],
+        max_sort_records: 53,
+    };
+    build_u32_batches(
+        vec![rows[..3333 * cols].to_vec(), rows[3333 * cols..].to_vec()],
+        d.path(),
+        &cfg,
+    )
+    .unwrap();
+    let engine = Engine::open(d.path()).unwrap();
+    for r in [0usize, 1, 3332, 3333, 9001, n - 1] {
+        let q = [
+            Predicate { column: 0, value: rows[r * cols] as u64 },
+            Predicate { column: 1, value: rows[r * cols + 1] as u64 },
+        ];
+        let expected = rows
+            .chunks_exact(cols)
+            .filter(|row| row[0] as u64 == q[0].value && row[1] as u64 == q[1].value)
+            .count() as u64;
+        assert_eq!(engine.query(&q).hits, expected);
+        let fetched = engine.row(r as u64).unwrap();
+        assert_eq!(fetched[0], rows[r * cols] as u64);
+        assert_eq!(fetched[1], rows[r * cols + 1] as u64);
     }
 }
 
