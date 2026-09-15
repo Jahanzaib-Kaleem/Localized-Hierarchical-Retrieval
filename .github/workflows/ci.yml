@@ -19,7 +19,7 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,5 +37,15 @@ jobs:
         shell: bash
         run: |
           ulimit -v 1048576
-          cargo run --release --bin scale -- 1000000 100000 100 | tee benchmark.json
+          cargo run --release --bin scale -- 1000000 100000 100 512 | tee benchmark.json
           cat benchmark.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Page-size storage/latency sweep
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          : > sweep.jsonl
+          for page in 64 128 256 512 1024; do
+            cargo run --release --bin scale -- 250000 50000 40 "$page" | tee -a sweep.jsonl
+          done
+          cat sweep.jsonl >> "$GITHUB_STEP_SUMMARY"
