@@ -45,6 +45,20 @@ jobs:
           assert d['exact']=='10/10', d
           assert d['median_pct_touched']==0.0 and d['p95_pct_touched']==0.0, d
           PY
+      - name: Topology-aware Hybrid-7 1M benchmark
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          cargo run --release --bin topology -- 1000000 2 | tee topology-1m.json
+          cat topology-1m.json >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json
+          d=json.load(open('topology-1m.json'))
+          assert d['exact']=='24/24', d
+          assert 'w2_direct_pair' in d['routes'], d
+          assert 'w2_singleton_only' in d['routes'], d
+          PY
       - name: Packed Hybrid comparison sweep
         working-directory: rust
         shell: bash
@@ -67,4 +81,17 @@ jobs:
           assert d['exact']=='10/10', d
           assert d['median_pct_touched']==0.0 and d['p95_pct_touched']==0.0, d
           assert d['hwm_kb'] < 1048576, d
+          PY
+      - name: Topology-aware Hybrid-7 10M benchmark
+        working-directory: rust
+        shell: bash
+        run: |
+          cargo run --release --bin topology -- 10000000 1 | tee topology-10m.json
+          cat topology-10m.json >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json
+          d=json.load(open('topology-10m.json'))
+          assert d['exact']=='24/24', d
+          assert 'w2_direct_pair' in d['routes'], d
+          assert 'w2_singleton_only' in d['routes'], d
           PY
