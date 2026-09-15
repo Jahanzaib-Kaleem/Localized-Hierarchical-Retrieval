@@ -17,15 +17,6 @@ fn make_batch(start: u64, rows: usize) -> Vec<u8> {
     out
 }
 
-fn exact_count(total: u64, q: &[Predicate]) -> u64 {
-    let mut n = 0u64;
-    'row: for r in 0..total {
-        for p in q { if value(r, p.column) as u64 != p.value { continue 'row; } }
-        n += 1;
-    }
-    n
-}
-
 fn recursive_bytes(path: &Path) -> u64 {
     let mut sum = 0u64;
     if let Ok(rd) = fs::read_dir(path) {
@@ -52,19 +43,20 @@ fn main() {
     let rows: u64 = args.get(1).and_then(|x| x.parse().ok()).unwrap_or(1_000_000);
     let batch_rows: usize = args.get(2).and_then(|x| x.parse().ok()).unwrap_or(100_000);
     let queries: usize = args.get(3).and_then(|x| x.parse().ok()).unwrap_or(200);
-    let root = args.get(4).map(PathBuf::from).unwrap_or_else(|| env::temp_dir().join(format!("lhr-rust-scale-{}", std::process::id())));
+    let page_rows: usize = args.get(4).and_then(|x| x.parse().ok()).unwrap_or(512);
+    let root = args.get(5).map(PathBuf::from).unwrap_or_else(|| env::temp_dir().join(format!("lhr-rust-scale-{}", std::process::id())));
     let _ = fs::remove_dir_all(&root); fs::create_dir_all(&root).unwrap();
 
     let mut hierarchies = Vec::new();
     for a in 0..CARDS.len() { for b in a+1..CARDS.len() { hierarchies.push(HierarchySpec { columns: vec![a,b] }); } }
     for cols in [[0,1,2],[0,3,4],[1,3,5],[2,4,6],[3,5,7],[0,6,7],[1,4,7],[2,5,6]] { hierarchies.push(HierarchySpec { columns: cols.to_vec() }); }
-    let cfg = BuildConfig { columns: CARDS.len(), page_rows: 512, cardinalities: CARDS.to_vec(), hierarchies, max_sort_records: 250_000 };
+    let cfg = BuildConfig { columns: CARDS.len(), page_rows, cardinalities: CARDS.to_vec(), hierarchies, max_sort_records: 250_000 };
 
     let batches = (0..rows).step_by(batch_rows).map(|start| make_batch(start, ((rows-start).min(batch_rows as u64)) as usize));
     let t = Instant::now(); let manifest = build_u8_batches(batches, &root, &cfg).expect("build dataset"); let build_s = t.elapsed().as_secs_f64();
     let engine = Engine::open(&root).expect("open dataset");
 
-    let mut latency_ms = Vec::with_capacity(queries); let mut touched = Vec::with_capacity(queries); let mut pages = Vec::with_capacity(queries); let mut exact_ok = 0usize;
+    let mut latency_ms = Vec::with_capacity(queries); let mut touched = Vec::with_capacity(queries); let mut pages = Vec::with_capacity(queries); let mut scan_ms = Vec::new(); let mut exact_ok = 0usize;
     for i in 0..queries {
         let source = (i as u64 * 7919 + 104729) % rows.max(1);
         let width = 2 + i % 4;
@@ -74,15 +66,17 @@ fn main() {
             if q.iter().any(|p: &Predicate| p.column == c) { continue; }
             q.push(Predicate { column: c, value: value(source, c) as u64 });
         }
-        let q0 = Instant::now(); let s = engine.query(&q); latency_ms.push(q0.elapsed().as_secs_f64()*1000.0); touched.push(s.rows_checked as f64); pages.push(s.pages_touched as f64);
-        if i < 10 { exact_ok += (s.hits == exact_count(rows, &q)) as usize; }
+        let q0 = Instant::now(); let routed = engine.query(&q); latency_ms.push(q0.elapsed().as_secs_f64()*1000.0); touched.push(routed.rows_checked as f64); pages.push(routed.pages_touched as f64);
+        if i < 10 {
+            let s0 = Instant::now(); let scanned = engine.scan(&q); scan_ms.push(s0.elapsed().as_secs_f64()*1000.0);
+            exact_ok += (routed.hits == scanned.hits) as usize;
+        }
     }
 
     let total_bytes = recursive_bytes(&root); let canonical_bytes: u64 = manifest.segments.iter().map(|s| fs::metadata(root.join("canonical").join(&s.file)).unwrap().len()).sum();
-    let med_ms = percentile(latency_ms.clone(), 0.50); let p95_ms = percentile(latency_ms, 0.95);
-    let med_touch = percentile(touched.clone(), 0.50); let p95_touch = percentile(touched, 0.95);
-    let med_pages = percentile(pages, 0.50);
-    println!("{{\"rows\":{},\"pages\":{},\"hierarchies\":{},\"build_s\":{:.3},\"disk_mb\":{:.3},\"canonical_mb\":{:.3},\"index_amplification\":{:.3},\"median_query_ms\":{:.4},\"p95_query_ms\":{:.4},\"median_rows_touched\":{},\"median_pct_touched\":{:.6},\"p95_pct_touched\":{:.6},\"median_pages_touched\":{},\"rss_kb\":{},\"hwm_kb\":{},\"exact\":\"{}/10\"}}",
-        rows, manifest.pages, manifest.hierarchies.len(), build_s, total_bytes as f64/1e6, canonical_bytes as f64/1e6, (total_bytes-canonical_bytes) as f64/canonical_bytes.max(1) as f64,
-        med_ms, p95_ms, med_touch as u64, 100.0*med_touch/rows.max(1) as f64, 100.0*p95_touch/rows.max(1) as f64, med_pages as u64, rss_kb("VmRSS:").unwrap_or(0), rss_kb("VmHWM:").unwrap_or(0), exact_ok);
+    let med_ms = percentile(latency_ms.clone(), 0.50); let p95_ms = percentile(latency_ms, 0.95); let med_scan_ms = percentile(scan_ms, 0.50);
+    let med_touch = percentile(touched.clone(), 0.50); let p95_touch = percentile(touched, 0.95); let med_pages = percentile(pages, 0.50);
+    println!("{{\"rows\":{},\"page_rows\":{},\"pages\":{},\"hierarchies\":{},\"build_s\":{:.3},\"disk_mb\":{:.3},\"canonical_mb\":{:.3},\"index_amplification\":{:.3},\"median_query_ms\":{:.4},\"p95_query_ms\":{:.4},\"median_scan_ms\":{:.4},\"median_speedup_vs_scan\":{:.3},\"median_rows_touched\":{},\"median_pct_touched\":{:.6},\"p95_pct_touched\":{:.6},\"median_pages_touched\":{},\"rss_kb\":{},\"hwm_kb\":{},\"exact\":\"{}/10\"}}",
+        rows, page_rows, manifest.pages, manifest.hierarchies.len(), build_s, total_bytes as f64/1e6, canonical_bytes as f64/1e6, (total_bytes-canonical_bytes) as f64/canonical_bytes.max(1) as f64,
+        med_ms, p95_ms, med_scan_ms, if med_ms > 0.0 { med_scan_ms/med_ms } else { 0.0 }, med_touch as u64, 100.0*med_touch/rows.max(1) as f64, 100.0*p95_touch/rows.max(1) as f64, med_pages as u64, rss_kb("VmRSS:").unwrap_or(0), rss_kb("VmHWM:").unwrap_or(0), exact_ok);
 }
