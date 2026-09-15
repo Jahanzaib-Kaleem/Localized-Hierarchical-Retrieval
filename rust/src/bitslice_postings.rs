@@ -14,27 +14,15 @@ fn read_record<R: Read>(r: &mut R) -> io::Result<Option<(u64, u32)>> {
     while got < b.len() {
         match r.read(&mut b[got..])? {
             0 if got == 0 => return Ok(None),
-            0 => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated bit-slice source",
-                ))
-            }
+            0 => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated bit-slice source")),
             n => got += n,
         }
     }
-    Ok(Some((
-        u64::from_le_bytes(b[..8].try_into().unwrap()),
-        u32::from_le_bytes(b[8..].try_into().unwrap()),
-    )))
+    Ok(Some((u64::from_le_bytes(b[..8].try_into().unwrap()), u32::from_le_bytes(b[8..].try_into().unwrap()))))
 }
 
 fn bits_for_keyspace(keyspace: u64) -> u32 {
-    if keyspace <= 1 {
-        0
-    } else {
-        64 - (keyspace - 1).leading_zeros()
-    }
+    if keyspace <= 1 { 0 } else { 64 - (keyspace - 1).leading_zeros() }
 }
 
 pub struct BitSlicePostingHierarchy {
@@ -49,9 +37,7 @@ pub struct BitSlicePostingHierarchy {
 
 impl BitSlicePostingHierarchy {
     pub fn estimated_bytes(keyspace: u64, rows: u64) -> Option<u64> {
-        if keyspace == 0 || rows > u32::MAX as u64 {
-            return None;
-        }
+        if keyspace == 0 || rows > u32::MAX as u64 { return None; }
         let bits = bits_for_keyspace(keyspace) as u64;
         let words = rows.checked_add(63)? / 64;
         (HEADER as u64)
@@ -59,31 +45,17 @@ impl BitSlicePostingHierarchy {
             .checked_add(bits.checked_mul(words)?.checked_mul(8)?)
     }
 
-    pub fn build_from_sorted(
-        sorted: impl AsRef<Path>,
-        output: impl AsRef<Path>,
-        keyspace: u64,
-        rows: u64,
-    ) -> io::Result<()> {
-        let bytes = Self::estimated_bytes(keyspace, rows).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid bit-slice dimensions")
-        })?;
+    pub fn build_from_sorted(sorted: impl AsRef<Path>, output: impl AsRef<Path>, keyspace: u64, rows: u64) -> io::Result<()> {
+        let bytes = Self::estimated_bytes(keyspace, rows).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid bit-slice dimensions"))?;
         let rows_u32 = rows as u32;
         let bits = bits_for_keyspace(keyspace) as usize;
         let words = (rows as usize + 63) / 64;
         let counts = HEADER;
         let body = counts
-            .checked_add((keyspace as usize).checked_mul(4).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "bit-slice count overflow")
-            })?)
+            .checked_add((keyspace as usize).checked_mul(4).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bit-slice count overflow"))?)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bit-slice offset overflow"))?;
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(output)?;
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(output)?;
         file.set_len(bytes)?;
         let mut map = unsafe { MmapMut::map_mut(&file)? };
         map.fill(0);
@@ -100,10 +72,7 @@ impl BitSlicePostingHierarchy {
         let mut seen = 0u64;
         while let Some((key, row)) = read_record(&mut reader)? {
             if key >= keyspace || row as u64 >= rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "bit-slice record outside declared dimensions",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "bit-slice record outside declared dimensions"));
             }
             counts_mem[key as usize] = counts_mem[key as usize]
                 .checked_add(1)
@@ -111,9 +80,7 @@ impl BitSlicePostingHierarchy {
             let word = row as usize / 64;
             let row_bit = row as usize % 64;
             for bit in 0..bits {
-                if (key >> bit) & 1 == 0 {
-                    continue;
-                }
+                if (key >> bit) & 1 == 0 { continue; }
                 let off = body + (bit * words + word) * 8;
                 let mut value = u64::from_le_bytes(map[off..off + 8].try_into().unwrap());
                 value |= 1u64 << row_bit;
@@ -122,10 +89,7 @@ impl BitSlicePostingHierarchy {
             seen += 1;
         }
         if seen != rows {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bit-slice source row count mismatch",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bit-slice source row count mismatch"));
         }
         for (key, count) in counts_mem.into_iter().enumerate() {
             let off = counts + key * 4;
@@ -138,10 +102,7 @@ impl BitSlicePostingHierarchy {
         let file = File::open(path)?;
         let map = unsafe { Mmap::map(&file)? };
         if map.len() < HEADER || &map[..8] != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid bit-slice header",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid bit-slice header"));
         }
         let keyspace = u64::from_le_bytes(map[8..16].try_into().unwrap());
         let rows = u32::from_le_bytes(map[16..20].try_into().unwrap());
@@ -151,8 +112,7 @@ impl BitSlicePostingHierarchy {
         let body = u64::from_le_bytes(map[40..48].try_into().unwrap()) as usize;
         let words = (rows as usize + 63) / 64;
         let expected = Self::estimated_bytes(keyspace, rows as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid bit-slice layout"))?
-            as usize;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid bit-slice layout"))? as usize;
         if keyspace == 0
             || bits != bits_for_keyspace(keyspace) as usize
             || words_u64 != words as u64
@@ -160,20 +120,9 @@ impl BitSlicePostingHierarchy {
             || body != HEADER + keyspace as usize * 4
             || map.len() != expected
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bit-slice layout mismatch",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bit-slice layout mismatch"));
         }
-        Ok(Self {
-            map,
-            keyspace,
-            rows,
-            bits,
-            words,
-            counts,
-            body,
-        })
+        Ok(Self { map, keyspace, rows, bits, words, counts, body })
     }
 
     fn count_at(&self, key: u64) -> usize {
@@ -195,42 +144,21 @@ impl BitSlicePostingHierarchy {
     }
 
     fn equality_word(&self, key: u64, word: usize) -> u64 {
-        if key >= self.keyspace || word >= self.words {
-            return 0;
-        }
+        if key >= self.keyspace || word >= self.words { return 0; }
         let mut out = u64::MAX;
         for bit in 0..self.bits {
             let plane = self.plane_word(bit, word);
-            if (key >> bit) & 1 != 0 {
-                out &= plane;
-            } else {
-                out &= !plane;
-            }
+            if (key >> bit) & 1 != 0 { out &= plane; } else { out &= !plane; }
         }
         out & self.last_mask(word)
     }
 
-    fn matches_row(&self, key: u64, row: u32) -> bool {
-        if key >= self.keyspace || row >= self.rows {
-            return false;
-        }
-        let word = row as usize / 64;
-        let bit = row as usize % 64;
-        self.equality_word(key, word) & (1u64 << bit) != 0
-    }
-
     pub fn row_count(&self, key: u64) -> usize {
-        if key >= self.keyspace {
-            0
-        } else {
-            self.count_at(key)
-        }
+        if key >= self.keyspace { 0 } else { self.count_at(key) }
     }
 
     pub fn rows(&self, key: u64) -> Vec<u32> {
-        if key >= self.keyspace {
-            return Vec::new();
-        }
+        if key >= self.keyspace { return Vec::new(); }
         let mut out = Vec::with_capacity(self.count_at(key));
         for word in 0..self.words {
             let mut mask = self.equality_word(key, word);
@@ -244,26 +172,26 @@ impl BitSlicePostingHierarchy {
     }
 
     pub fn intersect_rows(&self, key: u64, seed: &[u32]) -> Vec<u32> {
-        if key >= self.keyspace || seed.is_empty() {
-            return Vec::new();
+        if key >= self.keyspace || seed.is_empty() { return Vec::new(); }
+        let mut out = Vec::with_capacity(seed.len().min(self.count_at(key)));
+        let mut cached_word = usize::MAX;
+        let mut cached_mask = 0u64;
+        for &row in seed {
+            if row >= self.rows { continue; }
+            let word = row as usize / 64;
+            if word != cached_word {
+                cached_word = word;
+                cached_mask = self.equality_word(key, word);
+            }
+            if cached_mask & (1u64 << (row as usize % 64)) != 0 {
+                out.push(row);
+            }
         }
-        seed.iter()
-            .copied()
-            .filter(|&row| self.matches_row(key, row))
-            .collect()
+        out
     }
 
-    pub fn intersect_hierarchy(
-        &self,
-        key: u64,
-        other: &BitSlicePostingHierarchy,
-        other_key: u64,
-    ) -> Vec<u32> {
-        if key >= self.keyspace
-            || other_key >= other.keyspace
-            || self.rows != other.rows
-            || self.words != other.words
-        {
+    pub fn intersect_hierarchy(&self, key: u64, other: &BitSlicePostingHierarchy, other_key: u64) -> Vec<u32> {
+        if key >= self.keyspace || other_key >= other.keyspace || self.rows != other.rows || self.words != other.words {
             return Vec::new();
         }
         let capacity = self.count_at(key).min(other.count_at(other_key));
@@ -303,6 +231,7 @@ mod tests {
         assert_eq!(x.rows(1), vec![1, 4]);
         assert_eq!(x.rows(2), vec![2, 5]);
         assert_eq!(x.intersect_rows(1, &[0, 1, 2, 4, 5]), vec![1, 4]);
+        assert_eq!(x.intersect_rows(1, &[4, 1, 5]), vec![4, 1]);
 
         let source2 = d.path().join("sorted2");
         let output2 = d.path().join("bits2");
