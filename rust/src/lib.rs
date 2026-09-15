@@ -1,5 +1,6 @@
 pub mod bitmap;
 pub mod builder;
+pub mod delta_postings;
 pub mod dense_postings;
 pub mod engine;
 pub mod exact;
@@ -14,6 +15,7 @@ pub mod segment;
 
 pub use bitmap::BitmapHierarchy;
 pub use builder::{build_u32_batches, build_u8_batches, BuildConfig, HierarchySpec};
+pub use delta_postings::DeltaPostingHierarchy;
 pub use dense_postings::DensePostingHierarchy;
 pub use engine::{Engine, Predicate, QueryStats};
 pub use exact::add_exact_hierarchies;
