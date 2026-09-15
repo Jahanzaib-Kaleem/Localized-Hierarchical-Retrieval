@@ -1,0 +1,72 @@
+name: LHR CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test Rust engine
+        working-directory: rust
+        run: cargo test --release
+      - name: Test release engine under 1 GiB virtual-memory ceiling
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          cargo test --release
+      - name: End-to-end 1M-row exact-pair benchmark under 1 GiB ceiling
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          cargo run --release --bin scale -- 1000000 100000 100 512 exactpairs | tee benchmark.json
+          cat benchmark.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Routing strategy sweep
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          : > sweep.jsonl
+          for profile in pairs selected all3 exactpairs hybrid; do
+            cargo run --release --bin scale -- 250000 50000 40 64 "$profile" | tee -a sweep.jsonl
+          done
+          cat sweep.jsonl >> "$GITHUB_STEP_SUMMARY"
+      - name: 5M-row exact-pair stress benchmark under 1 GiB ceiling
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          cargo run --release --bin scale -- 5000000 100000 40 512 exactpairs | tee benchmark-5m.json
+          cat benchmark-5m.json >> "$GITHUB_STEP_SUMMARY"
+      - name: 10M-row exact-pair stress benchmark with 1 GiB RSS gate
+        working-directory: rust
+        shell: bash
+        run: |
+          # mmap reserves address space proportional to on-disk indexes, so RLIMIT_AS is not a
+          # meaningful proxy for a 1 GiB physical-RAM VPS at this scale. Gate measured peak RSS.
+          cargo run --release --bin scale -- 10000000 100000 20 1024 exactpairs | tee benchmark-10m.json
+          cat benchmark-10m.json >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json
+          d=json.load(open('benchmark-10m.json'))
+          assert d['exact']=='10/10', d
+          assert d['hwm_kb'] < 1048576, d
+          PY

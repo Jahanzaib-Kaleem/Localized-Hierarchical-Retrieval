@@ -1,0 +1,3 @@
+use lhr::Hierarchy;
+use std::{env,time::Instant};
+fn main(){let args:Vec<String>=env::args().collect();if args.len()<3{eprintln!("usage: bench <hierarchy.bin> <key> [iterations]");std::process::exit(2)}let h=Hierarchy::open(&args[1]).expect("open hierarchy");let key:u64=args[2].parse().unwrap();let n:usize=args.get(3).and_then(|x|x.parse().ok()).unwrap_or(10000);let t=Instant::now();let mut pages=0usize;for _ in 0..n{pages+=h.pages(key).len()}let elapsed=t.elapsed();println!("records={} iterations={} returned_pages={} total_us={} ns_per_lookup={:.1}",h.len(),n,pages,elapsed.as_micros(),elapsed.as_nanos() as f64/n as f64);}
