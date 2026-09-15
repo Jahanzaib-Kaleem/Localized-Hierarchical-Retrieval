@@ -27,9 +27,7 @@ fn value(row: u64, col: usize) -> u32 {
 fn make_batch(start: u64, rows: usize) -> Vec<u32> {
     let mut out = Vec::with_capacity(rows * CARDS.len());
     for row in start..start + rows as u64 {
-        for col in 0..CARDS.len() {
-            out.push(value(row, col));
-        }
+        for col in 0..CARDS.len() { out.push(value(row, col)); }
     }
     out
 }
@@ -48,12 +46,7 @@ fn recursive_bytes(path: &Path) -> u64 {
 
 fn rss_kb(field: &str) -> Option<u64> {
     let text = fs::read_to_string("/proc/self/status").ok()?;
-    text.lines()
-        .find(|line| line.starts_with(field))?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+    text.lines().find(|line| line.starts_with(field))?.split_whitespace().nth(1)?.parse().ok()
 }
 
 fn percentile(mut values: Vec<f64>, p: f64) -> f64 {
@@ -68,30 +61,23 @@ fn main() {
     let root = env::temp_dir().join(format!("lhr-mixed-scale-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
 
-    let cfg = BuildConfig {
-        columns: CARDS.len(),
-        page_rows: 1024,
-        cardinalities: CARDS.to_vec(),
-        hierarchies: vec![],
-        max_sort_records: 250_000,
-    };
-    let batches = (0..rows).step_by(100_000).map(|start| {
-        make_batch(start, ((rows - start).min(100_000)) as usize)
-    });
+    let cfg = BuildConfig { columns: CARDS.len(), page_rows: 1024, cardinalities: CARDS.to_vec(), hierarchies: vec![], max_sort_records: 250_000 };
+    let batches = (0..rows).step_by(100_000).map(|start| make_batch(start, ((rows - start).min(100_000)) as usize));
     let start = Instant::now();
     build_u32_batches(batches, &root, &cfg).expect("build mixed dataset");
-    let specs: Vec<_> = (0..CARDS.len())
-        .map(|column| HierarchySpec { columns: vec![column] })
-        .collect();
-    let manifest = add_exact_hierarchies(&root, &specs, 250_000)
-        .expect("build adaptive exact indexes");
+    let specs: Vec<_> = (0..CARDS.len()).map(|column| HierarchySpec { columns: vec![column] }).collect();
+    let manifest = add_exact_hierarchies(&root, &specs, 250_000).expect("build adaptive exact indexes");
     let build_s = start.elapsed().as_secs_f64();
     let engine = Engine::open(&root).expect("open mixed dataset");
 
     let mut kinds = serde_json::Map::new();
+    let mut index_mb = serde_json::Map::new();
     for h in &manifest.hierarchies {
         if h.columns.len() == 1 {
-            kinds.insert(h.columns[0].to_string(), json!(h.kind));
+            let name = h.columns[0].to_string();
+            kinds.insert(name.clone(), json!(h.kind));
+            let bytes = fs::metadata(root.join("routing").join(&h.file)).unwrap().len();
+            index_mb.insert(name, json!(bytes as f64 / 1e6));
         }
     }
 
@@ -102,10 +88,7 @@ fn main() {
     for i in 0..queries {
         let source = (i as u64 * 104729 + 7919) % rows.max(1);
         let (pattern_name, columns) = PATTERNS[i % PATTERNS.len()];
-        let q: Vec<_> = columns
-            .iter()
-            .map(|&column| Predicate { column, value: value(source, column) as u64 })
-            .collect();
+        let q: Vec<_> = columns.iter().map(|&column| Predicate { column, value: value(source, column) as u64 }).collect();
         let q0 = Instant::now();
         let result = engine.query(&q);
         let ms = q0.elapsed().as_secs_f64() * 1000.0;
@@ -129,28 +112,22 @@ fn main() {
     }
 
     let total_bytes = recursive_bytes(&root);
-    let canonical_bytes: u64 = manifest
-        .segments
-        .iter()
-        .map(|s| fs::metadata(root.join("canonical").join(&s.file)).unwrap().len())
-        .sum();
-    println!(
-        "{}",
-        json!({
-            "rows": rows,
-            "columns": CARDS.len(),
-            "cards": CARDS,
-            "kinds": kinds,
-            "patterns": patterns,
-            "build_s": build_s,
-            "disk_mb": total_bytes as f64 / 1e6,
-            "canonical_mb": canonical_bytes as f64 / 1e6,
-            "index_amplification": (total_bytes - canonical_bytes) as f64 / canonical_bytes.max(1) as f64,
-            "median_query_ms": percentile(latency.clone(), 0.50),
-            "p95_query_ms": percentile(latency, 0.95),
-            "rss_kb": rss_kb("VmRSS:").unwrap_or(0),
-            "hwm_kb": rss_kb("VmHWM:").unwrap_or(0),
-            "exact": format!("{exact_ok}/10")
-        })
-    );
+    let canonical_bytes: u64 = manifest.segments.iter().map(|s| fs::metadata(root.join("canonical").join(&s.file)).unwrap().len()).sum();
+    println!("{}", json!({
+        "rows": rows,
+        "columns": CARDS.len(),
+        "cards": CARDS,
+        "kinds": kinds,
+        "index_mb": index_mb,
+        "patterns": patterns,
+        "build_s": build_s,
+        "disk_mb": total_bytes as f64 / 1e6,
+        "canonical_mb": canonical_bytes as f64 / 1e6,
+        "index_amplification": (total_bytes - canonical_bytes) as f64 / canonical_bytes.max(1) as f64,
+        "median_query_ms": percentile(latency.clone(), 0.50),
+        "p95_query_ms": percentile(latency, 0.95),
+        "rss_kb": rss_kb("VmRSS:").unwrap_or(0),
+        "hwm_kb": rss_kb("VmHWM:").unwrap_or(0),
+        "exact": format!("{exact_ok}/10")
+    }));
 }
