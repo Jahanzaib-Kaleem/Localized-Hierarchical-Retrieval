@@ -1,5 +1,7 @@
 use crate::{
+    bitslice_postings::BitSlicePostingHierarchy,
     builder::HierarchySpec,
+    delta_postings::DeltaPostingHierarchy,
     dense_postings::{count_unique_sorted, DensePostingHierarchy},
     external::external_sort,
     manifest::{HierarchyMeta, Manifest},
@@ -24,6 +26,28 @@ fn write_record<W: Write>(w: &mut W, key: u64, row: u32) -> io::Result<()> {
     w.write_all(&row.to_le_bytes())
 }
 
+// Bit-slices are excellent for low/moderate cardinalities because composition becomes
+// word-wise equality-mask work instead of decoding very large row-id postings. Do not
+// extend them into sparse high-cardinality fields: the all-row word scan then dominates.
+// An 8x word-work allowance admits card~64 while still excluding card~1K+ at our scales.
+fn bitslice_query_ok(keyspace: u64, rows: u64) -> bool {
+    if keyspace == 0 {
+        return false;
+    }
+    let bits = if keyspace <= 1 {
+        0
+    } else {
+        (64 - (keyspace - 1).leading_zeros()) as u64
+    };
+    let words = rows.saturating_add(63) / 64;
+    let bit_word_ops = words.saturating_mul(bits);
+    let avg_posting_rows = rows
+        .saturating_add(keyspace.saturating_sub(1))
+        .checked_div(keyspace)
+        .unwrap_or(0);
+    bit_word_ops <= avg_posting_rows.saturating_mul(8)
+}
+
 pub fn add_exact_hierarchies(
     root: impl AsRef<Path>,
     specs: &[HierarchySpec],
@@ -45,6 +69,7 @@ pub fn add_exact_hierarchies(
             "exact postings v1 require <= u32::MAX rows",
         ));
     }
+
     for spec in specs {
         if spec.columns.is_empty() || spec.columns.iter().any(|&c| c >= manifest.columns) {
             return Err(io::Error::new(
@@ -53,7 +78,10 @@ pub fn add_exact_hierarchies(
             ));
         }
         if manifest.hierarchies.iter().any(|h| {
-            matches!(h.kind.as_str(), "postings" | "densepost") && h.columns == spec.columns
+            matches!(
+                h.kind.as_str(),
+                "postings" | "densepost" | "deltapost" | "bitslice"
+            ) && h.columns == spec.columns
         }) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -81,8 +109,7 @@ pub fn add_exact_hierarchies(
     for meta in &manifest.segments {
         let seg = Segment::open(root.join("canonical").join(&meta.file))?;
         for local in 0..seg.rows() {
-            let global = meta.row_start + local as u64;
-            let row = global as u32;
+            let row = (meta.row_start + local as u64) as u32;
             for (i, spec) in specs.iter().enumerate() {
                 let mut key = 0u64;
                 for &c in &spec.columns {
@@ -99,16 +126,14 @@ pub fn add_exact_hierarchies(
                     key = key
                         .checked_mul(radix)
                         .and_then(|x| x.checked_add(value))
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "key overflow")
-                        })?;
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "key overflow"))?;
                 }
                 write_record(&mut writers[i], key, row)?;
             }
         }
     }
-    for w in &mut writers {
-        w.flush()?;
+    for writer in &mut writers {
+        writer.flush()?;
     }
     drop(writers);
 
@@ -128,10 +153,39 @@ pub fn add_exact_hierarchies(
         let sparse_bytes = 40u64
             .saturating_add(unique.saturating_mul(24))
             .saturating_add(manifest.rows.saturating_mul(4));
-        let dense_bytes = DensePostingHierarchy::estimated_bytes(space, manifest.rows)
-            .unwrap_or(u64::MAX);
+        let dense_bytes =
+            DensePostingHierarchy::estimated_bytes(space, manifest.rows).unwrap_or(u64::MAX);
+        let bitslice_bytes = if spec.columns.len() == 1
+            && bitslice_query_ok(space, manifest.rows)
+        {
+            BitSlicePostingHierarchy::estimated_bytes(space, manifest.rows).unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
 
-        let (file, kind) = if dense_bytes < sparse_bytes {
+        // Delta size depends on row locality, so measure the real file before choosing.
+        let delta_file = format!("h{:04}.dlt", base + i);
+        let delta_path = routing.join(&delta_file);
+        DeltaPostingHierarchy::build_from_sorted(&sorted, &delta_path)?;
+        let delta_bytes = fs::metadata(&delta_path)?.len();
+
+        let (file, kind) = if bitslice_bytes <= delta_bytes
+            && bitslice_bytes <= dense_bytes
+            && bitslice_bytes <= sparse_bytes
+        {
+            fs::remove_file(&delta_path)?;
+            let file = format!("h{:04}.bsl", base + i);
+            BitSlicePostingHierarchy::build_from_sorted(
+                &sorted,
+                routing.join(&file),
+                space,
+                manifest.rows,
+            )?;
+            (file, "bitslice".to_string())
+        } else if delta_bytes <= dense_bytes && delta_bytes <= sparse_bytes {
+            (delta_file, "deltapost".to_string())
+        } else if dense_bytes < sparse_bytes {
+            fs::remove_file(&delta_path)?;
             let file = format!("h{:04}.dpost", base + i);
             DensePostingHierarchy::build_from_sorted(
                 &sorted,
@@ -141,6 +195,7 @@ pub fn add_exact_hierarchies(
             )?;
             (file, "densepost".to_string())
         } else {
+            fs::remove_file(&delta_path)?;
             let file = format!("h{:04}.post", base + i);
             PostingHierarchy::build_from_sorted(&sorted, routing.join(&file), manifest.rows)?;
             (file, "postings".to_string())
