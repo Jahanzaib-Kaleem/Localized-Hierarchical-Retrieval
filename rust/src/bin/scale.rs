@@ -1,4 +1,5 @@
 use lhr::{build_u8_batches, BuildConfig, Engine, HierarchySpec, Predicate};
+use serde_json::json;
 use std::{env, fs, path::{Path, PathBuf}, time::Instant};
 
 const CARDS: [u64; 8] = [8, 12, 6, 16, 10, 20, 8, 14];
@@ -17,13 +18,21 @@ fn make_batch(start: u64, rows: usize) -> Vec<u8> {
     out
 }
 
+fn hierarchy_profile(profile: &str) -> Vec<HierarchySpec> {
+    let mut out = Vec::new();
+    for a in 0..CARDS.len() { for b in a+1..CARDS.len() { out.push(HierarchySpec { columns: vec![a,b] }); } }
+    match profile {
+        "pairs" => {},
+        "selected" => for cols in [[0,1,2],[0,3,4],[1,3,5],[2,4,6],[3,5,7],[0,6,7],[1,4,7],[2,5,6]] { out.push(HierarchySpec { columns: cols.to_vec() }); },
+        "all3" => for a in 0..CARDS.len() { for b in a+1..CARDS.len() { for c in b+1..CARDS.len() { out.push(HierarchySpec { columns: vec![a,b,c] }); } } },
+        other => panic!("unknown hierarchy profile: {other}"),
+    }
+    out
+}
+
 fn recursive_bytes(path: &Path) -> u64 {
     let mut sum = 0u64;
-    if let Ok(rd) = fs::read_dir(path) {
-        for e in rd.flatten() {
-            if let Ok(m) = e.metadata() { if m.is_dir() { sum += recursive_bytes(&e.path()); } else { sum += m.len(); } }
-        }
-    }
+    if let Ok(rd) = fs::read_dir(path) { for e in rd.flatten() { if let Ok(m) = e.metadata() { if m.is_dir() { sum += recursive_bytes(&e.path()); } else { sum += m.len(); } } } }
     sum
 }
 
@@ -33,9 +42,7 @@ fn rss_kb(field: &str) -> Option<u64> {
 }
 
 fn percentile(mut x: Vec<f64>, p: f64) -> f64 {
-    x.sort_by(|a,b| a.partial_cmp(b).unwrap());
-    if x.is_empty() { return 0.0; }
-    x[((x.len() - 1) as f64 * p).round() as usize]
+    x.sort_by(|a,b| a.partial_cmp(b).unwrap()); if x.is_empty() { return 0.0; } x[((x.len() - 1) as f64 * p).round() as usize]
 }
 
 fn main() {
@@ -43,40 +50,38 @@ fn main() {
     let rows: u64 = args.get(1).and_then(|x| x.parse().ok()).unwrap_or(1_000_000);
     let batch_rows: usize = args.get(2).and_then(|x| x.parse().ok()).unwrap_or(100_000);
     let queries: usize = args.get(3).and_then(|x| x.parse().ok()).unwrap_or(200);
-    let page_rows: usize = args.get(4).and_then(|x| x.parse().ok()).unwrap_or(512);
-    let root = args.get(5).map(PathBuf::from).unwrap_or_else(|| env::temp_dir().join(format!("lhr-rust-scale-{}", std::process::id())));
+    let page_rows: usize = args.get(4).and_then(|x| x.parse().ok()).unwrap_or(64);
+    let profile = args.get(5).map(String::as_str).unwrap_or("all3");
+    let root = args.get(6).map(PathBuf::from).unwrap_or_else(|| env::temp_dir().join(format!("lhr-rust-scale-{}", std::process::id())));
     let _ = fs::remove_dir_all(&root); fs::create_dir_all(&root).unwrap();
 
-    let mut hierarchies = Vec::new();
-    for a in 0..CARDS.len() { for b in a+1..CARDS.len() { hierarchies.push(HierarchySpec { columns: vec![a,b] }); } }
-    for cols in [[0,1,2],[0,3,4],[1,3,5],[2,4,6],[3,5,7],[0,6,7],[1,4,7],[2,5,6]] { hierarchies.push(HierarchySpec { columns: cols.to_vec() }); }
+    let hierarchies = hierarchy_profile(profile);
     let cfg = BuildConfig { columns: CARDS.len(), page_rows, cardinalities: CARDS.to_vec(), hierarchies, max_sort_records: 250_000 };
-
     let batches = (0..rows).step_by(batch_rows).map(|start| make_batch(start, ((rows-start).min(batch_rows as u64)) as usize));
     let t = Instant::now(); let manifest = build_u8_batches(batches, &root, &cfg).expect("build dataset"); let build_s = t.elapsed().as_secs_f64();
     let engine = Engine::open(&root).expect("open dataset");
 
     let mut latency_ms = Vec::with_capacity(queries); let mut touched = Vec::with_capacity(queries); let mut pages = Vec::with_capacity(queries); let mut scan_ms = Vec::new(); let mut exact_ok = 0usize;
+    let mut width_touch: Vec<Vec<f64>> = vec![Vec::new(); 6]; let mut width_ms: Vec<Vec<f64>> = vec![Vec::new(); 6];
     for i in 0..queries {
-        let source = (i as u64 * 7919 + 104729) % rows.max(1);
-        let width = 2 + i % 4;
-        let mut q = Vec::new();
-        for j in 0..width {
-            let c = (i + j * 3) % CARDS.len();
-            if q.iter().any(|p: &Predicate| p.column == c) { continue; }
-            q.push(Predicate { column: c, value: value(source, c) as u64 });
-        }
-        let q0 = Instant::now(); let routed = engine.query(&q); latency_ms.push(q0.elapsed().as_secs_f64()*1000.0); touched.push(routed.rows_checked as f64); pages.push(routed.pages_touched as f64);
-        if i < 10 {
-            let s0 = Instant::now(); let scanned = engine.scan(&q); scan_ms.push(s0.elapsed().as_secs_f64()*1000.0);
-            exact_ok += (routed.hits == scanned.hits) as usize;
-        }
+        let source = (i as u64 * 7919 + 104729) % rows.max(1); let width = 2 + i % 4; let mut q = Vec::new();
+        for j in 0..width { let c = (i + j * 3) % CARDS.len(); q.push(Predicate { column: c, value: value(source, c) as u64 }); }
+        let q0 = Instant::now(); let routed = engine.query(&q); let q_ms = q0.elapsed().as_secs_f64()*1000.0;
+        latency_ms.push(q_ms); touched.push(routed.rows_checked as f64); pages.push(routed.pages_touched as f64); width_touch[width].push(routed.rows_checked as f64); width_ms[width].push(q_ms);
+        if i < 10 { let s0 = Instant::now(); let scanned = engine.scan(&q); scan_ms.push(s0.elapsed().as_secs_f64()*1000.0); exact_ok += (routed.hits == scanned.hits) as usize; }
     }
 
     let total_bytes = recursive_bytes(&root); let canonical_bytes: u64 = manifest.segments.iter().map(|s| fs::metadata(root.join("canonical").join(&s.file)).unwrap().len()).sum();
     let med_ms = percentile(latency_ms.clone(), 0.50); let p95_ms = percentile(latency_ms, 0.95); let med_scan_ms = percentile(scan_ms, 0.50);
     let med_touch = percentile(touched.clone(), 0.50); let p95_touch = percentile(touched, 0.95); let med_pages = percentile(pages, 0.50);
-    println!("{{\"rows\":{},\"page_rows\":{},\"pages\":{},\"hierarchies\":{},\"build_s\":{:.3},\"disk_mb\":{:.3},\"canonical_mb\":{:.3},\"index_amplification\":{:.3},\"median_query_ms\":{:.4},\"p95_query_ms\":{:.4},\"median_scan_ms\":{:.4},\"median_speedup_vs_scan\":{:.3},\"median_rows_touched\":{},\"median_pct_touched\":{:.6},\"p95_pct_touched\":{:.6},\"median_pages_touched\":{},\"rss_kb\":{},\"hwm_kb\":{},\"exact\":\"{}/10\"}}",
-        rows, page_rows, manifest.pages, manifest.hierarchies.len(), build_s, total_bytes as f64/1e6, canonical_bytes as f64/1e6, (total_bytes-canonical_bytes) as f64/canonical_bytes.max(1) as f64,
-        med_ms, p95_ms, med_scan_ms, if med_ms > 0.0 { med_scan_ms/med_ms } else { 0.0 }, med_touch as u64, 100.0*med_touch/rows.max(1) as f64, 100.0*p95_touch/rows.max(1) as f64, med_pages as u64, rss_kb("VmRSS:").unwrap_or(0), rss_kb("VmHWM:").unwrap_or(0), exact_ok);
+    let mut widths = serde_json::Map::new();
+    for w in 2..=5 { widths.insert(w.to_string(), json!({"median_pct_touched":100.0*percentile(width_touch[w].clone(),0.50)/rows.max(1) as f64,"p95_pct_touched":100.0*percentile(width_touch[w].clone(),0.95)/rows.max(1) as f64,"median_ms":percentile(width_ms[w].clone(),0.50)})); }
+    let result = json!({
+        "rows":rows,"page_rows":page_rows,"profile":profile,"pages":manifest.pages,"hierarchies":manifest.hierarchies.len(),"build_s":build_s,
+        "disk_mb":total_bytes as f64/1e6,"canonical_mb":canonical_bytes as f64/1e6,"index_amplification":(total_bytes-canonical_bytes) as f64/canonical_bytes.max(1) as f64,
+        "median_query_ms":med_ms,"p95_query_ms":p95_ms,"median_scan_ms":med_scan_ms,"median_speedup_vs_scan":if med_ms>0.0{med_scan_ms/med_ms}else{0.0},
+        "median_rows_touched":med_touch as u64,"median_pct_touched":100.0*med_touch/rows.max(1) as f64,"p95_pct_touched":100.0*p95_touch/rows.max(1) as f64,"median_pages_touched":med_pages as u64,
+        "rss_kb":rss_kb("VmRSS:").unwrap_or(0),"hwm_kb":rss_kb("VmHWM:").unwrap_or(0),"exact":format!("{exact_ok}/10"),"widths":widths
+    });
+    println!("{}",serde_json::to_string(&result).unwrap());
 }
