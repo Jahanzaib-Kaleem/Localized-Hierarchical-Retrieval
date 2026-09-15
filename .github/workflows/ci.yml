@@ -44,6 +44,7 @@ jobs:
           d=json.load(open('packed-hybrid-1m.json'))
           assert d['exact']=='10/10', d
           assert d['median_pct_touched']==0.0 and d['p95_pct_touched']==0.0, d
+          assert d['index_amplification'] < 1.6, d
           PY
       - name: Topology-aware Hybrid-7 1M benchmark
         working-directory: rust
@@ -58,6 +59,19 @@ jobs:
           assert d['exact']=='24/24', d
           assert 'w2_direct_pair' in d['routes'], d
           assert 'w2_singleton_only' in d['routes'], d
+          PY
+      - name: Mixed-cardinality adaptive 1M benchmark
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          cargo run --release --bin mixed_scale -- 1000000 120 | tee mixed-1m.json
+          cat mixed-1m.json >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json
+          d=json.load(open('mixed-1m.json'))
+          assert d['exact']=='10/10', d
+          assert d['kinds']['0']=='bitslice', d
           PY
       - name: Packed Hybrid comparison sweep
         working-directory: rust
@@ -81,6 +95,7 @@ jobs:
           assert d['exact']=='10/10', d
           assert d['median_pct_touched']==0.0 and d['p95_pct_touched']==0.0, d
           assert d['hwm_kb'] < 1048576, d
+          assert d['index_amplification'] < 1.6, d
           PY
       - name: Topology-aware Hybrid-7 10M benchmark
         working-directory: rust
