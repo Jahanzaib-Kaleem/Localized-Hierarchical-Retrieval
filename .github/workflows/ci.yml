@@ -1,6 +1,7 @@
 name: LHR CI
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -18,6 +19,7 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,3 +32,10 @@ jobs:
         run: |
           ulimit -v 1048576
           cargo test --release
+      - name: End-to-end 1M-row benchmark under 1 GiB ceiling
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          cargo run --release --bin scale -- 1000000 100000 100 | tee benchmark.json
+          cat benchmark.json >> "$GITHUB_STEP_SUMMARY"
