@@ -122,7 +122,10 @@ fn all_pair_postings_are_exact_and_skip_canonical_verification() {
     }
     let manifest = add_exact_hierarchies(d.path(), &pairs, 113).unwrap();
     assert_eq!(manifest.hierarchies.len(), cols * (cols - 1) / 2);
-    assert!(manifest.hierarchies.iter().all(|h| h.kind == "postings"));
+    assert!(manifest
+        .hierarchies
+        .iter()
+        .all(|h| h.kind == "postings" || h.kind == "densepost"));
 
     let engine = Engine::open(d.path()).unwrap();
     for seed in 0..120usize {
