@@ -1,3 +1,4 @@
+pub mod bitmap;
 pub mod builder;
 pub mod engine;
 pub mod external;
@@ -8,6 +9,7 @@ pub mod manifest;
 pub mod planner;
 pub mod segment;
 
+pub use bitmap::BitmapHierarchy;
 pub use builder::{build_u8_batches, BuildConfig, HierarchySpec};
 pub use engine::{Engine, Predicate, QueryStats};
 pub use hierarchy::{Hierarchy, Record};
