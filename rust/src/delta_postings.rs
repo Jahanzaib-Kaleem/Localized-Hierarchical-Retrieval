@@ -1,5 +1,6 @@
 use memmap2::Mmap;
 use std::{fs::File,io::{self,BufReader,BufWriter,Read,Seek,Write},path::Path};
+// Packed-posting format v2: 8-byte magic keeps header parsing fixed-width.
 const MAGIC:&[u8;8]=b"LHRDPB2\0";const HEADER:usize=48;const BLOCK:usize=128;
 fn read_record<R:Read>(r:&mut R)->io::Result<Option<(u64,u32)>>{let mut b=[0u8;12];let mut n=0;while n<12{match r.read(&mut b[n..])?{0 if n==0=>return Ok(None),0=>return Err(io::Error::new(io::ErrorKind::UnexpectedEof,"truncated postings")),x=>n+=x}}Ok(Some((u64::from_le_bytes(b[..8].try_into().unwrap()),u32::from_le_bytes(b[8..].try_into().unwrap()))))}
 fn bits(x:u32)->u8{if x==0{0}else{(32-x.leading_zeros())as u8}}
