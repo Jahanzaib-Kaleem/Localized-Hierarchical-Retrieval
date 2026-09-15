@@ -72,6 +72,23 @@ jobs:
           d=json.load(open('mixed-1m.json'))
           assert d['exact']=='10/10', d
           assert d['kinds']['0']=='bitslice', d
+          assert d['kinds']['5']!='bitslice', d
+          PY
+      - name: Mixed-cardinality adaptive 10M stress benchmark
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          cargo run --release --bin mixed_scale -- 10000000 60 | tee mixed-10m.json
+          cat mixed-10m.json >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json
+          d=json.load(open('mixed-10m.json'))
+          assert d['exact']=='10/10', d
+          assert d['kinds']['0']=='bitslice', d
+          assert d['kinds']['5']!='bitslice', d
+          assert d['hwm_kb'] < 1048576, d
+          assert d['index_amplification'] < 1.0, d
           PY
       - name: Packed Hybrid comparison sweep
         working-directory: rust
