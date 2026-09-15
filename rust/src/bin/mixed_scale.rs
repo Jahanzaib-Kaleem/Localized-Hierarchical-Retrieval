@@ -69,11 +69,12 @@ fn main() {
         make_batch(start, ((rows - start).min(100_000)) as usize)
     });
     let start = Instant::now();
-    let mut manifest = build_u32_batches(batches, &root, &cfg).expect("build mixed dataset");
+    build_u32_batches(batches, &root, &cfg).expect("build mixed dataset");
     let specs: Vec<_> = (0..CARDS.len())
         .map(|column| HierarchySpec { columns: vec![column] })
         .collect();
-    manifest = add_exact_hierarchies(&root, &specs, 250_000).expect("build adaptive exact indexes");
+    let manifest = add_exact_hierarchies(&root, &specs, 250_000)
+        .expect("build adaptive exact indexes");
     let build_s = start.elapsed().as_secs_f64();
     let engine = Engine::open(&root).expect("open mixed dataset");
 
