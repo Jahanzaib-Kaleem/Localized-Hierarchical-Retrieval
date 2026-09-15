@@ -12,7 +12,7 @@ pub mod postings;
 pub mod segment;
 
 pub use bitmap::BitmapHierarchy;
-pub use builder::{build_u8_batches, BuildConfig, HierarchySpec};
+pub use builder::{build_u32_batches, build_u8_batches, BuildConfig, HierarchySpec};
 pub use engine::{Engine, Predicate, QueryStats};
 pub use exact::add_exact_hierarchies;
 pub use hierarchy::{Hierarchy, Record};
