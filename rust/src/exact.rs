@@ -26,9 +26,10 @@ fn write_record<W: Write>(w: &mut W, key: u64, row: u32) -> io::Result<()> {
     w.write_all(&row.to_le_bytes())
 }
 
-// A bit-slice can be smaller than postings even for very high-cardinality fields, but
-// equality lookup would then scan every row-word to recover only a handful of row IDs.
-// Keep it only where the expected word work is within 2x an average posting decode.
+// Bit-slices are excellent for low/moderate cardinalities because composition becomes
+// word-wise equality-mask work instead of decoding very large row-id postings. Do not
+// extend them into sparse high-cardinality fields: the all-row word scan then dominates.
+// An 8x word-work allowance admits card~64 while still excluding card~1K+ at our scales.
 fn bitslice_query_ok(keyspace: u64, rows: u64) -> bool {
     if keyspace == 0 {
         return false;
@@ -44,7 +45,7 @@ fn bitslice_query_ok(keyspace: u64, rows: u64) -> bool {
         .saturating_add(keyspace.saturating_sub(1))
         .checked_div(keyspace)
         .unwrap_or(0);
-    bit_word_ops <= avg_posting_rows.saturating_mul(2)
+    bit_word_ops <= avg_posting_rows.saturating_mul(8)
 }
 
 pub fn add_exact_hierarchies(
