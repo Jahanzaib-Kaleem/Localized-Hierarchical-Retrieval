@@ -1,4 +1,4 @@
-use crate::{mixed_radix_key, Hierarchy, Manifest, Segment};
+use crate::{mixed_radix_key, BitmapHierarchy, Hierarchy, Manifest, Segment};
 use std::{collections::HashMap, fs, io, path::Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,8 +12,19 @@ pub struct QueryStats {
     pub hierarchy_lookups: u64,
 }
 
-struct LoadedHierarchy { columns: Vec<usize>, data: Hierarchy }
-struct LoadedSegment { first_page: u32, data: Segment }
+enum HierarchyData {
+    Sparse(Hierarchy),
+    Bitmap(BitmapHierarchy),
+}
+
+impl HierarchyData {
+    fn page_count(&self, key: u64) -> usize { match self { Self::Sparse(x) => x.page_count(key), Self::Bitmap(x) => x.page_count(key) } }
+    fn pages(&self, key: u64) -> Vec<u32> { match self { Self::Sparse(x) => x.pages(key), Self::Bitmap(x) => x.pages(key) } }
+    fn intersect_pages(&self, key: u64, seed: &[u32]) -> Vec<u32> { match self { Self::Sparse(x) => x.intersect_pages(key, seed), Self::Bitmap(x) => x.intersect_pages(key, seed) } }
+}
+
+struct LoadedHierarchy { columns: Vec<usize>, data: HierarchyData }
+struct LoadedSegment { first_page: u32, row_start: u64, data: Segment }
 
 pub struct Engine {
     rows: u64,
@@ -33,7 +44,13 @@ impl Engine {
         if !m.format.starts_with("LHR/") { return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported LHR manifest")); }
         let mut hier = Vec::new();
         for h in &m.hierarchies {
-            hier.push(LoadedHierarchy { columns: h.columns.clone(), data: Hierarchy::open(root.join("routing").join(&h.file))? });
+            let path = root.join("routing").join(&h.file);
+            let data = match h.kind.as_str() {
+                "sparse" => HierarchyData::Sparse(Hierarchy::open(path)?),
+                "bitmap" => HierarchyData::Bitmap(BitmapHierarchy::open(path)?),
+                other => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown hierarchy kind {other}"))),
+            };
+            hier.push(LoadedHierarchy { columns: h.columns.clone(), data });
         }
         let mut segments = Vec::new();
         for s in &m.segments {
@@ -41,7 +58,7 @@ impl Engine {
             if data.rows() != s.rows as usize || data.cols() != m.columns {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "segment metadata mismatch"));
             }
-            segments.push(LoadedSegment { first_page: s.first_page, data });
+            segments.push(LoadedSegment { first_page: s.first_page, row_start: s.row_start, data });
         }
         Ok(Self { rows: m.rows, page_rows: m.page_rows, pages: m.pages, columns: m.columns, card: m.cardinalities, hier, segments })
     }
@@ -111,7 +128,36 @@ impl Engine {
     }
 
     pub fn query_count(&self, predicates: &[Predicate]) -> (u64, u64) {
-        let s = self.query(predicates);
-        (s.hits, s.rows_checked)
+        let s = self.query(predicates); (s.hits, s.rows_checked)
+    }
+
+    pub fn query_row_ids(&self, predicates: &[Predicate], limit: usize) -> (Vec<u64>, QueryStats) {
+        let (pages, hierarchy_lookups) = self.candidate_pages_with_lookups(predicates);
+        let pred: Vec<_> = predicates.iter().map(|x| (x.column, x.value)).collect();
+        let mut stats = QueryStats { hierarchy_lookups, ..QueryStats::default() };
+        let mut out = Vec::with_capacity(limit.min(1024));
+        for s in &self.segments {
+            let page_count = ((s.data.rows() + self.page_rows - 1) / self.page_rows) as u32;
+            let lo = pages.partition_point(|&x| x < s.first_page);
+            let hi = pages.partition_point(|&x| x < s.first_page + page_count);
+            for &pid in &pages[lo..hi] {
+                let start = (pid - s.first_page) as usize * self.page_rows;
+                let end = (start + self.page_rows).min(s.data.rows());
+                stats.rows_checked += (end - start) as u64; stats.pages_touched += 1;
+                for r in start..end {
+                    if s.data.matches(r, &pred) {
+                        stats.hits += 1;
+                        if out.len() < limit { out.push(s.row_start + r as u64); }
+                    }
+                }
+            }
+        }
+        (out, stats)
+    }
+
+    pub fn row(&self, row_id: u64) -> Option<Vec<u64>> {
+        let s = self.segments.iter().find(|s| row_id >= s.row_start && row_id < s.row_start + s.data.rows() as u64)?;
+        let local = (row_id - s.row_start) as usize;
+        Some((0..self.columns).map(|c| s.data.value(local, c).unwrap()).collect())
     }
 }
