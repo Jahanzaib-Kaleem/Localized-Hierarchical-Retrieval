@@ -26,6 +26,27 @@ fn write_record<W: Write>(w: &mut W, key: u64, row: u32) -> io::Result<()> {
     w.write_all(&row.to_le_bytes())
 }
 
+// A bit-slice can be smaller than postings even for very high-cardinality fields, but
+// equality lookup would then scan every row-word to recover only a handful of row IDs.
+// Keep it only where the expected word work is within 2x an average posting decode.
+fn bitslice_query_ok(keyspace: u64, rows: u64) -> bool {
+    if keyspace == 0 {
+        return false;
+    }
+    let bits = if keyspace <= 1 {
+        0
+    } else {
+        (64 - (keyspace - 1).leading_zeros()) as u64
+    };
+    let words = rows.saturating_add(63) / 64;
+    let bit_word_ops = words.saturating_mul(bits);
+    let avg_posting_rows = rows
+        .saturating_add(keyspace.saturating_sub(1))
+        .checked_div(keyspace)
+        .unwrap_or(0);
+    bit_word_ops <= avg_posting_rows.saturating_mul(2)
+}
+
 pub fn add_exact_hierarchies(
     root: impl AsRef<Path>,
     specs: &[HierarchySpec],
@@ -104,16 +125,14 @@ pub fn add_exact_hierarchies(
                     key = key
                         .checked_mul(radix)
                         .and_then(|x| x.checked_add(value))
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "key overflow")
-                        })?;
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "key overflow"))?;
                 }
                 write_record(&mut writers[i], key, row)?;
             }
         }
     }
-    for w in &mut writers {
-        w.flush()?;
+    for writer in &mut writers {
+        writer.flush()?;
     }
     drop(writers);
 
@@ -135,7 +154,9 @@ pub fn add_exact_hierarchies(
             .saturating_add(manifest.rows.saturating_mul(4));
         let dense_bytes =
             DensePostingHierarchy::estimated_bytes(space, manifest.rows).unwrap_or(u64::MAX);
-        let bitslice_bytes = if spec.columns.len() == 1 {
+        let bitslice_bytes = if spec.columns.len() == 1
+            && bitslice_query_ok(space, manifest.rows)
+        {
             BitSlicePostingHierarchy::estimated_bytes(space, manifest.rows).unwrap_or(u64::MAX)
         } else {
             u64::MAX
