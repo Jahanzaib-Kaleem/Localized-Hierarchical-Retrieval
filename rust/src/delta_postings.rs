@@ -1,5 +1,5 @@
 use memmap2::Mmap;
-use std::{fs::File, io::{self, BufReader, BufWriter, Read, Write}, path::Path};
+use std::{fs::File, io::{self, BufReader, BufWriter, Read, Seek, Write}, path::Path};
 
 const MAGIC:&[u8;8]=b"LHRDPST1";
 const HEADER:usize=48;
