@@ -19,7 +19,7 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,20 +32,20 @@ jobs:
         run: |
           ulimit -v 1048576
           cargo test --release
-      - name: End-to-end 1M-row benchmark under 1 GiB ceiling
+      - name: End-to-end 1M-row exact-pair benchmark under 1 GiB ceiling
         working-directory: rust
         shell: bash
         run: |
           ulimit -v 1048576
-          cargo run --release --bin scale -- 1000000 100000 100 512 | tee benchmark.json
+          cargo run --release --bin scale -- 1000000 100000 100 512 exactpairs | tee benchmark.json
           cat benchmark.json >> "$GITHUB_STEP_SUMMARY"
-      - name: Page-size storage/latency sweep
+      - name: Routing strategy sweep
         working-directory: rust
         shell: bash
         run: |
           ulimit -v 1048576
           : > sweep.jsonl
-          for page in 64 128 256 512 1024; do
-            cargo run --release --bin scale -- 250000 50000 40 "$page" | tee -a sweep.jsonl
+          for profile in pairs selected all3 exactpairs hybrid; do
+            cargo run --release --bin scale -- 250000 50000 40 64 "$profile" | tee -a sweep.jsonl
           done
           cat sweep.jsonl >> "$GITHUB_STEP_SUMMARY"
