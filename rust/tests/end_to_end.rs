@@ -4,6 +4,10 @@ fn exact_count(rows: &[u8], cols: usize, q: &[Predicate]) -> u64 {
     rows.chunks_exact(cols).filter(|row| q.iter().all(|p| row[p.column] as u64 == p.value)).count() as u64
 }
 
+fn exact_ids(rows: &[u8], cols: usize, q: &[Predicate]) -> Vec<u64> {
+    rows.chunks_exact(cols).enumerate().filter(|(_, row)| q.iter().all(|p| row[p.column] as u64 == p.value)).map(|(i,_)| i as u64).collect()
+}
+
 #[test]
 fn native_builder_and_reader_are_exact_across_irregular_batches() {
     let d = tempfile::tempdir().unwrap();
@@ -33,6 +37,7 @@ fn native_builder_and_reader_are_exact_across_irregular_batches() {
     };
     let manifest = build_u8_batches(batches, d.path(), &cfg).unwrap();
     assert_eq!(manifest.rows, n as u64);
+    assert!(manifest.hierarchies.iter().all(|h| h.kind == "bitmap" || h.kind == "sparse"));
     let engine = Engine::open(d.path()).unwrap();
 
     for seed in 0..200usize {
@@ -48,6 +53,16 @@ fn native_builder_and_reader_are_exact_across_irregular_batches() {
         let stats = engine.query(&q);
         assert_eq!(stats.hits, expected, "query {seed:?}");
         assert!(stats.rows_checked <= n as u64);
+    }
+
+    let q = [Predicate { column: 0, value: 3 }, Predicate { column: 2, value: 1 }, Predicate { column: 4, value: 7 }];
+    let expected = exact_ids(&rows, cols, &q);
+    let (ids, stats) = engine.query_row_ids(&q, 17);
+    assert_eq!(stats.hits, expected.len() as u64);
+    assert_eq!(ids, expected.iter().copied().take(17).collect::<Vec<_>>());
+    for id in ids {
+        let row = engine.row(id).unwrap();
+        assert!(q.iter().all(|p| row[p.column] == p.value));
     }
 }
 
