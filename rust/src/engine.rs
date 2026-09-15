@@ -1,4 +1,4 @@
-use crate::{intersect_sorted, mixed_radix_key, Hierarchy, Manifest, Segment};
+use crate::{mixed_radix_key, Hierarchy, Manifest, Segment};
 use std::{collections::HashMap, fs, io, path::Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,21 +54,23 @@ impl Engine {
         if q.iter().any(|(&c, &v)| c >= self.columns || self.card.get(c).map_or(true, |&k| v >= k)) {
             return (Vec::new(), 0);
         }
-        let mut lists: Vec<Vec<u32>> = Vec::new();
-        let mut lookups = 0u64;
-        for h in &self.hier {
+        let mut applicable: Vec<(usize, usize, u64)> = Vec::new();
+        for (i, h) in self.hier.iter().enumerate() {
             if h.columns.iter().all(|c| q.contains_key(c)) {
                 let vals: Vec<_> = h.columns.iter().map(|&c| (c, q[&c])).collect();
-                let key = match mixed_radix_key(&vals, &self.card) { Some(k) => k, None => return (Vec::new(), lookups) };
-                lists.push(h.data.pages(key));
-                lookups += 1;
+                let key = match mixed_radix_key(&vals, &self.card) { Some(k) => k, None => return (Vec::new(), 0) };
+                let count = h.data.page_count(key);
+                if count == 0 { return (Vec::new(), 1); }
+                applicable.push((count, i, key));
             }
         }
-        if lists.is_empty() { return ((0..self.pages).collect(), lookups); }
-        lists.sort_by_key(Vec::len);
-        let mut out = lists.remove(0);
-        for x in lists {
-            out = intersect_sorted(&out, &x);
+        let lookups = applicable.len() as u64;
+        if applicable.is_empty() { return ((0..self.pages).collect(), 0); }
+        applicable.sort_unstable_by_key(|x| x.0);
+        let (_, first_i, first_key) = applicable[0];
+        let mut out = self.hier[first_i].data.pages(first_key);
+        for &(_, i, key) in &applicable[1..] {
+            out = self.hier[i].data.intersect_pages(key, &out);
             if out.is_empty() { break; }
         }
         (out, lookups)
