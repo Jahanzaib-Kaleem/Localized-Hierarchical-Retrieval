@@ -49,3 +49,10 @@ jobs:
             cargo run --release --bin scale -- 250000 50000 40 64 "$profile" | tee -a sweep.jsonl
           done
           cat sweep.jsonl >> "$GITHUB_STEP_SUMMARY"
+      - name: 5M-row exact-pair stress benchmark under 1 GiB ceiling
+        working-directory: rust
+        shell: bash
+        run: |
+          ulimit -v 1048576
+          cargo run --release --bin scale -- 5000000 100000 40 512 exactpairs | tee benchmark-5m.json
+          cat benchmark-5m.json >> "$GITHUB_STEP_SUMMARY"
