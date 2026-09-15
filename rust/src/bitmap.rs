@@ -1,5 +1,5 @@
 use memmap2::{Mmap, MmapMut};
-use std::{fs::{File, OpenOptions}, io::{self, BufReader, Read, Write}, path::Path};
+use std::{fs::{File, OpenOptions}, io::{self, BufReader, Read}, path::Path};
 
 const MAGIC: &[u8; 8] = b"LHRBIT01";
 const HEADER: usize = 32;
@@ -102,6 +102,7 @@ impl BitmapHierarchy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     #[test]
     fn converts_sparse_and_queries_bits() {
         let d = tempfile::tempdir().unwrap(); let sparse = d.path().join("s.bin"); let bitmap = d.path().join("b.bin");
