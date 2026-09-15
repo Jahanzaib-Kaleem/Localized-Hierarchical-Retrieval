@@ -6,13 +6,15 @@ on:
 jobs:
   python:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - run: pip install -r requirements.txt
-      - run: pytest -q
+      - run: python -m pytest -q
 
   rust:
     runs-on: ubuntu-latest
@@ -22,7 +24,7 @@ jobs:
       - name: Test Rust engine
         working-directory: rust
         run: cargo test --release
-      - name: Compile release engine under 1 GiB virtual-memory ceiling
+      - name: Test release engine under 1 GiB virtual-memory ceiling
         working-directory: rust
         shell: bash
         run: |
