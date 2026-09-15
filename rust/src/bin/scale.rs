@@ -66,7 +66,7 @@ fn main() {
 
     let mut latency_ms = Vec::with_capacity(queries); let mut touched = Vec::with_capacity(queries); let mut pages = Vec::with_capacity(queries); let mut exact_ok = 0usize;
     for i in 0..queries {
-        let source = ((i as u64 * 7919 + 104729) % rows.max(1)) as u64;
+        let source = (i as u64 * 7919 + 104729) % rows.max(1);
         let width = 2 + i % 4;
         let mut q = Vec::new();
         for j in 0..width {
@@ -79,9 +79,9 @@ fn main() {
     }
 
     let total_bytes = recursive_bytes(&root); let canonical_bytes: u64 = manifest.segments.iter().map(|s| fs::metadata(root.join("canonical").join(&s.file)).unwrap().len()).sum();
-    let med_ms = percentile(latency_ms.clone(), .50); let p95_ms = percentile(latency_ms, .95);
-    let med_touch = percentile(touched.clone(), .50); let p95_touch = percentile(touched, .95);
-    let med_pages = percentile(pages, .50);
+    let med_ms = percentile(latency_ms.clone(), 0.50); let p95_ms = percentile(latency_ms, 0.95);
+    let med_touch = percentile(touched.clone(), 0.50); let p95_touch = percentile(touched, 0.95);
+    let med_pages = percentile(pages, 0.50);
     println!("{{\"rows\":{},\"pages\":{},\"hierarchies\":{},\"build_s\":{:.3},\"disk_mb\":{:.3},\"canonical_mb\":{:.3},\"index_amplification\":{:.3},\"median_query_ms\":{:.4},\"p95_query_ms\":{:.4},\"median_rows_touched\":{},\"median_pct_touched\":{:.6},\"p95_pct_touched\":{:.6},\"median_pages_touched\":{},\"rss_kb\":{},\"hwm_kb\":{},\"exact\":\"{}/10\"}}",
         rows, manifest.pages, manifest.hierarchies.len(), build_s, total_bytes as f64/1e6, canonical_bytes as f64/1e6, (total_bytes-canonical_bytes) as f64/canonical_bytes.max(1) as f64,
         med_ms, p95_ms, med_touch as u64, 100.0*med_touch/rows.max(1) as f64, 100.0*p95_touch/rows.max(1) as f64, med_pages as u64, rss_kb("VmRSS:").unwrap_or(0), rss_kb("VmHWM:").unwrap_or(0), exact_ok);
