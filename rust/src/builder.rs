@@ -1,5 +1,5 @@
-use crate::{external::external_sort, manifest::{HierarchyMeta, Manifest, SegmentMeta}, key::mixed_radix_key, Segment};
-use std::{collections::HashSet, fs::{self, File}, io::{self, BufWriter, Write}, path::{Path, PathBuf}};
+use crate::{external::external_sort, manifest::{HierarchyMeta, Manifest, SegmentMeta}, Segment};
+use std::{fs::{self, File}, io::{self, BufWriter, Write}, path::{Path, PathBuf}};
 
 #[derive(Clone, Debug)]
 pub struct HierarchySpec { pub columns: Vec<usize> }
@@ -18,10 +18,32 @@ fn write_record<W: Write>(w: &mut W, key: u64, page: u32) -> io::Result<()> {
     w.write_all(&page.to_le_bytes())
 }
 
+fn page_keys(page: &[u8], columns: usize, spec: &HierarchySpec, card: &[u64]) -> io::Result<Vec<u64>> {
+    let rows = page.len() / columns;
+    let mut keys = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let base = r * columns;
+        let mut key = 0u64;
+        for &c in &spec.columns {
+            let value = page[base + c] as u64;
+            let radix = card[c];
+            if value >= radix { return Err(io::Error::new(io::ErrorKind::InvalidData, "token outside declared cardinality")); }
+            key = key.checked_mul(radix).and_then(|x| x.checked_add(value)).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "hierarchy key overflow"))?;
+        }
+        keys.push(key);
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Ok(keys)
+}
+
 pub fn build_u8_batches<I>(batches: I, root: impl AsRef<Path>, cfg: &BuildConfig) -> io::Result<Manifest>
 where I: IntoIterator<Item = Vec<u8>> {
-    if cfg.columns == 0 || cfg.page_rows == 0 || cfg.cardinalities.len() != cfg.columns {
+    if cfg.columns == 0 || cfg.page_rows == 0 || cfg.cardinalities.len() != cfg.columns || cfg.max_sort_records == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid build config"));
+    }
+    if cfg.cardinalities.iter().any(|&x| x == 0 || x > 256) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "u8 builder requires cardinalities in 1..=256"));
     }
     if cfg.hierarchies.iter().any(|h| h.columns.is_empty() || h.columns.iter().any(|&c| c >= cfg.columns)) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid hierarchy columns"));
@@ -47,14 +69,7 @@ where I: IntoIterator<Item = Vec<u8>> {
             let page_end = (page_start + cfg.page_rows).min(rows);
             let page = &data[page_start * cfg.columns..page_end * cfg.columns];
             for (hi, spec) in cfg.hierarchies.iter().enumerate() {
-                let mut keys = HashSet::new();
-                for r in 0..(page_end - page_start) {
-                    let base = r * cfg.columns;
-                    let vals: Vec<(usize, u64)> = spec.columns.iter().map(|&c| (c, page[base + c] as u64)).collect();
-                    let key = mixed_radix_key(&vals, &cfg.cardinalities).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "token outside declared cardinality"))?;
-                    keys.insert(key);
-                }
-                for key in keys { write_record(&mut spools[hi], key, page_id)?; }
+                for key in page_keys(page, cfg.columns, spec, &cfg.cardinalities)? { write_record(&mut spools[hi], key, page_id)?; }
             }
             page_id = page_id.checked_add(1).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "page id overflow"))?;
         }
