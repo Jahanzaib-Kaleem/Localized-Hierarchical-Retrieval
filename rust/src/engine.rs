@@ -1,6 +1,6 @@
 use crate::{
     mixed_radix_key, BitSlicePostingHierarchy, BitmapHierarchy, DeltaPostingHierarchy,
-    DensePostingHierarchy, Hierarchy, Manifest, PostingHierarchy, Segment,
+    DensePostingHierarchy, FlatPostingHierarchy, Hierarchy, Manifest, PostingHierarchy, Segment,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -51,6 +51,7 @@ enum RowHierarchyData {
     Sparse(PostingHierarchy),
     Dense(DensePostingHierarchy),
     Delta(DeltaPostingHierarchy),
+    Flat(FlatPostingHierarchy),
     BitSlice(BitSlicePostingHierarchy),
 }
 impl RowHierarchyData {
@@ -59,6 +60,7 @@ impl RowHierarchyData {
             Self::Sparse(x) => x.row_count(key),
             Self::Dense(x) => x.row_count(key),
             Self::Delta(x) => x.row_count(key),
+            Self::Flat(x) => x.row_count(key),
             Self::BitSlice(x) => x.row_count(key),
         }
     }
@@ -67,6 +69,7 @@ impl RowHierarchyData {
             Self::Sparse(x) => x.rows(key),
             Self::Dense(x) => x.rows(key),
             Self::Delta(x) => x.rows(key),
+            Self::Flat(x) => x.rows(key),
             Self::BitSlice(x) => x.rows(key),
         }
     }
@@ -75,6 +78,7 @@ impl RowHierarchyData {
             Self::Sparse(x) => x.intersect_rows(key, seed),
             Self::Dense(x) => x.intersect_rows(key, seed),
             Self::Delta(x) => x.intersect_rows(key, seed),
+            Self::Flat(x) => x.intersect_rows(key, seed),
             Self::BitSlice(x) => x.intersect_rows(key, seed),
         }
     }
@@ -153,6 +157,10 @@ impl Engine {
                 "deltapost" => row_hier.push(LoadedRowHierarchy {
                     columns: hierarchy.columns.clone(),
                     data: RowHierarchyData::Delta(DeltaPostingHierarchy::open(path)?),
+                }),
+                "flatpost" => row_hier.push(LoadedRowHierarchy {
+                    columns: hierarchy.columns.clone(),
+                    data: RowHierarchyData::Flat(FlatPostingHierarchy::open(path)?),
                 }),
                 "bitslice" => row_hier.push(LoadedRowHierarchy {
                     columns: hierarchy.columns.clone(),
