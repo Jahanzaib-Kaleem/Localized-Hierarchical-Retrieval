@@ -1,8 +1,16 @@
 use lhr::{add_exact_hierarchies, build_u32_batches, BuildConfig, Engine, HierarchySpec, Predicate};
 use serde_json::json;
-use std::{env, fs, path::Path, time::Instant};
+use std::{collections::BTreeMap, env, fs, path::Path, time::Instant};
 
 const CARDS: [u64; 6] = [8, 64, 1_024, 10_000, 100_000, 1_000_000];
+const PATTERNS: [(&str, &[usize]); 6] = [
+    ("c0_c1", &[0, 1]),
+    ("c0_c5", &[0, 5]),
+    ("c1_c3", &[1, 3]),
+    ("c2_c4", &[2, 4]),
+    ("c0_c2_c5", &[0, 2, 5]),
+    ("c1_c3_c4_c5", &[1, 3, 4, 5]),
+];
 
 fn value(row: u64, col: usize) -> u32 {
     let k = CARDS[col];
@@ -87,28 +95,37 @@ fn main() {
         }
     }
 
-    let patterns: [&[usize]; 6] = [
-        &[0, 1],
-        &[0, 5],
-        &[1, 3],
-        &[2, 4],
-        &[0, 2, 5],
-        &[1, 3, 4, 5],
-    ];
     let mut latency = Vec::with_capacity(queries);
+    let mut buckets: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
+    let mut hit_buckets: BTreeMap<&'static str, Vec<u64>> = BTreeMap::new();
     let mut exact_ok = 0usize;
     for i in 0..queries {
         let source = (i as u64 * 104729 + 7919) % rows.max(1);
-        let columns = patterns[i % patterns.len()];
+        let (pattern_name, columns) = PATTERNS[i % PATTERNS.len()];
         let q: Vec<_> = columns
             .iter()
             .map(|&column| Predicate { column, value: value(source, column) as u64 })
             .collect();
         let q0 = Instant::now();
         let result = engine.query(&q);
-        latency.push(q0.elapsed().as_secs_f64() * 1000.0);
+        let ms = q0.elapsed().as_secs_f64() * 1000.0;
+        latency.push(ms);
+        buckets.entry(pattern_name).or_default().push(ms);
+        hit_buckets.entry(pattern_name).or_default().push(result.hits);
         if i < 10 { exact_ok += (result.hits == engine.scan(&q).hits) as usize; }
         assert_eq!(result.rows_checked, 0, "adaptive exact query touched canonical rows");
+    }
+
+    let mut patterns = serde_json::Map::new();
+    for (name, values) in buckets {
+        let hits = hit_buckets.remove(name).unwrap_or_default();
+        patterns.insert(name.to_string(), json!({
+            "n": values.len(),
+            "median_ms": percentile(values.clone(), 0.50),
+            "p95_ms": percentile(values, 0.95),
+            "median_hits": percentile(hits.iter().map(|&x| x as f64).collect(), 0.50) as u64,
+            "max_hits": hits.into_iter().max().unwrap_or(0)
+        }));
     }
 
     let total_bytes = recursive_bytes(&root);
@@ -124,6 +141,7 @@ fn main() {
             "columns": CARDS.len(),
             "cards": CARDS,
             "kinds": kinds,
+            "patterns": patterns,
             "build_s": build_s,
             "disk_mb": total_bytes as f64 / 1e6,
             "canonical_mb": canonical_bytes as f64 / 1e6,
