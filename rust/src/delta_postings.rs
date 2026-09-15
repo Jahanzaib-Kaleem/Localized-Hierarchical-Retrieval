@@ -1,11 +1,11 @@
 use memmap2::Mmap;
 use std::{fs::File,io::{self,BufReader,BufWriter,Read,Seek,Write},path::Path};
-const MAGIC:&[u8;8]=b"LHRDPB2";const HEADER:usize=48;const BLOCK:usize=128;
+const MAGIC:&[u8;8]=b"LHRDPB2\0";const HEADER:usize=48;const BLOCK:usize=128;
 fn read_record<R:Read>(r:&mut R)->io::Result<Option<(u64,u32)>>{let mut b=[0u8;12];let mut n=0;while n<12{match r.read(&mut b[n..])?{0 if n==0=>return Ok(None),0=>return Err(io::Error::new(io::ErrorKind::UnexpectedEof,"truncated postings")),x=>n+=x}}Ok(Some((u64::from_le_bytes(b[..8].try_into().unwrap()),u32::from_le_bytes(b[8..].try_into().unwrap()))))}
 fn bits(x:u32)->u8{if x==0{0}else{(32-x.leading_zeros())as u8}}
 fn pack(vals:&[u32],bw:u8,w:&mut impl Write)->io::Result<()> {if bw==0{return Ok(())}let mut acc=0u64;let mut have=0u32;for&v in vals{acc|=(v as u64)<<have;have+=bw as u32;while have>=8{w.write_all(&[acc as u8])?;acc>>=8;have-=8;}}if have>0{w.write_all(&[acc as u8])?}Ok(())}
 fn unpack(buf:&[u8],p:&mut usize,n:usize,bw:u8)->Option<Vec<u32>>{if bw==0{return Some(vec![0;n])}let mask=if bw==32{u64::MAX}else{(1u64<<bw)-1};let mut out=Vec::with_capacity(n);let(mut acc,mut have)=(0u64,0u32);for _ in 0..n{while have<bw as u32{acc|=(*buf.get(*p)? as u64)<<have;*p+=1;have+=8;}out.push((acc&mask)as u32);acc>>=bw;have-=bw as u32;}Some(out)}
-fn write_block(rows:&[u32],w:&mut(BufWriter<File>))->io::Result<()> {let base=rows[0];let ds:Vec<u32>=rows[1..].iter().map(|&x|x-base).collect();let bw=ds.iter().copied().map(bits).max().unwrap_or(0);w.write_all(&base.to_le_bytes())?;w.write_all(&(rows.len()as u16).to_le_bytes())?;w.write_all(&[bw,0])?;pack(&ds,bw,w)}
+fn write_block(rows:&[u32],w:&mut BufWriter<File>)->io::Result<()> {let base=rows[0];let ds:Vec<u32>=rows[1..].iter().map(|&x|x-base).collect();let bw=ds.iter().copied().map(bits).max().unwrap_or(0);w.write_all(&base.to_le_bytes())?;w.write_all(&(rows.len()as u16).to_le_bytes())?;w.write_all(&[bw,0])?;pack(&ds,bw,w)}
 /// Directory stays binary-searchable. Posting bodies are independent 128-row blocks:
 /// absolute base + count + bit width + packed base-relative deltas.
 pub struct DeltaPostingHierarchy{map:Mmap,keys:u64,dir:usize,body:usize}
