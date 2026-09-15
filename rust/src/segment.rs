@@ -25,8 +25,9 @@ impl Segment{
  pub fn value(&self,row:usize,col:usize)->Option<u64>{
   if row>=self.rows||col>=self.cols{return None} let o=HEADER+(row*self.cols+col)*self.width;let b=&self.map[o..o+self.width];Some(match self.width{1=>b[0] as u64,2=>u16::from_le_bytes(b.try_into().unwrap()) as u64,4=>u32::from_le_bytes(b.try_into().unwrap()) as u64,8=>u64::from_le_bytes(b.try_into().unwrap()),_=>unreachable!()})
  }
+ pub fn matches(&self,row:usize,pred:&[(usize,u64)])->bool{row<self.rows&&pred.iter().all(|&(c,v)|self.value(row,c)==Some(v))}
  pub fn count_page(&self,start:usize,end:usize,pred:&[(usize,u64)])->u64{
-  let mut n=0;for r in start..end.min(self.rows){if pred.iter().all(|&(c,v)|self.value(r,c)==Some(v)){n+=1}}n
+  let mut n=0;for r in start..end.min(self.rows){if self.matches(r,pred){n+=1}}n
  }
 }
-#[cfg(test)]mod tests{use super::*;#[test]fn roundtrip(){let f=tempfile::NamedTempFile::new().unwrap();Segment::write(f.path(),3,2,1,&[1,2,3,4,1,4]).unwrap();let s=Segment::open(f.path()).unwrap();assert_eq!(s.value(1,1),Some(4));assert_eq!(s.count_page(0,3,&[(0,1)]),2);}}
+#[cfg(test)]mod tests{use super::*;#[test]fn roundtrip(){let f=tempfile::NamedTempFile::new().unwrap();Segment::write(f.path(),3,2,1,&[1,2,3,4,1,4]).unwrap();let s=Segment::open(f.path()).unwrap();assert_eq!(s.value(1,1),Some(4));assert!(s.matches(1,&[(1,4)]));assert_eq!(s.count_page(0,3,&[(0,1)]),2);}}
