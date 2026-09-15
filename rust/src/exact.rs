@@ -15,6 +15,8 @@ use std::{
     path::Path,
 };
 
+const BITSLICE_STORAGE_BUDGET_MULTIPLIER: u64 = 2;
+
 fn keyspace(spec: &HierarchySpec, card: &[u64]) -> io::Result<u64> {
     spec.columns.iter().try_fold(1u64, |a, &c| {
         a.checked_mul(card[c])
@@ -171,11 +173,19 @@ pub fn add_exact_hierarchies(
         DeltaPostingHierarchy::build_from_sorted(&sorted, &delta_path)?;
         let delta_bytes = fs::metadata(&delta_path)?.len();
 
-        let (file, kind) = if bitslice_bytes <= delta_bytes
-            && bitslice_bytes <= dense_bytes
-            && bitslice_bytes <= sparse_bytes
-            && bitslice_bytes <= flat_bytes
-        {
+        let best_non_bitslice = delta_bytes
+            .min(dense_bytes)
+            .min(sparse_bytes)
+            .min(flat_bytes);
+        // For low-cardinality fields, a small storage premium is worthwhile because two
+        // bit-sliced predicates can be composed directly as word masks without materializing
+        // huge postings. The query-work guard above keeps this speed budget away from sparse
+        // high-cardinality fields.
+        let prefer_bitslice = bitslice_bytes != u64::MAX
+            && bitslice_bytes
+                <= best_non_bitslice.saturating_mul(BITSLICE_STORAGE_BUDGET_MULTIPLIER);
+
+        let (file, kind) = if prefer_bitslice {
             fs::remove_file(&delta_path)?;
             let file = format!("h{:04}.bsl", base + i);
             BitSlicePostingHierarchy::build_from_sorted(
