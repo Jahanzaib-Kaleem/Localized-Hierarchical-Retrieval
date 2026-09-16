@@ -117,8 +117,10 @@ pub fn planner_indexes_for_request(
     }
     let mut used = BTreeSet::new();
     for (layer, explain) in dataset.explain_values(&predicates)? {
-        for index in explain.plan.selected_indexes {
-            used.insert(format!("layer:{layer}:{}:{}", index.kind, index.file));
+        if let Some(plan) = explain.plan {
+            for index in plan.selected_indexes {
+                used.insert(format!("layer:{layer}:{}:{}", index.kind, index.file));
+            }
         }
     }
     Ok(used.into_iter().collect())
