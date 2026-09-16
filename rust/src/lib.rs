@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod bitmap;
 pub mod bitslice_postings;
 pub mod builder;
@@ -24,6 +25,10 @@ pub mod rowids;
 pub mod schema;
 pub mod segment;
 
+pub use admin::{
+    add_index, dataset_stats, drop_index, list_indexes, rebuild_index, ColumnStats,
+    DatasetStatsReport, IndexChangeReport, IndexInfo,
+};
 pub use bitmap::BitmapHierarchy;
 pub use bitslice_postings::BitSlicePostingHierarchy;
 pub use builder::{build_u32_batches, build_u8_batches, BuildConfig, HierarchySpec};
