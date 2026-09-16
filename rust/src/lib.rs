@@ -48,8 +48,8 @@ pub use import::{import_csv, CsvImportConfig, CsvImportReport};
 pub use intersect::intersect_sorted;
 pub use key::mixed_radix_key;
 pub use logical::{
-    dictionary_filename, LogicalDataset, LogicalPredicate, LogicalQueryResult, LogicalRow,
-    NamedValue,
+    dictionary_filename, LogicalDataset, LogicalExplain, LogicalPredicate, LogicalQueryResult,
+    LogicalRow, NamedValue,
 };
 pub use maintenance::restore_backup;
 pub use manifest::{HierarchyMeta, Manifest, SegmentMeta};
