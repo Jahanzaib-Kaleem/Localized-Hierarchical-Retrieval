@@ -1,6 +1,7 @@
 pub mod bitmap;
 pub mod bitslice_postings;
 pub mod builder;
+pub mod catalog;
 pub mod delta_postings;
 pub mod dense_postings;
 pub mod engine;
@@ -19,6 +20,10 @@ pub mod segment;
 pub use bitmap::BitmapHierarchy;
 pub use bitslice_postings::BitSlicePostingHierarchy;
 pub use builder::{build_u32_batches, build_u8_batches, BuildConfig, HierarchySpec};
+pub use catalog::{
+    abandon_generation, begin_generation, list_generations, publish_generation,
+    resolve_dataset_root, rollback_generation, GenerationInfo, StagedGeneration,
+};
 pub use delta_postings::DeltaPostingHierarchy;
 pub use dense_postings::DensePostingHierarchy;
 pub use engine::{Engine, Predicate, QueryStats};
