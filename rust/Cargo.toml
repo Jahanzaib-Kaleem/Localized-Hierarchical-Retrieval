@@ -6,6 +6,7 @@ description = "Localized Hierarchical Retrieval engine"
 license = "MIT"
 
 [dependencies]
+axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 fs2 = "0.4"
@@ -14,6 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
 
 [dev-dependencies]
 tempfile = "3"
