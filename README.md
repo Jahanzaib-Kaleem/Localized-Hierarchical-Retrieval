@@ -31,18 +31,36 @@ Studio: http://127.0.0.1:8787
 MCP:    http://127.0.0.1:8788/mcp
 ```
 
-The first run generates a persistent administrator token. Retrieve it locally with:
+The first run generates a persistent administrator access secret. Retrieve it locally with:
 
 ```bash
 docker exec lhr cat /data/.lhr-admin-token
 ```
 
-Use that credential in Studio or as the bearer credential for an explicitly trusted MCP client. The default Docker mappings are loopback-only. Remote API/MCP access should be placed behind trusted HTTPS/private transport rather than exposing either listener directly.
+Studio presents a lock screen and does not mount the database UI until the Rust service accepts that credential. The credential is kept in browser `sessionStorage` only and is cleared with the browser session. API and MCP authorization remains enforced server-side regardless of what the browser renders.
 
-Docker Compose is also included:
+For an interactive deployment where you choose the access secret and host-facing ports yourself, use the included setup wizard.
+
+Windows / PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -StudioPort 3000 -McpPort 8000
+```
+
+Linux / macOS:
 
 ```bash
-docker compose up -d
+LHR_STUDIO_PORT=3000 LHR_MCP_PORT=8000 sh scripts/setup.sh
+```
+
+The setup scripts seed the chosen secret directly into the persistent Docker volume over stdin rather than putting it in the Docker command line.
+
+The default Docker mappings remain loopback-only. For a public URL, keep LHR on `127.0.0.1` and terminate HTTPS/private transport in front of Studio/API and MCP. Do not expose the raw cleartext listeners directly to the Internet; credentials sent over plain public HTTP can be intercepted. See [`docs/SECURITY.md`](docs/SECURITY.md).
+
+Docker Compose is also included and supports optional host-port overrides:
+
+```bash
+LHR_STUDIO_PORT=3000 LHR_MCP_PORT=8000 docker compose up -d
 ```
 
 ## Current status
@@ -69,7 +87,7 @@ The production-oriented implementation lives under `rust/`. It now includes:
 - CSV, JSONL, and streaming JSON-array ingestion with rejects, progress, disk preflight, and resumable preparation;
 - persistent workload telemetry with P50/P95/P99 and workload-based accelerator recommendations;
 - an authenticated role-based HTTP service with rate/concurrency/body/resource limits, audit logging, health/readiness, and Prometheus-style metrics;
-- LHR Studio: an API-backed React/TypeScript/TanStack control plane compiled to static assets and served by Rust;
+- LHR Studio: an API-backed React/TypeScript/TanStack control plane compiled to static assets, served by Rust, and locked until a valid server credential is supplied;
 - a stateless MCP control plane for bounded lead queries, diagnostics, query benchmarking, mutations and role-gated administration;
 - a single-process Docker appliance with amd64/arm64 image publication;
 - an explicit **LHR/1** dataset compatibility contract.
@@ -150,9 +168,9 @@ Equality queries retain the optimized exact-index path. Predicate families witho
 
 `lhr serve` exposes the database through a role-based API. The safe native default binds to loopback only. Remote listeners require authentication and an explicit assertion that TLS/private transport is enforced upstream.
 
-The service includes query/mutation/admin endpoints, body/rate/concurrency/resource limits, audit JSONL, health/readiness endpoints, graceful shutdown, and Prometheus-style metrics. LHR Studio is a static browser application served by the same Rust service and talks to those APIs without a production Node process.
+The service includes query/mutation/admin endpoints, body/rate/concurrency/resource limits, audit JSONL, health/readiness endpoints, graceful shutdown, and Prometheus-style metrics. LHR Studio is a static browser application served by the same Rust service and talks to those APIs without a production Node process. The Studio shell is locked until an authenticated metrics check succeeds, while the Rust service remains the authoritative access-control boundary.
 
-See [`docs/SERVICE.md`](docs/SERVICE.md).
+See [`docs/SERVICE.md`](docs/SERVICE.md) and [`docs/SECURITY.md`](docs/SECURITY.md).
 
 ## MCP / AI operator control
 
@@ -188,6 +206,7 @@ See [`docs/FORMAT.md`](docs/FORMAT.md).
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — retrieval/build architecture.
 - [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — implemented database operations and invariants.
 - [`docs/SERVICE.md`](docs/SERVICE.md) — HTTP security, API, metrics, and deployment contract.
+- [`docs/SECURITY.md`](docs/SECURITY.md) — Studio lock screen, deployment secret bootstrap, credential rotation, and HTTPS requirements.
 - [`docs/MCP.md`](docs/MCP.md) — MCP connection, tool, security, diagnostic and AI-operator contract.
 - [`docs/FORMAT.md`](docs/FORMAT.md) — LHR/1 on-disk compatibility contract.
 - [`docs/STREAMING.md`](docs/STREAMING.md) — historical page-routing/streaming prototype.
@@ -198,10 +217,11 @@ See [`docs/FORMAT.md`](docs/FORMAT.md).
 - `rust/` — current engine, database product layer, CLI/service/MCP, tests, and scale benchmarks
 - `studio/` — React/TypeScript/TanStack browser control plane compiled into the Docker appliance
 - `docker/` — one-process appliance entrypoint
+- `scripts/` — interactive secure Docker bootstrap helpers
 - `python/lhr/` — historical/reference research implementation
 - `benchmarks/` — benchmark material
 - `tests/` — Python/reference correctness tests
-- `docs/` — research, architecture, format, operations, service, MCP, and benchmark history
+- `docs/` — research, architecture, format, operations, service, security, MCP, and benchmark history
 
 ## Core design principles
 
