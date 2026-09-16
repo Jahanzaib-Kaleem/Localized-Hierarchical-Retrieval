@@ -82,7 +82,11 @@ impl OverlayCatalog {
     }
 }
 
-pub fn read_overlay(root: impl AsRef<Path>, rows: u64, max_row_id: Option<u64>) -> io::Result<OverlayCatalog> {
+pub fn read_overlay(
+    root: impl AsRef<Path>,
+    rows: u64,
+    max_row_id: Option<u64>,
+) -> io::Result<OverlayCatalog> {
     let root = root.as_ref();
     let path = root.join(OVERLAY_FILE);
     if !path.exists() {
@@ -167,7 +171,9 @@ impl VisibilityMap {
                 usize::try_from(count)
                     .ok()
                     .and_then(|x| x.checked_mul(VIS_RECORD))
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "visibility map overflow"))?,
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "visibility map overflow")
+                    })?,
             )
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "visibility map overflow"))?;
         if map.len() != expected {
@@ -179,7 +185,7 @@ impl VisibilityMap {
         let out = Self::Mapped { map, count };
         let mut previous = None;
         for index in 0..count {
-            let (row_id, _) = out.record(index).unwrap();
+            let (row_id, _) = out.entry(index).unwrap();
             if previous.is_some_and(|x| row_id <= x) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -198,7 +204,11 @@ impl VisibilityMap {
         }
     }
 
-    fn record(&self, index: u64) -> Option<(u64, VisibilityTarget)> {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn entry(&self, index: u64) -> Option<(u64, VisibilityTarget)> {
         let Self::Mapped { map, count } = self else {
             return None;
         };
@@ -217,7 +227,7 @@ impl VisibilityMap {
         let mut hi = self.len();
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let (id, target) = self.record(mid).unwrap();
+            let (id, target) = self.entry(mid).unwrap();
             match id.cmp(&row_id) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -230,7 +240,7 @@ impl VisibilityMap {
     pub fn to_map(&self) -> BTreeMap<u64, VisibilityTarget> {
         let mut out = BTreeMap::new();
         for index in 0..self.len() {
-            let (row_id, target) = self.record(index).unwrap();
+            let (row_id, target) = self.entry(index).unwrap();
             out.insert(row_id, target);
         }
         out
