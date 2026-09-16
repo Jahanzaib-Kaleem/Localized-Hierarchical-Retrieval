@@ -80,7 +80,6 @@ The complete chronological reasoning, rejected designs, benchmark stages, and de
 
 - `rust/` — current production-oriented implementation and benchmarks
 - `python/lhr/` — reference/research implementation
-- `experiments/` — reproducible research experiments
 - `benchmarks/` — benchmark material
 - `tests/` — correctness tests
 - `docs/` — architecture, research record, formats, and benchmark history
