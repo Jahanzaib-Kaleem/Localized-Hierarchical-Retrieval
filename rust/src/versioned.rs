@@ -220,6 +220,16 @@ impl VersionedDataset {
         select: Option<&[String]>,
         limit: usize,
     ) -> io::Result<LogicalQueryResult> {
+        self.query_values_after(predicates, select, None, limit)
+    }
+
+    pub fn query_values_after(
+        &self,
+        predicates: &[LogicalPredicate],
+        select: Option<&[String]>,
+        after_row_id: Option<u64>,
+        limit: usize,
+    ) -> io::Result<LogicalQueryResult> {
         let mut hits = 0u64;
         let mut rows_checked = 0u64;
         let mut pages_touched = 0u64;
@@ -230,7 +240,8 @@ impl VersionedDataset {
             let (hidden_hits, hidden_rows) =
                 self.hidden_match_count(layer_id, dataset, predicates)?;
             let fetch_limit = limit.saturating_add(hidden_rows);
-            let result = dataset.query_values(predicates, select, fetch_limit)?;
+            let result =
+                dataset.query_values_after(predicates, select, after_row_id, fetch_limit)?;
             hits = hits.saturating_add(result.hits.saturating_sub(hidden_hits));
             rows_checked = rows_checked.saturating_add(result.rows_checked);
             pages_touched = pages_touched.saturating_add(result.pages_touched);
