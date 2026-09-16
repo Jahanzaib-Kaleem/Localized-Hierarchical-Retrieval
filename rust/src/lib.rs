@@ -40,7 +40,7 @@ pub use catalog::{
 pub use delta_postings::DeltaPostingHierarchy;
 pub use dense_postings::DensePostingHierarchy;
 pub use dictionary::{write_dictionary_record, DecodedValue, Dictionary};
-pub use engine::{Engine, Predicate, QueryStats};
+pub use engine::{Engine, Predicate, QueryExplain, QueryPlanIndex, QueryStats};
 pub use exact::add_exact_hierarchies;
 pub use flat_postings::FlatPostingHierarchy;
 pub use hierarchy::{Hierarchy, Record};
