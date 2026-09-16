@@ -8,7 +8,8 @@ use std::{
 
 pub const SCHEMA_FORMAT: &str = "LHR-SCHEMA/1";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]\#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum LogicalType {
     Text,
     Unsigned,
@@ -17,7 +18,8 @@ pub enum LogicalType {
     Timestamp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]\#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Normalization {
     None,
     Trim,
