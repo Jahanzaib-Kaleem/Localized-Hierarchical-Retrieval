@@ -14,6 +14,7 @@ pub mod import;
 pub mod intersect;
 pub mod key;
 pub mod logical;
+pub mod maintenance;
 pub mod manifest;
 pub mod mutation;
 pub mod operations;
@@ -28,7 +29,8 @@ pub use bitslice_postings::BitSlicePostingHierarchy;
 pub use builder::{build_u32_batches, build_u8_batches, BuildConfig, HierarchySpec};
 pub use catalog::{
     abandon_generation, begin_generation, list_generations, publish_generation,
-    resolve_dataset_root, rollback_generation, GenerationInfo, StagedGeneration,
+    resolve_dataset_root, rollback_generation, vacuum_generations, GenerationInfo,
+    StagedGeneration, VacuumReport,
 };
 pub use delta_postings::DeltaPostingHierarchy;
 pub use dense_postings::DensePostingHierarchy;
@@ -44,6 +46,7 @@ pub use logical::{
     dictionary_filename, LogicalDataset, LogicalPredicate, LogicalQueryResult, LogicalRow,
     NamedValue,
 };
+pub use maintenance::restore_backup;
 pub use manifest::{HierarchyMeta, Manifest, SegmentMeta};
 pub use mutation::{apply_mutations, Mutation, MutationConfig, MutationReport};
 pub use operations::{

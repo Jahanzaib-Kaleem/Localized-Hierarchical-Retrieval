@@ -2,6 +2,7 @@ use crate::{seal_dataset, verify_dataset};
 use fs2::FileExt;
 use serde::Serialize;
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -17,6 +18,14 @@ pub struct GenerationInfo {
     pub path: PathBuf,
     pub current: bool,
     pub sealed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct VacuumReport {
+    pub kept: Vec<u64>,
+    pub deleted: Vec<u64>,
+    pub stale_paths_removed: usize,
+    pub bytes_reclaimed: u64,
 }
 
 pub struct StagedGeneration {
@@ -88,6 +97,23 @@ fn atomic_write_current(root: &Path, id: u64) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+fn directory_bytes(path: &Path) -> io::Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            total = total.saturating_add(directory_bytes(&entry.path())?);
+        } else if meta.is_file() {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    Ok(total)
 }
 
 /// Resolve either a generation catalog root or a legacy single-generation dataset root.
@@ -253,5 +279,89 @@ pub fn rollback_generation(root: impl AsRef<Path>, id: u64) -> io::Result<Genera
         path: path.clone(),
         current: true,
         sealed: path.join("integrity.json").is_file(),
+    })
+}
+
+/// Remove old immutable generations and abandoned writer work while preserving CURRENT,
+/// explicitly protected generations, and the newest `retain_newest` published generations.
+/// The same single-writer lock used by import/mutation/rollback makes deletion race-free.
+pub fn vacuum_generations(
+    root: impl AsRef<Path>,
+    retain_newest: usize,
+    protected: &[u64],
+) -> io::Result<VacuumReport> {
+    let root = root.as_ref();
+    let _lock = acquire_writer_lock(root)?;
+    let current = current_id(root)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "generation vacuum requires a catalog CURRENT")
+    })?;
+    let current_path = generation_path(root, current);
+    let report = verify_dataset(&current_path)?;
+    if !report.valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refusing to vacuum while CURRENT is invalid: {}", report.errors.join("; ")),
+        ));
+    }
+
+    let generations = list_generations(root)?;
+    let published: BTreeSet<u64> = generations.iter().map(|x| x.id).collect();
+    for &id in protected {
+        if !published.contains(&id) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("protected generation {} does not exist", generation_name(id)),
+            ));
+        }
+    }
+
+    let mut keep = BTreeSet::new();
+    keep.insert(current);
+    keep.extend(protected.iter().copied());
+    for generation in generations.iter().rev().take(retain_newest) {
+        keep.insert(generation.id);
+    }
+
+    let mut deleted = Vec::new();
+    let mut bytes_reclaimed = 0u64;
+    for generation in &generations {
+        if keep.contains(&generation.id) {
+            continue;
+        }
+        bytes_reclaimed = bytes_reclaimed.saturating_add(directory_bytes(&generation.path)?);
+        fs::remove_dir_all(&generation.path)?;
+        deleted.push(generation.id);
+    }
+
+    let mut stale_paths_removed = 0usize;
+    let generations_dir = root.join(GENERATIONS_DIR);
+    if generations_dir.is_dir() {
+        for entry in fs::read_dir(&generations_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type()?.is_dir() && name.starts_with(".staging-") {
+                bytes_reclaimed = bytes_reclaimed.saturating_add(directory_bytes(&entry.path())?);
+                fs::remove_dir_all(entry.path())?;
+                stale_paths_removed += 1;
+            }
+        }
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type()?.is_dir()
+            && (name.starts_with(".mutation-work-") || name.starts_with(".restore-work-"))
+        {
+            bytes_reclaimed = bytes_reclaimed.saturating_add(directory_bytes(&entry.path())?);
+            fs::remove_dir_all(entry.path())?;
+            stale_paths_removed += 1;
+        }
+    }
+
+    Ok(VacuumReport {
+        kept: keep.into_iter().collect(),
+        deleted,
+        stale_paths_removed,
+        bytes_reclaimed,
     })
 }
