@@ -1,342 +1,271 @@
 # LHR Operational Database Layer
 
-LHR is moving from an architecture/benchmark project into a full database product. This document tracks the operational surface required around the exact retrieval engine.
+LHR is no longer only a retrieval benchmark. The Rust implementation now includes a generation-based operational database around the exact retrieval engine.
 
-The target is not a deliberately minimal database. The goal is a coherent, production-grade system whose storage engine remains deterministic, exact, mmap-friendly, and independent of semantic knowledge about columns.
+The design goal remains the same: deterministic exactness, bounded-memory construction, mmap-friendly reads, and aggressive reduction of query work. Operational features are built around immutable publication rather than weakening those guarantees.
 
-## Operational principles
+## Operational invariants
 
-1. **Exactness remains the first invariant.** Operational features must never weaken retrieval correctness.
-2. **Crash safety beats convenience.** A partially completed mutation must not become the visible dataset generation.
-3. **Readers observe stable generations.** Long queries must not see a mixture of old and new files.
-4. **Every durable file can be verified.** Corruption should be detectable before incorrect data is returned.
-5. **Maintenance is explicit and inspectable.** Compaction, reindexing, vacuuming, backup, restore, and verification are first-class operations.
-6. **Observability is part of the product.** Storage, planner choices, query work, and maintenance cost should be measurable.
+1. **Exactness first.** Indexes and workload recommendations may affect cost, never correctness.
+2. **Published generations are immutable.** Writers build new state rather than editing live mmap files.
+3. **Publication is atomic.** `CURRENT` changes only after the candidate generation has been verified and sealed.
+4. **Logical row identity survives rewrites.** Updates/compaction may change physical placement without changing the row ID returned to clients.
+5. **Readers can hold snapshots.** A generation can remain readable while newer generations are published.
+6. **Durable files are verifiable.** Integrity ledgers detect missing, extra, truncated, or changed files.
+7. **Maintenance is first-class.** Recovery, compaction, vacuum, backup/restore, index administration, statistics, and explainability are product operations.
+8. **The network service does not become an arbitrary filesystem API.** Path-sensitive backup/restore remain local administrative commands.
 
-## Foundation implemented first
+## Catalog and transactions
 
-The initial operational branch adds the first user-facing `lhr` executable and a reusable Rust operations module.
-
-### `lhr status`
-
-Reads the dataset manifest and reports:
-
-- format
-- rows / columns / pages
-- segment count
-- hierarchy count
-- canonical bytes
-- routing/index bytes
-- total dataset bytes
-- whether an integrity seal exists
-
-### `lhr verify`
-
-Checks structural invariants before opening the dataset:
-
-- valid manifest and cardinality shape
-- contiguous segment row ranges
-- contiguous page addressing
-- segment headers, lengths, row counts, and column counts
-- existence/validity of routing structures through a full `Engine::open`
-- integrity manifest completeness when present
-- SHA-256 and byte length for every sealed stable file
-
-A dataset can be structurally valid but unsealed; that is reported as a warning. Once sealed, changed/missing/extra stable files make verification fail.
-
-### `lhr seal`
-
-Computes an integrity ledger over all stable dataset files (excluding temporary build state) and atomically publishes `integrity.json`.
-
-The seal records:
+A catalog contains immutable generations plus one atomic publication pointer:
 
 ```text
-relative path | byte length | SHA-256
-```
-
-A seal is intentionally explicit rather than silently refreshed. Any legitimate mutation must finish completely before publishing a new seal.
-
-### `lhr query`
-
-Provides the first stable command-line query surface over encoded values:
-
-```bash
-lhr --root /data/my-db query 0=4 3=17 --limit 100
-```
-
-It returns matching row IDs plus planner/query statistics in JSON.
-
-### `lhr backup`
-
-Creates a filesystem snapshot at a new destination, verifies the copied dataset, and only then publishes the destination directory. Failed copies remain invisible and are cleaned up.
-
-## Full product workstream
-
-The remaining operational layer is divided into durable generations, mutation/compaction, schema/dictionaries, query/result APIs, observability, and network service concerns.
-
-### 1. Dataset generations and transactions
-
-The current single-manifest layout will evolve toward generation-based publication:
-
-```text
-<dataset>/
+<catalog>/
   CURRENT
+  WRITER.lock
+  READERS/
   generations/
-    000000000001/
-      manifest.json
-      integrity.json
-      canonical/
-      routing/
-      dictionaries/
-    000000000002/
-      ...
-  temp/
+    00000000000000000001/
+    00000000000000000002/
 ```
 
-A writer constructs a generation in isolation, fsyncs all durable files, seals/verifies it, then atomically moves `CURRENT` to the new generation. Existing readers can continue using the old generation until they close it.
+A writer acquires the catalog writer lock, constructs unpublished files, verifies them, seals them, renames the staging directory to its final generation ID, then atomically replaces `CURRENT`.
 
-This is the basis for:
+Failed imports, mutations, rebuilds, or compactions do not replace `CURRENT`.
 
-- atomic imports
-- crash recovery
-- online index rebuilds
-- online compaction
-- snapshots
-- rollback
-- reader/writer isolation
+## Schema and dictionaries
 
-### 2. Ingestion
+`schema.json` defines named columns, logical types, nullability, normalization, and explicit null literals. Per-column mmap dictionaries map canonical external values to deterministic integer tokens and back.
 
-Production ingestion should support:
+Supported logical types include text, unsigned integer, signed integer, boolean, and timestamp-like text. The storage engine never guesses a column's semantics; normalization is explicit configuration.
 
-- CSV
-- JSON/JSONL
-- Parquet when appropriate
-- pre-tokenized binary batches
-- schema mapping
-- configurable null representation
-- validation/reject files
-- bounded-memory batching
-- resumable large imports
-- disk-space preflight estimates
-- progress reporting
+## Ingestion
 
-Ingestion must never publish half-built canonical/index state.
+Two ingestion surfaces exist.
 
-### 3. Dictionaries and external values
+### Strict CSV import
 
-The current engine operates on deterministic integer tokens. The product layer therefore needs durable dictionaries that map external values to tokens and back.
+`lhr import csv` provides the original two-pass bounded-memory CSV builder. It externally sorts dictionary values, tokenizes rows in batches, writes canonical segments, and builds exact singleton indexes plus configured accelerators.
 
-Requirements:
+### External/reject-aware ingestion
 
-- per-column dictionary metadata
-- deterministic token allocation
-- persistent reverse lookup
-- append of unseen values
-- null handling
-- dictionary checksum/version
-- optional normalization configured by the user, never inferred semantically by the engine
-- ability to return original values in query results
+`lhr import external` supports:
 
-### 4. Inserts
+- CSV;
+- JSON Lines;
+- streaming JSON arrays;
+- schema validation and canonicalization;
+- row-level reject JSONL;
+- configurable reject ceilings;
+- progress files;
+- disk-space preflight;
+- persistent prepared spools identified by `resume_id`;
+- optional unknown-JSON-field rejection;
+- the same bounded-memory exact-index builder used by strict import.
 
-New records should enter append-only delta generations/segments rather than forcing a complete rewrite. Exact indexes for the delta are built separately and queried alongside base indexes.
+The prepared accepted spool can be reused after an interrupted later build phase when the source fingerprint still matches.
 
-Compaction later merges base + deltas.
+## Stable logical row IDs
 
-### 5. Updates
+Physical rows are an implementation detail. LHR exposes monotonically allocated logical row IDs.
 
-Updates should be represented as deterministic new row versions plus a visibility/version map rather than unsafe in-place mutation of mmap files.
+- an update retains the existing logical ID;
+- a delete leaves the ID unused/tombstoned rather than reassigning it;
+- an insert receives a new ID above the previous maximum;
+- compaction preserves surviving logical IDs.
 
-The query layer resolves the newest visible version. Compaction materializes a clean base generation later.
+`rowids.bin` stores an explicit strictly increasing mapping when identity addressing is insufficient.
 
-### 6. Deletes
+## Delta mutations
 
-Deletes should initially use compact tombstone/visibility structures. Deleted rows disappear immediately from logical results, while physical bytes are reclaimed during compaction/vacuum.
+`lhr mutate` applies a JSON batch as one transaction.
 
-### 7. Compaction and vacuum
+Rather than rebuilding the whole base for routine writes, mutations create immutable delta layers:
 
-Compaction should:
+- inserts create new delta rows;
+- updates create a newer physical row version under the same logical ID;
+- deletes create visibility tombstones;
+- `overlay.json` records delta layers;
+- `visibility.bin` maps overridden logical IDs to the newest layer or deletion.
 
-- merge base and delta segments
-- apply updates/deletes
-- rebuild chosen indexes
-- discard dead row versions
-- publish a new generation atomically
-- preserve the old generation until no active reader requires it
+The versioned reader queries the base and relevant deltas, suppresses stale versions, and returns one exact visible version per logical row.
 
-Vacuum removes unreachable generations and abandoned temp files after safety checks.
+## Compaction
 
-### 8. Index management
+`lhr compact` streams the visible logical database into a clean base generation. It:
 
-Operational commands should include:
+- resolves newest row versions;
+- applies tombstones;
+- discards dead physical versions;
+- preserves logical row IDs;
+- rebuilds dictionaries and the chosen exact accelerators;
+- publishes the compacted generation atomically.
 
-- list indexes
-- build index
-- drop index
-- rebuild index
-- explain storage cost
-- show representation chosen (`bitslice`, `deltapost`, `densepost`, `flatpost`, etc.)
-- analyze workload and recommend candidate accelerators
+The previous generation remains valid until normal generation retention/vacuum removes it.
 
-Recommendations can use measured query frequency/selectivity, but correctness must remain independent of the recommended topology.
+## Snapshots and concurrency
 
-### 9. Statistics and planner metadata
+Read-side snapshot leases pin a generation through an OS-level shared lock under `READERS/`. Publication of a new generation does not change an already-open snapshot.
 
-Persistent stats should include:
+Vacuum checks reader lease files and protects generations still in active use. Normal reads do not take the global writer lock.
 
-- cardinality
-- value frequency/skew summaries
-- per-index bytes
-- posting density
-- query frequencies
-- observed candidate sizes
-- route/intersection costs
-- p50/p95/p99 by query shape
+Writes/index changes/compaction/publication remain serialized by the catalog writer lock. Concurrent write requests therefore fail cleanly with a conflict rather than interleaving durable state.
 
-Stats are optimization inputs only. Stale stats may hurt performance but may not change correctness.
+## Vacuum
 
-### 10. Query API
+Generation vacuum always preserves:
 
-The encoded-token API should expand into a proper typed query surface with:
+- `CURRENT`;
+- explicitly protected generation IDs;
+- configured newest-generation retention;
+- generations with active snapshot leases.
 
-- equality predicates
-- result limits
-- deterministic pagination/cursors
-- selected output columns
-- row ID retrieval
-- original-value retrieval through dictionaries
-- explain mode
-- query timeout/resource limits
-- stable JSON protocol
+It also removes abandoned staging/work directories after safety checks and reports reclaimed bytes.
 
-Range/set predicates can be added only when their exact indexing/fallback behavior is defined.
+## Recovery
 
-### 11. Result materialization
+`lhr recover` is the startup/disaster-recovery operation for a catalog. Recovery:
 
-Finding matching row IDs is only half of a database product. Result materialization needs efficient column projection from canonical segments without reading unrelated fields.
+- inspects published generations;
+- verifies layered generation integrity;
+- selects the newest fully valid generation;
+- repoints `CURRENT` when the current target is missing/corrupt and a known-good generation exists;
+- removes abandoned unpublished work.
 
-This may motivate a more columnar canonical layout in a future format generation while preserving stable logical row IDs.
+It does not reinterpret partially written data as valid.
 
-### 12. Concurrency and snapshots
+## Verification and integrity
 
-Concurrency model:
+`lhr verify` checks base and operational structures, including manifest/segment consistency, index files, schema/dictionaries, logical row IDs, overlay metadata, visibility references, and integrity seals.
 
-- many readers per immutable generation
-- one or more writers build unpublished generations/deltas
-- publication is atomic
-- readers retain their generation handle for snapshot consistency
-- old generations are garbage-collected only after readers release them
+`lhr seal` writes an SHA-256 + byte-length ledger over stable files. Changed, missing, or unexpected stable files make sealed verification fail.
 
-No reader should need a global database lock for normal queries.
+## Backup and restore
 
-### 13. Crash recovery
+`lhr backup` copies a resolved immutable generation to a new destination and verifies the copy before publishing the destination path.
 
-On startup the operational layer should:
+`lhr restore` verifies a standalone generation backup, installs it as a new immutable catalog generation, then atomically publishes it through `CURRENT`.
 
-- read `CURRENT`
-- verify the referenced generation
-- ignore or clean abandoned temp generations
-- detect incomplete publication
-- optionally fall back to the last known-good generation
-- never guess that partially written bytes are valid
+Backup/restore paths remain local CLI capabilities rather than HTTP endpoints.
 
-### 14. Backup and restore
+## Index administration
 
-The current verified filesystem backup is the first step. Full support should include:
+The exact singleton backbone is protected because it provides generic exact completeness. Multi-column accelerators can be managed independently:
 
-- snapshot by generation ID
-- incremental/hard-link/reflink-friendly backups where available
-- restore verification
-- backup manifest metadata
-- retention policies
-- point-in-time generation selection
+```text
+lhr indexes list
+lhr indexes add <column> <column> [...]
+lhr indexes drop <column> <column> [...]
+lhr indexes rebuild <column> <column> [...]
+```
 
-### 15. Resource safety
+Index reports expose representation (`bitslice`, `deltapost`, `densepost`, `flatpost`, etc.), columns, exact/page status, and storage cost.
 
-Before expensive operations LHR should estimate:
+Rebuilding allows adaptive physical representation selection to run again on the current data distribution.
 
-- required temporary disk
-- resulting canonical/index bytes
-- expected memory ceiling
-- file descriptor use
+## Statistics and EXPLAIN
 
-Runtime limits should be configurable for builders and queries.
+`lhr stats` reports schema cardinalities, dictionary sizes, canonical/index storage, and index metadata.
 
-### 16. Observability
+`lhr explain` and `lhr explain-values` expose planner decisions: considered/selected indexes, representation and file, seed/intersection roles, candidate counts/pages, exact coverage, and whether canonical verification is required.
 
-Expose metrics for:
+This is diagnostic information only; planner choices are not part of the correctness contract.
 
-- RSS
-- page faults
-- bytes read/written
-- build throughput
-- compaction throughput
-- query latency histograms
-- candidate rows
-- pages touched
-- hierarchy lookups
-- index hit/use frequency
-- open readers/generations
-- disk usage by category
+## Typed query protocol
 
-CLI output should support both human-readable and JSON modes; a network server can export metrics later.
+The higher-level query API supports:
 
-### 17. Maintenance command surface
+- equality predicates;
+- set membership (`IN`);
+- inclusive signed/unsigned numeric ranges;
+- selected output columns;
+- stable logical-row cursor pagination;
+- result limits;
+- row-examination ceilings;
+- timeouts;
+- original-value materialization.
 
-Planned command families:
+Pure equality queries retain the optimized exact LHR index path. Set/range shapes currently use a deterministic exact versioned-row fallback until dedicated exact accelerator semantics are implemented for those operators.
+
+`lhr query-json` accepts this protocol from a JSON file.
+
+## Workload telemetry
+
+Queries can be appended to a local JSONL telemetry stream. Events include:
+
+- predicate columns/operators;
+- elapsed microseconds;
+- hits;
+- rows examined;
+- pages touched;
+- hierarchy lookups;
+- whether the optimized equality path was used;
+- exact indexes selected by the planner.
+
+`lhr workload` aggregates P50/P95/P99 by query shape and index-use frequency. It also proposes multi-column equality accelerators when a frequently observed shape lacks one and incurs enough row work to justify investigation.
+
+Recommendations are optimization hints. Applying or ignoring them cannot alter result correctness.
+
+## HTTP service
+
+`lhr serve` exposes the query and operational API. See [`SERVICE.md`](SERVICE.md) for the full contract.
+
+Implemented service protections include:
+
+- secure loopback-only default;
+- refusal of non-loopback cleartext exposure unless the operator explicitly declares trusted TLS/private transport upstream;
+- Bearer API keys with read/write/admin roles;
+- body-size limit;
+- per-key rate limit;
+- request concurrency limit;
+- server-side query/build resource ceilings;
+- structured JSON errors with request IDs;
+- mutation/admin audit JSONL;
+- health/readiness endpoints;
+- Prometheus-style runtime/database metrics;
+- graceful shutdown.
+
+## Metrics
+
+The service exports counters/gauges for HTTP requests/errors/active requests, query activity, mutation/compaction/admin operations, auth failures, rate limiting, RSS, page faults, process disk bytes, active snapshots, row count, and database storage categories.
+
+Persistent workload telemetry complements these process metrics with per-query-shape latency and planner information.
+
+## Main CLI surface
 
 ```text
 lhr status
+lhr stats
 lhr verify
 lhr seal
 lhr query
+lhr query-values
+lhr query-json
+lhr explain
+lhr explain-values
+lhr workload
+lhr import csv
+lhr import external
+lhr mutate
+lhr compact
+lhr indexes list|add|drop|rebuild
 lhr backup
 lhr restore
-lhr import
-lhr append
-lhr update
-lhr delete
-lhr compact
-lhr vacuum
-lhr index list|build|drop|rebuild
-lhr stats
-lhr explain
-lhr generations
-lhr rollback
+lhr recover
+lhr generations list|current|rollback|vacuum
 lhr serve
 ```
 
-### 18. Network service
+## What is intentionally still an engineering/validation frontier
 
-Once the local operational API is stable, `lhr serve` can expose it over HTTP. That layer then requires:
+The operational architecture is implemented, but that does not mean every possible database feature or workload has been exhausted. Remaining future work is primarily validation and optional expansion rather than a missing transactional foundation:
 
-- authentication/authorization
-- TLS or trusted reverse proxy deployment
-- request size limits
-- rate/concurrency limits
-- cancellation/timeouts
-- structured error protocol
-- audit logging for mutations
-- health/readiness endpoints
+- larger 25M/50M/70M+ end-to-end datasets;
+- real lead-data distributions and long-running mixed read/write workloads;
+- dedicated exact accelerators for additional predicate families if measurements justify them;
+- optional Parquet/pre-tokenized import surfaces;
+- backup retention/incremental-copy policies;
+- packaging/deployment conveniences such as systemd/container examples;
+- future storage-format migrations when LHR/1 eventually needs an incompatible successor.
 
-The storage engine should remain usable without the server.
-
-## Development order
-
-The intended order is dependency-driven rather than MVP-driven:
-
-1. integrity/status/verify/backup/CLI foundation
-2. immutable generation catalog + atomic `CURRENT`
-3. dictionary/schema layer
-4. production ingestion
-5. append-only deltas/inserts
-6. tombstones + row versions for deletes/updates
-7. compaction/vacuum and generation GC
-8. typed query/result materialization + explain
-9. persistent statistics/index management
-10. concurrency/snapshot hardening
-11. restore/rollback and disaster recovery
-12. HTTP service, auth, metrics, administrative API
-
-Each stage should retain the same benchmark discipline as the core engine: correctness gates first, then storage/RAM/latency measurements.
+The existing CI continues to run correctness tests, a release test suite under a 1 GiB virtual-memory ceiling, and 1M/5M/10M scale benchmarks after operational changes so product work cannot quietly regress the retrieval engine.
