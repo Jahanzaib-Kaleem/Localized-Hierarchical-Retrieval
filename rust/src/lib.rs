@@ -30,6 +30,7 @@ pub mod recovery;
 pub mod rowids;
 pub mod schema;
 pub mod segment;
+pub mod service;
 pub mod snapshot;
 pub mod telemetry;
 pub mod versioned;
@@ -84,11 +85,13 @@ pub use schema::{
     Normalization, SCHEMA_FORMAT,
 };
 pub use segment::Segment;
+pub use service::{serve, ServiceApiKey, ServiceConfig, ServiceRole};
 pub use snapshot::{
     leased_generation_ids, vacuum_with_reader_leases, SafeVacuumReport, SnapshotLease,
 };
 pub use telemetry::{
-    append_query_event, load_query_events, query_event, record_query, workload_report,
-    IndexRecommendation, IndexUseStats, QueryShapeStats, QueryTelemetryEvent, WorkloadReport,
+    append_query_event, load_query_events, planner_indexes_for_request, query_event, record_query,
+    workload_report, IndexRecommendation, IndexUseStats, QueryShapeStats, QueryTelemetryEvent,
+    WorkloadReport,
 };
 pub use versioned::VersionedDataset;
