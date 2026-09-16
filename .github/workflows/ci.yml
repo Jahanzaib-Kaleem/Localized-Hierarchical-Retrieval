@@ -17,6 +17,22 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m pytest -q
 
+  studio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: studio/package-lock.json
+      - name: Install Studio dependencies
+        working-directory: studio
+        run: npm ci
+      - name: Build Studio
+        working-directory: studio
+        run: npm run build
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 30
