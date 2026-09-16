@@ -538,7 +538,7 @@ impl Engine {
         rows: &[u32],
         predicates: &[(usize, u64)],
         lookups: u64,
-        mut collect: Option<(&mut Vec<u64>, usize)>,
+        mut collect: Option<(&mut Vec<u64>, usize, u64)>,
     ) -> QueryStats {
         let mut stats = QueryStats {
             hierarchy_lookups: lookups,
@@ -559,8 +559,8 @@ impl Engine {
                 stats.rows_checked += 1;
                 if segment.data.matches(local, predicates) {
                     stats.hits += 1;
-                    if let Some((out, limit)) = collect.as_mut() {
-                        if out.len() < *limit {
+                    if let Some((out, limit, first_row)) = collect.as_mut() {
+                        if (row_id as u64) >= *first_row && out.len() < *limit {
                             out.push(row_id as u64);
                         }
                     }
@@ -632,11 +632,22 @@ impl Engine {
         predicates: &[Predicate],
         limit: usize,
     ) -> (Vec<u64>, QueryStats) {
+        self.query_row_ids_from(predicates, limit, 0)
+    }
+
+    pub fn query_row_ids_from(
+        &self,
+        predicates: &[Predicate],
+        limit: usize,
+        first_row: u64,
+    ) -> (Vec<u64>, QueryStats) {
+        let first_row = first_row.min(self.rows);
         let pred: Vec<_> = predicates.iter().map(|x| (x.column, x.value)).collect();
         let mut out = Vec::with_capacity(limit.min(1024));
         if let Some(plan) = self.candidate_rows_with_lookups(predicates) {
             if plan.fully_covered {
-                out.extend(plan.rows.iter().take(limit).map(|&x| x as u64));
+                let start = plan.rows.partition_point(|&x| (x as u64) < first_row);
+                out.extend(plan.rows[start..].iter().take(limit).map(|&x| x as u64));
                 return (
                     out,
                     QueryStats {
@@ -647,8 +658,12 @@ impl Engine {
                     },
                 );
             }
-            let stats =
-                self.query_from_rows(&plan.rows, &pred, plan.lookups, Some((&mut out, limit)));
+            let stats = self.query_from_rows(
+                &plan.rows,
+                &pred,
+                plan.lookups,
+                Some((&mut out, limit, first_row)),
+            );
             return (out, stats);
         }
 
@@ -669,8 +684,9 @@ impl Engine {
                 for row in start..end {
                     if segment.data.matches(row, &pred) {
                         stats.hits += 1;
-                        if out.len() < limit {
-                            out.push(segment.row_start + row as u64);
+                        let global_row = segment.row_start + row as u64;
+                        if global_row >= first_row && out.len() < limit {
+                            out.push(global_row);
                         }
                     }
                 }
