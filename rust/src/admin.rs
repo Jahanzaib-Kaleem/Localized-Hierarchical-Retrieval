@@ -164,6 +164,14 @@ fn columns_from_names(schema: &DatasetSchema, names: &[String]) -> io::Result<Ve
     Ok(columns)
 }
 
+fn validated_columns(catalog_root: &Path, names: &[String]) -> io::Result<Vec<usize>> {
+    // Validate before acquiring a staged-generation ID. A malformed admin request must not leave
+    // an abandoned `.staging-*` directory behind or consume the next generation ID.
+    let current = resolve_dataset_root(catalog_root)?;
+    let schema = read_schema(current)?;
+    columns_from_names(&schema, names)
+}
+
 fn clone_tree_link(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -255,8 +263,8 @@ pub fn add_index(
         ));
     }
     let catalog_root = catalog_root.as_ref();
-    let (stage, schema, _) = clone_current(catalog_root)?;
-    let columns = columns_from_names(&schema, column_names)?;
+    let columns = validated_columns(catalog_root, column_names)?;
+    let (stage, _, _) = clone_current(catalog_root)?;
     let result = add_exact_hierarchies(
         &stage.path,
         &[HierarchySpec { columns }],
@@ -311,8 +319,8 @@ pub fn drop_index(
     column_names: &[String],
 ) -> io::Result<IndexChangeReport> {
     let catalog_root = catalog_root.as_ref();
-    let (stage, schema, mut manifest) = clone_current(catalog_root)?;
-    let columns = columns_from_names(&schema, column_names)?;
+    let columns = validated_columns(catalog_root, column_names)?;
+    let (stage, _, mut manifest) = clone_current(catalog_root)?;
     let result = drop_from_stage(&stage, &mut manifest, &columns);
     match result {
         Ok(()) => {
@@ -338,8 +346,8 @@ pub fn rebuild_index(
         ));
     }
     let catalog_root = catalog_root.as_ref();
-    let (stage, schema, mut manifest) = clone_current(catalog_root)?;
-    let columns = columns_from_names(&schema, column_names)?;
+    let columns = validated_columns(catalog_root, column_names)?;
+    let (stage, _, mut manifest) = clone_current(catalog_root)?;
     let result = (|| {
         drop_from_stage(&stage, &mut manifest, &columns)?;
         add_exact_hierarchies(
