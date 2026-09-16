@@ -1,4 +1,4 @@
-use crate::{list_indexes, QueryFilter, QueryRequest, QueryResponse};
+use crate::{list_indexes, LogicalPredicate, QueryFilter, QueryRequest, QueryResponse, VersionedDataset};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -106,6 +106,24 @@ fn filter_info(filters: &[QueryFilter]) -> (Vec<String>, Vec<String>, Vec<String
     (columns, equality, operators)
 }
 
+pub fn planner_indexes_for_request(
+    dataset: &VersionedDataset,
+    request: &QueryRequest,
+) -> io::Result<Vec<String>> {
+    let mut predicates = Vec::with_capacity(request.filters.len());
+    for filter in &request.filters {
+        let QueryFilter::Eq { column, value } = filter else { return Ok(Vec::new()); };
+        predicates.push(LogicalPredicate { column: column.clone(), value: value.clone() });
+    }
+    let mut used = BTreeSet::new();
+    for (layer, explain) in dataset.explain_values(&predicates)? {
+        for index in explain.plan.selected_indexes {
+            used.insert(format!("layer:{layer}:{}:{}", index.kind, index.file));
+        }
+    }
+    Ok(used.into_iter().collect())
+}
+
 pub fn query_event(
     request: &QueryRequest,
     response: &QueryResponse,
@@ -183,9 +201,7 @@ pub fn workload_report(root: impl AsRef<Path>) -> io::Result<WorkloadReport> {
     let mut index_use = BTreeMap::<String, u64>::new();
     for event in &events {
         shapes.entry((event.columns.clone(), event.operators.clone())).or_default().push(event);
-        for index in &event.used_indexes {
-            *index_use.entry(index.clone()).or_default() += 1;
-        }
+        for index in &event.used_indexes { *index_use.entry(index.clone()).or_default() += 1; }
     }
 
     let mut shape_stats = Vec::new();
@@ -194,9 +210,7 @@ pub fn workload_report(root: impl AsRef<Path>) -> io::Result<WorkloadReport> {
         let total_rows: u128 = group.iter().map(|x| x.rows_examined as u128).sum();
         let max_rows = group.iter().map(|x| x.rows_examined).max().unwrap_or(0);
         shape_stats.push(QueryShapeStats {
-            columns,
-            operators,
-            queries: group.len() as u64,
+            columns, operators, queries: group.len() as u64,
             p50_micros: percentile(latency.clone(), 0.50),
             p95_micros: percentile(latency.clone(), 0.95),
             p99_micros: percentile(latency, 0.99),
@@ -224,9 +238,7 @@ pub fn workload_report(root: impl AsRef<Path>) -> io::Result<WorkloadReport> {
         .map(|(columns, (queries, rows))| {
             let avg = rows as f64 / queries as f64;
             IndexRecommendation {
-                columns,
-                observed_queries: queries,
-                avg_rows_examined: avg,
+                columns, observed_queries: queries, avg_rows_examined: avg,
                 score: queries as f64 * (avg + 1.0).ln_1p(),
                 reason: "frequent multi-column equality shape without an exact accelerator".into(),
             }
