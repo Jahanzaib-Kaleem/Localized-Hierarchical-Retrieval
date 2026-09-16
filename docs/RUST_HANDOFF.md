@@ -1,6 +1,8 @@
-# Rust Handoff Contract
+# Rust Handoff Contract (Historical)
 
-The Python implementation is the executable specification for the first production implementation.
+> **Historical document.** This captured the Python-to-Rust transition before the current Rust engine existed. Several implementation details below were subsequently superseded by exact row indexes, adaptive posting representations, bit-slices, flat sparse postings, and the current query planner. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the current design and [`RESEARCH.md`](RESEARCH.md) for how the transition evolved.
+
+The Python implementation was the executable specification for the first production implementation.
 
 ## Frozen invariants
 
@@ -9,36 +11,39 @@ The Python implementation is the executable specification for the first producti
 3. Dataset size must not determine required resident RAM.
 4. Ingestion accepts bounded-size batches.
 5. Hierarchy construction uses bounded-memory external runs and merge.
-6. Hierarchy leaves identify pages/regions rather than duplicating every row ID.
-7. Hierarchy records are ordered by deterministic mixed-radix keys and are binary-searchable.
+6. Hierarchy leaves identify compact deterministic addresses rather than duplicating full records.
+7. Hierarchy records are ordered by deterministic mixed-radix keys and are binary-searchable where applicable.
 8. Multiple applicable hierarchies may be intersected before canonical I/O.
-9. The reader exact-checks all predicates on candidate pages.
+9. Any query not fully proven by exact indexes is exact-checked against canonical data.
 10. Hierarchy selection requires no semantic model or LLM.
 
-## Binary hierarchy record
+## Original binary hierarchy record
 
-Little endian, 12 bytes:
+The early page-routing Rust target used a little-endian 12-byte record:
 
 - `key`: uint64
 - `page`: uint32
 
-Records are globally sorted by `(key,page)` and deduplicated. This is deliberately simple enough for mmap plus binary search in Rust.
+Records were globally sorted by `(key,page)` and deduplicated. This deliberately simple layout supported mmap plus binary search.
+
+The later research added exact row-level representations (`deltapost`, `densepost`, `flatpost`, `bitslice`, and sparse postings), so this page record is no longer the complete description of LHR storage.
 
 ## Canonical segmentation
 
-Python v0 uses `.npy` canonical segments for research convenience. Rust should replace this with an LHR-native segment header plus packed column/token payload while preserving page numbering and manifest semantics.
+Python v0 used `.npy` canonical segments for research convenience. Rust replaced this with LHR-native mmap-friendly segments while preserving stable row addressing and manifest semantics.
 
-## Rust implementation priorities
+## Original Rust implementation priorities
 
 - mmap hierarchy directories and canonical segments
-- zero-copy binary search over hierarchy keys
-- galloping/intersection of sorted candidate page lists
+- zero-copy/binary-searchable routing
+- intersection of sorted candidate sets
 - direct page-to-segment addressing
 - bounded-memory external run generation and k-way merge
-- compact dictionary encoding
-- CRC/checksum and crash-safe manifest publication
-- benchmark resident set size, page faults, bytes read, p50/p95 latency, build throughput and index amplification
+- compact dictionary/token encoding
+- benchmark resident set size, page faults, bytes read, p50/p95 latency, build throughput, and index amplification
 
-## Not frozen
+Most of the core retrieval/build priorities above are now implemented. Production hardening still remains for dictionaries, checksums/crash recovery, updates/compaction, concurrency, and large-scale real-machine validation.
 
-Adaptive page sizing, hierarchy utility scoring, compression, update/compaction policy, concurrency and the final native segment encoding remain tunable. These are optimizations around the retrieval invariants rather than changes to the central architecture.
+## Why this file remains in the repository
+
+This handoff is useful research history: it shows which invariants were considered fundamental before the Rust implementation existed. The implementation changed substantially, but the exactness, bounded-memory, deterministic-routing, and mmap goals survived.
