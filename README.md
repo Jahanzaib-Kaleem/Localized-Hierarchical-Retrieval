@@ -4,9 +4,46 @@ LHR is a deterministic exact database/retrieval system for very large structured
 
 The project began from a practical question: can a 50M-100M+ row lead dataset remain fast and exact on unusually constrained hardware without depending on embeddings, semantic retrieval, or a large analytical database stack?
 
-The answer evolved into a Rust storage engine plus a full operational database layer built around immutable generations, exact adaptive indexes, delta mutations, compaction, typed queries, recovery, observability, and an authenticated HTTP service.
+The answer evolved into a Rust storage engine plus a full operational database layer built around immutable generations, exact adaptive indexes, delta mutations, compaction, typed queries, recovery, observability, an industrial browser Studio, an authenticated HTTP service, and a first-class MCP operator control plane.
 
 No LLM, embeddings, semantic similarity, or probabilistic retrieval is required. Values and columns have no inherent meaning to the engine.
+
+## One-command quick start
+
+Run the complete LHR appliance:
+
+```bash
+docker run -d \
+  --name lhr \
+  --restart unless-stopped \
+  -p 127.0.0.1:8787:8787 \
+  -p 127.0.0.1:8788:8788 \
+  -v lhr-data:/data \
+  ghcr.io/jahanzaib-kaleem/lhr:latest
+```
+
+The image contains the Rust database/service, compiled Studio assets, and MCP control plane. Node is used only while building the image; it is not a production runtime process.
+
+Open:
+
+```text
+Studio: http://127.0.0.1:8787
+MCP:    http://127.0.0.1:8788/mcp
+```
+
+The first run generates a persistent administrator token. Retrieve it locally with:
+
+```bash
+docker exec lhr cat /data/.lhr-admin-token
+```
+
+Use that credential in Studio or as the bearer credential for an explicitly trusted MCP client. The default Docker mappings are loopback-only. Remote API/MCP access should be placed behind trusted HTTPS/private transport rather than exposing either listener directly.
+
+Docker Compose is also included:
+
+```bash
+docker compose up -d
+```
 
 ## Current status
 
@@ -32,6 +69,9 @@ The production-oriented implementation lives under `rust/`. It now includes:
 - CSV, JSONL, and streaming JSON-array ingestion with rejects, progress, disk preflight, and resumable preparation;
 - persistent workload telemetry with P50/P95/P99 and workload-based accelerator recommendations;
 - an authenticated role-based HTTP service with rate/concurrency/body/resource limits, audit logging, health/readiness, and Prometheus-style metrics;
+- LHR Studio: an API-backed React/TypeScript/TanStack control plane compiled to static assets and served by Rust;
+- a stateless MCP control plane for bounded lead queries, diagnostics, query benchmarking, mutations and role-gated administration;
+- a single-process Docker appliance with amd64/arm64 image publication;
 - an explicit **LHR/1** dataset compatibility contract.
 
 ## Correctness rule
@@ -40,7 +80,7 @@ The production-oriented implementation lives under `rust/`. It now includes:
 
 Routing may over-select, but it may never exclude a true match. Exact row indexes can prove a result without canonical verification; otherwise surviving candidates are checked against canonical/versioned data.
 
-Updates, deletes, compaction, index recommendations, and representation changes preserve the same rule. Performance structures may alter the amount of work, never which logical rows are correct.
+Updates, deletes, compaction, index recommendations, representation changes, HTTP requests and MCP tool calls preserve the same rule. Performance structures may alter the amount of work, never which logical rows are correct.
 
 ## Current benchmark snapshot
 
@@ -78,7 +118,8 @@ The current design comes from measured failures rather than a one-shot design:
 - compaction then became a separate streaming maintenance operation;
 - set/range predicates were added through deterministic exact fallback first rather than inventing an unsafe accelerator;
 - workload telemetry/recommendations were added only as optimization inputs, never correctness dependencies;
-- the network service deliberately keeps arbitrary filesystem backup/restore paths local to reduce remote administrative capability.
+- the network service deliberately keeps arbitrary filesystem backup/restore paths local to reduce remote administrative capability;
+- the MCP control plane follows the same rule: AI clients can operate/query the database, but bulk filesystem import and path-based backup/restore remain local operator actions.
 
 The full retrieval research history is in [`docs/RESEARCH.md`](docs/RESEARCH.md). The operational/product decisions are documented in [`docs/OPERATIONS_RESEARCH.md`](docs/OPERATIONS_RESEARCH.md).
 
@@ -105,13 +146,33 @@ The low-level engine accepts encoded equality predicates. The typed API adds:
 
 Equality queries retain the optimized exact-index path. Predicate families without a dedicated exact accelerator use a deterministic versioned-row fallback.
 
-## HTTP service
+## HTTP service and Studio
 
-`lhr serve` exposes the database through a role-based API. The safe default binds to loopback only. Remote listeners require authentication and an explicit assertion that TLS/private transport is enforced upstream.
+`lhr serve` exposes the database through a role-based API. The safe native default binds to loopback only. Remote listeners require authentication and an explicit assertion that TLS/private transport is enforced upstream.
 
-The service includes query/mutation/admin endpoints, body/rate/concurrency/resource limits, audit JSONL, health/readiness endpoints, graceful shutdown, and Prometheus-style metrics.
+The service includes query/mutation/admin endpoints, body/rate/concurrency/resource limits, audit JSONL, health/readiness endpoints, graceful shutdown, and Prometheus-style metrics. LHR Studio is a static browser application served by the same Rust service and talks to those APIs without a production Node process.
 
 See [`docs/SERVICE.md`](docs/SERVICE.md).
+
+## MCP / AI operator control
+
+The Docker appliance additionally exposes MCP on port `8788`. It uses the same bearer-key role model (`read < write < admin`) and operates against the same snapshot leases, writer lock and immutable generations as the normal service.
+
+The MCP tool surface covers:
+
+- typed lead queries + cursor pagination;
+- row/schema/statistics access;
+- EXPLAIN, workload and index inspection;
+- generations and active leases;
+- real process RSS, page faults, disk read/write bytes and filesystem capacity;
+- bounded repeated-query benchmarking;
+- structural/versioned verification;
+- row mutations for write-role clients;
+- compaction, vacuum, recovery and exact-index administration for admin-role clients.
+
+This is intended to let an AI client answer normal lead questions and also act as an operator when explicitly granted a stronger credential. Large file ingestion and filesystem backup/restore remain CLI/local by design.
+
+See [`docs/MCP.md`](docs/MCP.md).
 
 ## Format compatibility
 
@@ -127,17 +188,20 @@ See [`docs/FORMAT.md`](docs/FORMAT.md).
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — retrieval/build architecture.
 - [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — implemented database operations and invariants.
 - [`docs/SERVICE.md`](docs/SERVICE.md) — HTTP security, API, metrics, and deployment contract.
+- [`docs/MCP.md`](docs/MCP.md) — MCP connection, tool, security, diagnostic and AI-operator contract.
 - [`docs/FORMAT.md`](docs/FORMAT.md) — LHR/1 on-disk compatibility contract.
 - [`docs/STREAMING.md`](docs/STREAMING.md) — historical page-routing/streaming prototype.
 - [`docs/RUST_HANDOFF.md`](docs/RUST_HANDOFF.md) — historical Python-to-Rust transition contract.
 
 ## Repository layout
 
-- `rust/` — current engine, database product layer, CLI/service, tests, and scale benchmarks
+- `rust/` — current engine, database product layer, CLI/service/MCP, tests, and scale benchmarks
+- `studio/` — React/TypeScript/TanStack browser control plane compiled into the Docker appliance
+- `docker/` — one-process appliance entrypoint
 - `python/lhr/` — historical/reference research implementation
 - `benchmarks/` — benchmark material
 - `tests/` — Python/reference correctness tests
-- `docs/` — research, architecture, format, operations, service, and benchmark history
+- `docs/` — research, architecture, format, operations, service, MCP, and benchmark history
 
 ## Core design principles
 
@@ -151,10 +215,11 @@ See [`docs/FORMAT.md`](docs/FORMAT.md).
 - Keep logical row identity independent of physical placement.
 - Prefer immutable publication + recovery over in-place mutation.
 - Reject unknown incompatible formats rather than guessing.
+- Keep UI/API/MCP control planes bounded; never let a dashboard or model request silently scale RAM with database size.
 
 ## Validation frontier
 
-The database/product surface is now substantially implemented. Remaining work is primarily validation and optional expansion rather than a missing storage/transaction foundation:
+The database/product/control-plane surface is substantially implemented. Remaining work is primarily validation and optional expansion rather than a missing storage/transaction foundation:
 
 - 25M/50M/70M+ end-to-end scale runs;
 - long-running mixed read/write/compaction workloads;
@@ -162,7 +227,7 @@ The database/product surface is now substantially implemented. Remaining work is
 - dedicated exact indexes for additional predicate families if workload measurements justify them;
 - optional Parquet/pre-tokenized ingest;
 - incremental backup/retention policies;
-- deployment conveniences such as systemd/container examples;
+- optional systemd/native deployment conveniences beyond the Docker appliance;
 - eventual explicit migrations when an incompatible successor to LHR/1 is warranted.
 
 CI remains the relative engineering gate: correctness first, release tests under the 1 GiB virtual-memory ceiling, then the 1M/5M/10M benchmark/stress suite.

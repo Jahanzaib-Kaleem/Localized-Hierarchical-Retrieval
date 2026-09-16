@@ -8,7 +8,7 @@ RUN npm run build
 FROM rust:1.90-bookworm AS rust-build
 WORKDIR /build
 COPY rust/ ./rust/
-RUN cargo build --manifest-path rust/Cargo.toml --release --bin lhr
+RUN cargo build --manifest-path rust/Cargo.toml --release --bin lhr --bin lhr-appliance
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -19,12 +19,13 @@ RUN apt-get update \
     && mkdir -p /data /opt/lhr/studio \
     && chown -R lhr:lhr /data
 COPY --from=rust-build /build/rust/target/release/lhr /usr/local/bin/lhr
+COPY --from=rust-build /build/rust/target/release/lhr-appliance /usr/local/bin/lhr-appliance
 COPY --from=studio-build /build/studio/dist/ /opt/lhr/studio/
 COPY --chown=lhr:lhr docker/entrypoint.sh /usr/local/bin/lhr-entrypoint
 RUN chmod 0755 /usr/local/bin/lhr-entrypoint
 ENV LHR_ROOT=/data \
     LHR_STUDIO_DIR=/opt/lhr/studio
 VOLUME ["/data"]
-EXPOSE 8787
+EXPOSE 8787 8788
 USER lhr
 ENTRYPOINT ["/usr/local/bin/lhr-entrypoint"]
