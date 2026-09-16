@@ -1,0 +1,35 @@
+:root {
+  color-scheme: dark;
+
+  /* Strict LHR palette: no colors outside these five tokens. */
+  --ink-0: #000000;
+  --ink-1: #151515;
+  --ink-2: #1e1e1e;
+  --ink-3: #353535;
+  --ink-4: #e7e7e7;
+
+  --bg: var(--ink-0);
+  --surface: var(--ink-1);
+  --surface-raised: var(--ink-2);
+  --border: var(--ink-3);
+  --text: var(--ink-4);
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+
+  --radius-xs: 3px;
+  --radius-sm: 5px;
+  --radius-md: 7px;
+
+  --sidebar: 224px;
+  --topbar: 50px;
+  --content-max: 1600px;
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
