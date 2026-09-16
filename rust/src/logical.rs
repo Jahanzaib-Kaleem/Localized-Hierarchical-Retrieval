@@ -1,6 +1,6 @@
 use crate::{
     read_schema, resolve_dataset_root, DatasetSchema, DecodedValue, Dictionary, Engine, Manifest,
-    Predicate, RowIdMap,
+    Predicate, QueryExplain, RowIdMap,
 };
 use serde::Serialize;
 use std::{
@@ -34,6 +34,14 @@ pub struct LogicalQueryResult {
     pub pages_touched: u64,
     pub hierarchy_lookups: u64,
     pub rows: Vec<LogicalRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogicalExplain {
+    pub predicates: Vec<LogicalPredicate>,
+    pub dictionary_miss: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<QueryExplain>,
 }
 
 pub fn dictionary_filename(column: usize) -> String {
@@ -196,6 +204,22 @@ impl LogicalDataset {
                 })
                 .collect(),
         }
+    }
+
+    pub fn explain_values(&self, predicates: &[LogicalPredicate]) -> io::Result<LogicalExplain> {
+        let encoded = self.encoded_predicates(predicates)?;
+        Ok(match encoded {
+            None => LogicalExplain {
+                predicates: predicates.to_vec(),
+                dictionary_miss: true,
+                plan: None,
+            },
+            Some(encoded) => LogicalExplain {
+                predicates: predicates.to_vec(),
+                dictionary_miss: false,
+                plan: Some(self.engine.explain(&encoded)),
+            },
+        })
     }
 
     pub fn query_values(
