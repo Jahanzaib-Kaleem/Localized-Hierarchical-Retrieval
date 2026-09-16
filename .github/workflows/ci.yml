@@ -24,11 +24,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: studio/package-lock.json
       - name: Install Studio dependencies
         working-directory: studio
-        run: npm ci
+        run: npm install --no-audit --no-fund
       - name: Build Studio
         working-directory: studio
         run: npm run build
