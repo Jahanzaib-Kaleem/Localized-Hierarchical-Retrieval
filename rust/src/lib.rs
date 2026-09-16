@@ -15,9 +15,11 @@ pub mod intersect;
 pub mod key;
 pub mod logical;
 pub mod manifest;
+pub mod mutation;
 pub mod operations;
 pub mod planner;
 pub mod postings;
+pub mod rowids;
 pub mod schema;
 pub mod segment;
 
@@ -43,12 +45,14 @@ pub use logical::{
     NamedValue,
 };
 pub use manifest::{HierarchyMeta, Manifest, SegmentMeta};
+pub use mutation::{apply_mutations, Mutation, MutationConfig, MutationReport};
 pub use operations::{
     backup_dataset, dataset_status, read_integrity_manifest, seal_dataset, verify_dataset,
     DatasetStatus, IntegrityEntry, IntegrityManifest, VerificationReport,
 };
 pub use planner::choose_hierarchies;
 pub use postings::PostingHierarchy;
+pub use rowids::{RowIdMap, RowIdWriter, ROW_IDS_FILE};
 pub use schema::{
     read_schema, read_schema_file, write_schema, ColumnSchema, DatasetSchema, LogicalType,
     Normalization, SCHEMA_FORMAT,

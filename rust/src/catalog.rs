@@ -57,6 +57,22 @@ fn current_id(root: &Path) -> io::Result<Option<u64>> {
     Ok(Some(parse_generation_id(&text)?))
 }
 
+fn acquire_writer_lock(root: &Path) -> io::Result<File> {
+    fs::create_dir_all(root)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(root.join(WRITER_LOCK))?;
+    lock.try_lock_exclusive().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("another LHR writer owns the catalog lock: {e}"),
+        )
+    })?;
+    Ok(lock)
+}
+
 fn atomic_write_current(root: &Path, id: u64) -> io::Result<()> {
     fs::create_dir_all(root)?;
     let target = root.join(CURRENT_FILE);
@@ -145,18 +161,7 @@ fn next_generation_id(root: &Path) -> io::Result<u64> {
 pub fn begin_generation(root: impl AsRef<Path>) -> io::Result<StagedGeneration> {
     let root = root.as_ref();
     fs::create_dir_all(root.join(GENERATIONS_DIR))?;
-    let lock_path = root.join(WRITER_LOCK);
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(lock_path)?;
-    lock.try_lock_exclusive().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::WouldBlock,
-            format!("another LHR writer owns the catalog lock: {e}"),
-        )
-    })?;
+    let lock = acquire_writer_lock(root)?;
 
     let id = next_generation_id(root)?;
     let path = root
@@ -223,8 +228,11 @@ pub fn abandon_generation(stage: StagedGeneration) -> io::Result<()> {
 }
 
 /// Atomically repoint CURRENT to an already-published, verified generation.
+/// Rollback participates in the same single-writer lock as imports and mutations so it cannot
+/// race a generation build/publication.
 pub fn rollback_generation(root: impl AsRef<Path>, id: u64) -> io::Result<GenerationInfo> {
     let root = root.as_ref();
+    let _lock = acquire_writer_lock(root)?;
     let path = generation_path(root, id);
     if !path.is_dir() {
         return Err(io::Error::new(

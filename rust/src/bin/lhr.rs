@@ -1,11 +1,12 @@
 use clap::{Parser, Subcommand};
 use lhr::{
-    backup_dataset, dataset_status, import_csv, list_generations, read_schema_file,
-    resolve_dataset_root, rollback_generation, seal_dataset, verify_dataset, CsvImportConfig,
-    DatasetSchema, Engine, LogicalDataset, LogicalPredicate, Predicate,
+    apply_mutations, backup_dataset, dataset_status, import_csv, list_generations,
+    read_schema_file, resolve_dataset_root, rollback_generation, seal_dataset, verify_dataset,
+    CsvImportConfig, DatasetSchema, Engine, LogicalDataset, LogicalPredicate, Mutation,
+    MutationConfig, Predicate,
 };
 use serde_json::json;
-use std::{error::Error, path::PathBuf, process};
+use std::{error::Error, fs, path::PathBuf, process};
 
 #[derive(Parser, Debug)]
 #[command(name = "lhr", version, about = "Localized Hierarchical Retrieval operational CLI")]
@@ -50,6 +51,16 @@ enum Command {
     Import {
         #[command(subcommand)]
         command: ImportCommand,
+    },
+    /// Apply a JSON array of insert/update/delete operations as one atomic generation.
+    Mutate {
+        file: PathBuf,
+        #[arg(long, default_value_t = 16_384)]
+        batch_rows: usize,
+        #[arg(long, default_value_t = 250_000)]
+        max_sort_records: usize,
+        #[arg(long, default_value_t = 67_108_864)]
+        dictionary_run_bytes: usize,
     },
     /// Back up the current resolved generation to a new destination.
     Backup {
@@ -170,6 +181,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                 print_json(&import_csv(&cli.root, source, &schema, &config)?)?;
             }
         },
+        Command::Mutate {
+            file,
+            batch_rows,
+            max_sort_records,
+            dictionary_run_bytes,
+        } => {
+            let mutations: Vec<Mutation> = serde_json::from_slice(&fs::read(file)?)?;
+            let config = MutationConfig {
+                batch_rows,
+                max_sort_records,
+                dictionary_run_bytes,
+            };
+            print_json(&apply_mutations(&cli.root, &mutations, &config)?)?;
+        }
         Command::Generations { command } => match command {
             GenerationCommand::List => print_json(&list_generations(&cli.root)?)?,
             GenerationCommand::Current => {
@@ -212,7 +237,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let (row_ids, stats) = engine.query_row_ids(&predicates, limit);
                     print_json(&json!({
                         "generation_path": dataset,
-                        "row_ids": row_ids,
+                        "physical_row_ids": row_ids,
                         "returned": row_ids.len(),
                         "limit": limit,
                         "stats": {
@@ -256,7 +281,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "verification": report,
                     }))?;
                 }
-                Command::Import { .. } | Command::Generations { .. } => unreachable!(),
+                Command::Import { .. } | Command::Mutate { .. } | Command::Generations { .. } => {
+                    unreachable!()
+                }
             }
         }
     }
