@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +64,10 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
+fn csv_error(error: csv::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
 fn canonical_value(
     dataset: &LogicalDataset,
     column: usize,
@@ -107,7 +111,9 @@ fn prepare(dataset: &LogicalDataset, mutations: &[Mutation]) -> io::Result<Prepa
                     return Err(invalid(format!("row_id {row_id} does not exist")));
                 }
                 if deletes.contains(row_id) {
-                    return Err(invalid(format!("row_id {row_id} was already deleted in this transaction")));
+                    return Err(invalid(format!(
+                        "row_id {row_id} was already deleted in this transaction"
+                    )));
                 }
                 if values.is_empty() {
                     return Err(invalid(format!("update for row_id {row_id} has no values")));
@@ -218,8 +224,11 @@ fn write_mutation_csv(
         ));
     }
 
-    let mut csv = csv::WriterBuilder::new().from_path(path)?;
-    csv.write_record(dataset.schema().columns.iter().map(|x| x.name.as_str()))?;
+    let mut csv = csv::WriterBuilder::new()
+        .from_path(path)
+        .map_err(csv_error)?;
+    csv.write_record(dataset.schema().columns.iter().map(|x| x.name.as_str()))
+        .map_err(csv_error)?;
     let mut row_ids = RowIdWriter::create(row_ids_path, rows_after)?;
 
     for physical in 0..dataset.physical_rows() {
@@ -243,7 +252,7 @@ fn write_mutation_csv(
                 None => sentinels[column].as_deref().unwrap(),
             })
             .collect();
-        csv.write_record(record)?;
+        csv.write_record(record).map_err(csv_error)?;
         row_ids.push(logical)?;
     }
 
@@ -262,7 +271,7 @@ fn write_mutation_csv(
                 None => sentinels[column].as_deref().unwrap(),
             })
             .collect();
-        csv.write_record(record)?;
+        csv.write_record(record).map_err(csv_error)?;
         row_ids.push(next_id)?;
         next_id = next_id
             .checked_add(1)
@@ -270,9 +279,7 @@ fn write_mutation_csv(
     }
     csv.flush()?;
     row_ids.finish()?;
-    let max_row_id = if rows_after == 0 {
-        None
-    } else if prepared.inserts.is_empty() {
+    let max_row_id = if prepared.inserts.is_empty() {
         (0..dataset.physical_rows())
             .rev()
             .filter_map(|physical| dataset.logical_row_id(physical))
