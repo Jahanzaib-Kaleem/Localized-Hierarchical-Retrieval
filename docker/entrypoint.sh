@@ -36,4 +36,7 @@ cat > /tmp/lhr-service.json <<EOF
 }
 EOF
 
-exec /usr/local/bin/lhr --root "$ROOT" serve --config /tmp/lhr-service.json
+exec /usr/local/bin/lhr-appliance \
+  --root "$ROOT" \
+  --config /tmp/lhr-service.json \
+  --mcp-bind "0.0.0.0:8788"
