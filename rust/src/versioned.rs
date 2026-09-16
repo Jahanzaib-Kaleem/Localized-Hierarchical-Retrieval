@@ -1,8 +1,11 @@
 use crate::{
     read_overlay, DeltaLayerMeta, LogicalDataset, LogicalExplain, LogicalPredicate, LogicalQueryResult,
-    LogicalRow, NamedValue, OverlayCatalog, VisibilityMap, VisibilityTarget,
+    LogicalRow, OverlayCatalog, SnapshotLease, VisibilityMap, VisibilityTarget,
 };
-use std::{io, path::{Path, PathBuf}};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 struct Layer {
     id: u32,
@@ -11,18 +14,21 @@ struct Layer {
 
 /// A logical view over one immutable base generation plus zero or more immutable delta layers.
 /// Visibility overrides select the newest row version (or a tombstone) by stable logical row ID.
+/// A shared generation lease pins the resolved CURRENT snapshot for the lifetime of this object.
 pub struct VersionedDataset {
     root: PathBuf,
     base: LogicalDataset,
     deltas: Vec<Layer>,
     overlay: OverlayCatalog,
     visibility: VisibilityMap,
+    _snapshot: SnapshotLease,
 }
 
 impl VersionedDataset {
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
-        let base = LogicalDataset::open(root)?;
-        let root = base.root().to_path_buf();
+        let snapshot = SnapshotLease::acquire(root)?;
+        let root = snapshot.path().to_path_buf();
+        let base = LogicalDataset::open(&root)?;
         let overlay = read_overlay(&root, base.physical_rows(), base.max_row_id())?;
         let visibility = VisibilityMap::open_optional(&root)?;
         let mut deltas = Vec::with_capacity(overlay.deltas.len());
@@ -53,24 +59,51 @@ impl VersionedDataset {
                 }
             }
         }
-        Ok(Self { root, base, deltas, overlay, visibility })
+        Ok(Self {
+            root,
+            base,
+            deltas,
+            overlay,
+            visibility,
+            _snapshot: snapshot,
+        })
     }
 
-    pub fn root(&self) -> &Path { &self.root }
-    pub fn schema(&self) -> &crate::DatasetSchema { self.base.schema() }
-    pub fn visible_rows(&self) -> u64 { self.overlay.visible_rows }
-    pub fn max_row_id(&self) -> Option<u64> { self.overlay.max_row_id }
-    pub fn overlay(&self) -> &OverlayCatalog { &self.overlay }
-    pub fn visibility(&self) -> &VisibilityMap { &self.visibility }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn schema(&self) -> &crate::DatasetSchema {
+        self.base.schema()
+    }
+    pub fn visible_rows(&self) -> u64 {
+        self.overlay.visible_rows
+    }
+    pub fn max_row_id(&self) -> Option<u64> {
+        self.overlay.max_row_id
+    }
+    pub fn overlay(&self) -> &OverlayCatalog {
+        &self.overlay
+    }
+    pub fn visibility(&self) -> &VisibilityMap {
+        &self.visibility
+    }
 
     pub fn contains_canonical_value(&self, column: usize, value: &str) -> bool {
         self.base.contains_canonical_value(column, value)
-            || self.deltas.iter().any(|x| x.dataset.contains_canonical_value(column, value))
+            || self
+                .deltas
+                .iter()
+                .any(|x| x.dataset.contains_canonical_value(column, value))
     }
 
     fn layer(&self, id: u32) -> Option<&LogicalDataset> {
-        if id == 0 { return Some(&self.base); }
-        self.deltas.iter().find(|x| x.id == id).map(|x| &x.dataset)
+        if id == 0 {
+            return Some(&self.base);
+        }
+        self.deltas
+            .iter()
+            .find(|x| x.id == id)
+            .map(|x| &x.dataset)
     }
 
     fn visible_in_layer(&self, row_id: u64, layer: u32) -> bool {
@@ -110,11 +143,21 @@ impl VersionedDataset {
         }
     }
 
-    fn values_match(&self, values: &[Option<String>], predicates: &[LogicalPredicate]) -> io::Result<bool> {
+    fn values_match(
+        &self,
+        values: &[Option<String>],
+        predicates: &[LogicalPredicate],
+    ) -> io::Result<bool> {
         for predicate in predicates {
-            let column = self.schema().column_index(&predicate.column).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("unknown column {}", predicate.column))
-            })?;
+            let column = self
+                .schema()
+                .column_index(&predicate.column)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unknown column {}", predicate.column),
+                    )
+                })?;
             let schema = &self.schema().columns[column];
             let expected = match predicate.value.as_deref() {
                 None => {
@@ -129,7 +172,9 @@ impl VersionedDataset {
                 Some(raw) if schema.is_null_literal(raw) => None,
                 Some(raw) => Some(schema.canonicalize(raw)?),
             };
-            if values.get(column) != Some(&expected) { return Ok(false); }
+            if values.get(column) != Some(&expected) {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -150,12 +195,17 @@ impl VersionedDataset {
             let Some(physical) = dataset.physical_row_id(row_id) else { continue; };
             hidden_rows = hidden_rows.saturating_add(1);
             let values = dataset.decode_physical_values(physical)?;
-            if self.values_match(&values, predicates)? { hidden_hits += 1; }
+            if self.values_match(&values, predicates)? {
+                hidden_hits += 1;
+            }
         }
         Ok((hidden_hits, hidden_rows))
     }
 
-    pub fn explain_values(&self, predicates: &[LogicalPredicate]) -> io::Result<Vec<(u32, LogicalExplain)>> {
+    pub fn explain_values(
+        &self,
+        predicates: &[LogicalPredicate],
+    ) -> io::Result<Vec<(u32, LogicalExplain)>> {
         let mut plans = Vec::with_capacity(self.deltas.len() + 1);
         plans.push((0, self.base.explain_values(predicates)?));
         for layer in &self.deltas {
@@ -177,22 +227,32 @@ impl VersionedDataset {
         let mut rows = Vec::<LogicalRow>::new();
 
         let mut run_layer = |layer_id: u32, dataset: &LogicalDataset| -> io::Result<()> {
-            let (hidden_hits, hidden_rows) = self.hidden_match_count(layer_id, dataset, predicates)?;
+            let (hidden_hits, hidden_rows) =
+                self.hidden_match_count(layer_id, dataset, predicates)?;
             let fetch_limit = limit.saturating_add(hidden_rows);
             let result = dataset.query_values(predicates, select, fetch_limit)?;
             hits = hits.saturating_add(result.hits.saturating_sub(hidden_hits));
             rows_checked = rows_checked.saturating_add(result.rows_checked);
             pages_touched = pages_touched.saturating_add(result.pages_touched);
             hierarchy_lookups = hierarchy_lookups.saturating_add(result.hierarchy_lookups);
-            rows.extend(result.rows.into_iter().filter(|row| self.visible_in_layer(row.row_id, layer_id)));
+            rows.extend(
+                result
+                    .rows
+                    .into_iter()
+                    .filter(|row| self.visible_in_layer(row.row_id, layer_id)),
+            );
             Ok(())
         };
 
         run_layer(0, &self.base)?;
-        for layer in &self.deltas { run_layer(layer.id, &layer.dataset)?; }
+        for layer in &self.deltas {
+            run_layer(layer.id, &layer.dataset)?;
+        }
         rows.sort_unstable_by_key(|row| row.row_id);
         rows.dedup_by_key(|row| row.row_id);
-        if rows.len() > limit { rows.truncate(limit); }
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
 
         Ok(LogicalQueryResult {
             hits,
@@ -213,27 +273,44 @@ impl VersionedDataset {
         loop {
             let mut next: Option<u64> = None;
             for (index, position) in positions.iter().enumerate() {
-                let dataset = if index == 0 { &self.base } else { &self.deltas[index - 1].dataset };
-                if *position >= dataset.physical_rows() { continue; }
+                let dataset = if index == 0 {
+                    &self.base
+                } else {
+                    &self.deltas[index - 1].dataset
+                };
+                if *position >= dataset.physical_rows() {
+                    continue;
+                }
                 let id = dataset.logical_row_id(*position).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "layer row is missing logical row ID")
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "layer row is missing logical row ID",
+                    )
                 })?;
                 next = Some(next.map_or(id, |old| old.min(id)));
             }
             let Some(row_id) = next else { break; };
 
             for (index, position) in positions.iter_mut().enumerate() {
-                let dataset = if index == 0 { &self.base } else { &self.deltas[index - 1].dataset };
+                let dataset = if index == 0 {
+                    &self.base
+                } else {
+                    &self.deltas[index - 1].dataset
+                };
                 while *position < dataset.physical_rows()
                     && dataset.logical_row_id(*position) == Some(row_id)
                 {
                     *position += 1;
                 }
             }
-            if let Some(values) = self.row_values(row_id)? { f(row_id, values)?; }
+            if let Some(values) = self.row_values(row_id)? {
+                f(row_id, values)?;
+            }
         }
         Ok(())
     }
 
-    pub fn delta_meta(&self) -> &[DeltaLayerMeta] { &self.overlay.deltas }
+    pub fn delta_meta(&self) -> &[DeltaLayerMeta] {
+        &self.overlay.deltas
+    }
 }
