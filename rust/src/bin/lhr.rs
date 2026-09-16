@@ -1,10 +1,12 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use lhr::{
     add_index, apply_mutations_delta, backup_dataset, compact_dataset, dataset_stats,
-    dataset_status, drop_index, import_csv, list_generations, list_indexes, read_schema_file,
-    rebuild_index, recover_catalog, resolve_dataset_root, restore_backup, rollback_generation,
-    seal_dataset, vacuum_with_reader_leases, verify_versioned_dataset, CompactionConfig,
-    CsvImportConfig, DatasetSchema, Engine, LogicalPredicate, Mutation, MutationConfig, Predicate,
+    dataset_status, drop_index, execute_query, import_csv, import_external, list_generations,
+    list_indexes, planner_indexes_for_request, read_schema_file, rebuild_index, record_query,
+    recover_catalog, resolve_dataset_root, restore_backup, rollback_generation, seal_dataset,
+    serve, vacuum_with_reader_leases, verify_versioned_dataset, workload_report, CompactionConfig,
+    CsvImportConfig, DatasetSchema, Engine, ExternalFormat, ExternalImportConfig, LogicalPredicate,
+    Mutation, MutationConfig, Predicate, QueryRequest, ServiceConfig, SnapshotLease,
     VersionedDataset,
 };
 use serde_json::json;
@@ -52,6 +54,15 @@ enum Command {
         #[arg(long = "is-null")]
         null_columns: Vec<String>,
     },
+    /// Execute the typed exact query protocol from a JSON request file.
+    QueryJson {
+        file: PathBuf,
+        /// Do not append this query to persistent workload telemetry.
+        #[arg(long)]
+        no_telemetry: bool,
+    },
+    /// Aggregate persistent query telemetry and recommend useful exact accelerators.
+    Workload,
     Import {
         #[command(subcommand)]
         command: ImportCommand,
@@ -86,10 +97,33 @@ enum Command {
         #[command(subcommand)]
         command: GenerationCommand,
     },
+    /// Run the authenticated HTTP service. Remote cleartext binds are refused unless the config
+    /// explicitly states that a trusted TLS reverse proxy/private transport protects the listener.
+    Serve {
+        /// JSON service configuration. Defaults to secure loopback-only settings.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the configured bind address, e.g. 127.0.0.1:8787.
+        #[arg(long)]
+        bind: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliExternalFormat { Csv, Jsonl, Json }
+impl From<CliExternalFormat> for ExternalFormat {
+    fn from(value: CliExternalFormat) -> Self {
+        match value {
+            CliExternalFormat::Csv => ExternalFormat::Csv,
+            CliExternalFormat::Jsonl => ExternalFormat::Jsonl,
+            CliExternalFormat::Json => ExternalFormat::Json,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
 enum ImportCommand {
+    /// Fast strict CSV import.
     Csv {
         source: PathBuf,
         #[arg(long)]
@@ -104,6 +138,38 @@ enum ImportCommand {
         max_sort_records: usize,
         #[arg(long, default_value_t = 67_108_864)]
         dictionary_run_bytes: usize,
+    },
+    /// Reject-aware, resumable import for CSV, JSONL, or streaming JSON arrays.
+    External {
+        source: PathBuf,
+        #[arg(long)]
+        schema: PathBuf,
+        #[arg(long, value_enum)]
+        format: CliExternalFormat,
+        #[arg(long = "index")]
+        indexes: Vec<String>,
+        #[arg(long, default_value_t = 1024)]
+        page_rows: usize,
+        #[arg(long, default_value_t = 16_384)]
+        batch_rows: usize,
+        #[arg(long, default_value_t = 250_000)]
+        max_sort_records: usize,
+        #[arg(long, default_value_t = 67_108_864)]
+        dictionary_run_bytes: usize,
+        #[arg(long, default_value_t = 0)]
+        max_rejects: usize,
+        #[arg(long)]
+        reject_output: Option<PathBuf>,
+        #[arg(long)]
+        progress: Option<PathBuf>,
+        #[arg(long, default_value_t = 10_000)]
+        progress_every: u64,
+        #[arg(long)]
+        resume_id: Option<String>,
+        #[arg(long, default_value_t = 268_435_456)]
+        minimum_free_bytes: u64,
+        #[arg(long)]
+        allow_unknown_json_fields: bool,
     },
 }
 
@@ -191,6 +257,16 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<(), Box<dyn Error>> {
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Serve { config, bind } => {
+            let mut config = match config {
+                Some(path) => ServiceConfig::from_json_file(path)?,
+                None => ServiceConfig::default(),
+            };
+            if let Some(bind) = bind { config.bind = bind; }
+            config.validate()?;
+            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            runtime.block_on(serve(&cli.root, config))?;
+        }
         Command::Import { command } => match command {
             ImportCommand::Csv {
                 source, schema, indexes, page_rows, batch_rows, max_sort_records,
@@ -203,7 +279,39 @@ fn main() -> Result<(), Box<dyn Error>> {
                 };
                 print_json(&import_csv(&cli.root, source, &schema, &config)?)?;
             }
+            ImportCommand::External {
+                source, schema, format, indexes, page_rows, batch_rows, max_sort_records,
+                dictionary_run_bytes, max_rejects, reject_output, progress, progress_every,
+                resume_id, minimum_free_bytes, allow_unknown_json_fields,
+            } => {
+                let schema = read_schema_file(schema)?;
+                let engine = CsvImportConfig {
+                    page_rows, batch_rows, max_sort_records, dictionary_run_bytes,
+                    accelerators: parse_indexes(&indexes, &schema)?,
+                };
+                let config = ExternalImportConfig {
+                    engine,
+                    max_rejects,
+                    reject_output,
+                    progress_path: progress,
+                    progress_every,
+                    resume_id,
+                    minimum_free_bytes,
+                    reject_unknown_json_fields: !allow_unknown_json_fields,
+                };
+                print_json(&import_external(&cli.root, source, format.into(), &schema, &config)?)?;
+            }
         },
+        Command::QueryJson { file, no_telemetry } => {
+            let request: QueryRequest = serde_json::from_slice(&fs::read(file)?)?;
+            let lease = SnapshotLease::acquire(&cli.root)?;
+            let dataset = VersionedDataset::open(lease.path())?;
+            let indexes = planner_indexes_for_request(&dataset, &request)?;
+            let response = execute_query(&dataset, &request)?;
+            if !no_telemetry { record_query(&cli.root, &request, &response, indexes)?; }
+            print_json(&response)?;
+        }
+        Command::Workload => print_json(&workload_report(&cli.root)?)?,
         Command::Mutate { file, batch_rows, max_sort_records, dictionary_run_bytes } => {
             let mutations: Vec<Mutation> = serde_json::from_slice(&fs::read(file)?)?;
             let config = MutationConfig { batch_rows, max_sort_records, dictionary_run_bytes };
@@ -230,7 +338,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         },
         command => {
-            let dataset = resolve_dataset_root(&cli.root)?;
+            let lease = SnapshotLease::acquire(&cli.root)?;
+            let dataset = lease.path().to_path_buf();
             match command {
                 Command::Status => print_json(&dataset_status(&dataset)?)?,
                 Command::Stats => print_json(&dataset_stats(&cli.root)?)?,
@@ -257,21 +366,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 Command::QueryValues { predicates, null_columns, select, limit } => {
                     let predicates = logical_predicates(predicates, null_columns)?;
-                    let logical = VersionedDataset::open(&cli.root)?;
+                    let logical = VersionedDataset::open(&dataset)?;
                     let selection = if select.is_empty() { None } else { Some(select.as_slice()) };
                     print_json(&logical.query_values(&predicates, selection, limit)?)?;
                 }
                 Command::ExplainValues { predicates, null_columns } => {
                     let predicates = logical_predicates(predicates, null_columns)?;
-                    print_json(&VersionedDataset::open(&cli.root)?.explain_values(&predicates)?)?;
+                    print_json(&VersionedDataset::open(&dataset)?.explain_values(&predicates)?)?;
                 }
                 Command::Backup { destination } => {
                     let report = backup_dataset(&dataset, &destination)?;
                     print_json(&json!({ "source_generation": dataset, "destination": destination, "verification": report }))?;
                 }
-                Command::Import { .. } | Command::Mutate { .. } | Command::Compact { .. }
-                | Command::Indexes { .. } | Command::Restore { .. } | Command::Recover
-                | Command::Generations { .. } => unreachable!(),
+                Command::Import { .. } | Command::QueryJson { .. } | Command::Workload
+                | Command::Mutate { .. } | Command::Compact { .. } | Command::Indexes { .. }
+                | Command::Restore { .. } | Command::Recover | Command::Generations { .. }
+                | Command::Serve { .. } => unreachable!(),
             }
         }
     }

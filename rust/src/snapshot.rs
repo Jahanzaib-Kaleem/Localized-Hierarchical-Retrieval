@@ -16,24 +16,33 @@ pub struct SnapshotLease {
     _lock: Option<File>,
 }
 
+fn published_generation(path: &Path) -> Option<(u64, PathBuf)> {
+    let id = path
+        .file_name()?
+        .to_str()?
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| path.file_name().unwrap().to_str().unwrap())?
+        .parse::<u64>()
+        .ok()?;
+    let generations = path.parent()?;
+    if generations.file_name()?.to_str()? != "generations" {
+        return None;
+    }
+    let catalog = generations.parent()?.to_path_buf();
+    Some((id, catalog))
+}
+
 impl SnapshotLease {
-    /// Resolve CURRENT once and hold a shared OS lock for the selected generation. Publication of
-    /// a newer generation does not affect this snapshot; lease-aware vacuum will not unlink it.
+    /// Resolve CURRENT once and hold a shared OS lock for the selected published generation.
+    /// Publication of a newer generation does not affect this snapshot; lease-aware vacuum will
+    /// not unlink it. Passing either the catalog root or an already-resolved generation path uses
+    /// the same catalog-level READERS lock directory.
     pub fn acquire(root: impl AsRef<Path>) -> io::Result<Self> {
-        let catalog = root.as_ref();
-        let path = resolve_dataset_root(catalog)?;
-        let generation_id = path
-            .file_name()
-            .and_then(|x| x.to_str())
-            .filter(|x| x.len() == 20 && x.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|x| x.parse::<u64>().ok())
-            .filter(|_| {
-                path.parent()
-                    .and_then(|x| x.file_name())
-                    .and_then(|x| x.to_str())
-                    == Some("generations")
-            });
-        let lock = if let Some(id) = generation_id {
+        let path = resolve_dataset_root(root)?;
+        let published = published_generation(&path);
+        let generation_id = published.as_ref().map(|x| x.0);
+        let lock = if let Some((id, catalog)) = published {
             let dir = catalog.join(READERS_DIR);
             fs::create_dir_all(&dir)?;
             let file = OpenOptions::new()
@@ -123,8 +132,7 @@ mod tests {
     use super::*;
     use crate::{build_u8_batches, begin_generation, publish_generation, BuildConfig};
 
-    #[test]
-    fn active_snapshot_is_reported_as_leased() {
+    fn dataset() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let stage = begin_generation(dir.path()).unwrap();
         let cfg = BuildConfig {
@@ -136,8 +144,26 @@ mod tests {
         };
         build_u8_batches(vec![vec![0u8, 1u8, 0u8, 1u8]], &stage.path, &cfg).unwrap();
         publish_generation(stage).unwrap();
+        dir
+    }
+
+    #[test]
+    fn active_snapshot_is_reported_as_leased() {
+        let dir = dataset();
         let lease = SnapshotLease::acquire(dir.path()).unwrap();
         assert_eq!(leased_generation_ids(dir.path()).unwrap(), vec![1]);
+        drop(lease);
+        assert!(leased_generation_ids(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolved_generation_path_uses_catalog_reader_lock() {
+        let dir = dataset();
+        let generation = resolve_dataset_root(dir.path()).unwrap();
+        let lease = SnapshotLease::acquire(&generation).unwrap();
+        assert_eq!(lease.generation_id(), Some(1));
+        assert_eq!(leased_generation_ids(dir.path()).unwrap(), vec![1]);
+        assert!(!generation.join(READERS_DIR).exists());
         drop(lease);
         assert!(leased_generation_ids(dir.path()).unwrap().is_empty());
     }
