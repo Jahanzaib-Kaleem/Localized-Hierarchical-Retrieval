@@ -182,8 +182,6 @@ fn next_generation_id(root: &Path) -> io::Result<u64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "generation id overflow"))
 }
 
-/// Begin an unpublished immutable generation while holding the catalog's writer lock.
-/// Build canonical/index files inside `stage.path`, then call `publish_generation`.
 pub fn begin_generation(root: impl AsRef<Path>) -> io::Result<StagedGeneration> {
     let root = root.as_ref();
     fs::create_dir_all(root.join(GENERATIONS_DIR))?;
@@ -208,7 +206,6 @@ pub fn begin_generation(root: impl AsRef<Path>) -> io::Result<StagedGeneration> 
     })
 }
 
-/// Verify, seal, atomically install, and then publish a staged generation through CURRENT.
 pub fn publish_generation(stage: StagedGeneration) -> io::Result<GenerationInfo> {
     let mut report = verify_dataset(&stage.path)?;
     if !report.valid {
@@ -253,9 +250,6 @@ pub fn abandon_generation(stage: StagedGeneration) -> io::Result<()> {
     Ok(())
 }
 
-/// Atomically repoint CURRENT to an already-published, verified generation.
-/// Rollback participates in the same single-writer lock as imports and mutations so it cannot
-/// race a generation build/publication.
 pub fn rollback_generation(root: impl AsRef<Path>, id: u64) -> io::Result<GenerationInfo> {
     let root = root.as_ref();
     let _lock = acquire_writer_lock(root)?;
@@ -282,9 +276,6 @@ pub fn rollback_generation(root: impl AsRef<Path>, id: u64) -> io::Result<Genera
     })
 }
 
-/// Remove old immutable generations and abandoned writer work while preserving CURRENT,
-/// explicitly protected generations, and the newest `retain_newest` published generations.
-/// The same single-writer lock used by import/mutation/rollback makes deletion race-free.
 pub fn vacuum_generations(
     root: impl AsRef<Path>,
     retain_newest: usize,
@@ -349,9 +340,11 @@ pub fn vacuum_generations(
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if entry.file_type()?.is_dir()
-            && (name.starts_with(".mutation-work-") || name.starts_with(".restore-work-"))
-        {
+        let stale_work = name.starts_with(".mutation-work-")
+            || name.starts_with(".restore-work-")
+            || name.starts_with(".delta-work-")
+            || name.starts_with(".compaction-work-");
+        if entry.file_type()?.is_dir() && stale_work {
             bytes_reclaimed = bytes_reclaimed.saturating_add(directory_bytes(&entry.path())?);
             fs::remove_dir_all(entry.path())?;
             stale_paths_removed += 1;
