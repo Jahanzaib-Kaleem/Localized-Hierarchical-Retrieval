@@ -37,6 +37,11 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Explain the exact encoded-token query plan and candidate counts without returning rows.
+    Explain {
+        #[arg(value_name = "COLUMN=VALUE", required = true)]
+        predicates: Vec<String>,
+    },
     /// Query using schema column names and original external values.
     QueryValues {
         #[arg(value_name = "NAME=VALUE")]
@@ -49,6 +54,13 @@ enum Command {
         select: Vec<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+    },
+    /// Explain a named-value query after dictionary encoding and normalization.
+    ExplainValues {
+        #[arg(value_name = "NAME=VALUE")]
+        predicates: Vec<String>,
+        #[arg(long = "is-null")]
+        null_columns: Vec<String>,
     },
     /// Import external data into a new immutable generation.
     Import {
@@ -172,6 +184,24 @@ fn parse_logical_predicate(raw: &str) -> Result<LogicalPredicate, Box<dyn Error>
         column: column.to_owned(),
         value: Some(value.to_owned()),
     })
+}
+
+fn logical_predicates(
+    predicates: Vec<String>,
+    null_columns: Vec<String>,
+) -> Result<Vec<LogicalPredicate>, Box<dyn Error>> {
+    let mut predicates = predicates
+        .iter()
+        .map(|x| parse_logical_predicate(x))
+        .collect::<Result<Vec<_>, _>>()?;
+    predicates.extend(null_columns.into_iter().map(|column| LogicalPredicate {
+        column,
+        value: None,
+    }));
+    if predicates.is_empty() {
+        return Err("at least one predicate is required".into());
+    }
+    Ok(predicates)
 }
 
 fn parse_indexes(indexes: &[String], schema: &DatasetSchema) -> Result<Vec<Vec<usize>>, Box<dyn Error>> {
@@ -305,13 +335,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "physical_row_ids": row_ids,
                         "returned": row_ids.len(),
                         "limit": limit,
-                        "stats": {
-                            "hits": stats.hits,
-                            "rows_checked": stats.rows_checked,
-                            "pages_touched": stats.pages_touched,
-                            "hierarchy_lookups": stats.hierarchy_lookups,
-                        }
+                        "stats": stats,
                     }))?;
+                }
+                Command::Explain { predicates } => {
+                    let predicates = predicates
+                        .iter()
+                        .map(|x| parse_predicate(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let engine = Engine::open(&dataset)?;
+                    print_json(&engine.explain(&predicates))?;
                 }
                 Command::QueryValues {
                     predicates,
@@ -319,17 +352,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     select,
                     limit,
                 } => {
-                    let mut predicates = predicates
-                        .iter()
-                        .map(|x| parse_logical_predicate(x))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    predicates.extend(null_columns.into_iter().map(|column| LogicalPredicate {
-                        column,
-                        value: None,
-                    }));
-                    if predicates.is_empty() {
-                        return Err("query-values requires at least one predicate".into());
-                    }
+                    let predicates = logical_predicates(predicates, null_columns)?;
                     let logical = LogicalDataset::open(&cli.root)?;
                     let selection = if select.is_empty() {
                         None
@@ -337,6 +360,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                         Some(select.as_slice())
                     };
                     print_json(&logical.query_values(&predicates, selection, limit)?)?;
+                }
+                Command::ExplainValues {
+                    predicates,
+                    null_columns,
+                } => {
+                    let predicates = logical_predicates(predicates, null_columns)?;
+                    let logical = LogicalDataset::open(&cli.root)?;
+                    print_json(&logical.explain_values(&predicates)?)?;
                 }
                 Command::Backup { destination } => {
                     let report = backup_dataset(&dataset, &destination)?;
