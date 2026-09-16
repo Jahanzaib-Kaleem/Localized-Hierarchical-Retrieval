@@ -27,7 +27,12 @@ impl SnapshotLease {
             .and_then(|x| x.to_str())
             .filter(|x| x.len() == 20 && x.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|x| x.parse::<u64>().ok())
-            .filter(|_| path.parent().and_then(|x| x.file_name()).and_then(|x| x.to_str()) == Some("generations"));
+            .filter(|_| {
+                path.parent()
+                    .and_then(|x| x.file_name())
+                    .and_then(|x| x.to_str())
+                    == Some("generations")
+            });
         let lock = if let Some(id) = generation_id {
             let dir = catalog.join(READERS_DIR);
             fs::create_dir_all(&dir)?;
@@ -41,24 +46,42 @@ impl SnapshotLease {
         } else {
             None
         };
-        Ok(Self { path, generation_id, _lock: lock })
+        Ok(Self {
+            path,
+            generation_id,
+            _lock: lock,
+        })
     }
 
-    pub fn path(&self) -> &Path { &self.path }
-    pub fn generation_id(&self) -> Option<u64> { self.generation_id }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn generation_id(&self) -> Option<u64> {
+        self.generation_id
+    }
 }
 
 pub fn leased_generation_ids(root: impl AsRef<Path>) -> io::Result<Vec<u64>> {
     let dir = root.as_ref().join(READERS_DIR);
-    if !dir.exists() { return Ok(Vec::new()); }
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
     let mut leased = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() { continue; }
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(raw) = name.strip_suffix(".lock") else { continue; };
-        if raw.len() != 20 || !raw.bytes().all(|b| b.is_ascii_digit()) { continue; }
-        let Ok(id) = raw.parse::<u64>() else { continue; };
+        let Some(raw) = name.strip_suffix(".lock") else {
+            continue;
+        };
+        if raw.len() != 20 || !raw.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(id) = raw.parse::<u64>() else {
+            continue;
+        };
         let file = OpenOptions::new().read(true).write(true).open(entry.path())?;
         match file.try_lock_exclusive() {
             Ok(()) => {
@@ -89,7 +112,10 @@ pub fn vacuum_with_reader_leases(
     keep.extend(leased.iter().copied());
     let keep: Vec<_> = keep.into_iter().collect();
     let vacuum = vacuum_generations(root, retain_newest, &keep)?;
-    Ok(SafeVacuumReport { leased_generations: leased, vacuum })
+    Ok(SafeVacuumReport {
+        leased_generations: leased,
+        vacuum,
+    })
 }
 
 #[cfg(test)]
@@ -101,11 +127,14 @@ mod tests {
     fn active_snapshot_is_reported_as_leased() {
         let dir = tempfile::tempdir().unwrap();
         let stage = begin_generation(dir.path()).unwrap();
-        build_u8_batches(
-            &stage.path,
-            vec![vec![0u8, 1u8, 0u8, 1u8]],
-            BuildConfig { columns: 2, cardinalities: vec![2, 2], page_rows: 2, segment_rows: 4, hierarchies: vec![] },
-        ).unwrap();
+        let cfg = BuildConfig {
+            columns: 2,
+            cardinalities: vec![2, 2],
+            page_rows: 2,
+            hierarchies: vec![],
+            max_sort_records: 32,
+        };
+        build_u8_batches(vec![vec![0u8, 1u8, 0u8, 1u8]], &stage.path, &cfg).unwrap();
         publish_generation(stage).unwrap();
         let lease = SnapshotLease::acquire(dir.path()).unwrap();
         assert_eq!(leased_generation_ids(dir.path()).unwrap(), vec![1]);
