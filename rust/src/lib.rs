@@ -11,6 +11,7 @@ pub mod hierarchy;
 pub mod intersect;
 pub mod key;
 pub mod manifest;
+pub mod operations;
 pub mod planner;
 pub mod postings;
 pub mod segment;
@@ -27,6 +28,10 @@ pub use hierarchy::{Hierarchy, Record};
 pub use intersect::intersect_sorted;
 pub use key::mixed_radix_key;
 pub use manifest::{HierarchyMeta, Manifest, SegmentMeta};
+pub use operations::{
+    backup_dataset, dataset_status, read_integrity_manifest, seal_dataset, verify_dataset,
+    DatasetStatus, IntegrityEntry, IntegrityManifest, VerificationReport,
+};
 pub use planner::choose_hierarchies;
 pub use postings::PostingHierarchy;
 pub use segment::Segment;
