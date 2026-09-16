@@ -14,6 +14,7 @@ pub mod external;
 pub mod flat_postings;
 pub mod hierarchy;
 pub mod import;
+pub mod ingest;
 pub mod intersect;
 pub mod key;
 pub mod logical;
@@ -24,11 +25,13 @@ pub mod operations;
 pub mod overlay;
 pub mod planner;
 pub mod postings;
+pub mod query_api;
 pub mod recovery;
 pub mod rowids;
 pub mod schema;
 pub mod segment;
 pub mod snapshot;
+pub mod telemetry;
 pub mod versioned;
 
 pub use admin::{
@@ -53,6 +56,7 @@ pub use exact::add_exact_hierarchies;
 pub use flat_postings::FlatPostingHierarchy;
 pub use hierarchy::{Hierarchy, Record};
 pub use import::{import_csv, CsvImportConfig, CsvImportReport};
+pub use ingest::{import_external, ExternalFormat, ExternalImportConfig, ExternalImportReport};
 pub use intersect::intersect_sorted;
 pub use key::mixed_radix_key;
 pub use logical::{
@@ -72,6 +76,7 @@ pub use overlay::{
 };
 pub use planner::choose_hierarchies;
 pub use postings::PostingHierarchy;
+pub use query_api::{execute_query, QueryApiRow, QueryApiStats, QueryFilter, QueryRequest, QueryResponse};
 pub use recovery::{recover_catalog, verify_versioned_dataset, RecoveryReport};
 pub use rowids::{RowIdMap, RowIdWriter, ROW_IDS_FILE};
 pub use schema::{
@@ -81,5 +86,9 @@ pub use schema::{
 pub use segment::Segment;
 pub use snapshot::{
     leased_generation_ids, vacuum_with_reader_leases, SafeVacuumReport, SnapshotLease,
+};
+pub use telemetry::{
+    append_query_event, load_query_events, query_event, record_query, workload_report,
+    IndexRecommendation, IndexUseStats, QueryShapeStats, QueryTelemetryEvent, WorkloadReport,
 };
 pub use versioned::VersionedDataset;
