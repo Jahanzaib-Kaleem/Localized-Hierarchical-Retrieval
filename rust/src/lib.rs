@@ -30,6 +30,7 @@ pub mod rowids;
 pub mod schema;
 pub mod segment;
 pub mod snapshot;
+pub mod telemetry;
 pub mod versioned;
 
 pub use admin::{
@@ -83,5 +84,9 @@ pub use schema::{
 pub use segment::Segment;
 pub use snapshot::{
     leased_generation_ids, vacuum_with_reader_leases, SafeVacuumReport, SnapshotLease,
+};
+pub use telemetry::{
+    append_query_event, load_query_events, query_event, record_query, workload_report,
+    IndexRecommendation, IndexUseStats, QueryShapeStats, QueryTelemetryEvent, WorkloadReport,
 };
 pub use versioned::VersionedDataset;
