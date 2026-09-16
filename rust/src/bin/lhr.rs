@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand};
 use lhr::{
-    apply_mutations, backup_dataset, dataset_status, import_csv, list_generations,
-    read_schema_file, resolve_dataset_root, restore_backup, rollback_generation, seal_dataset,
-    vacuum_generations, verify_dataset, CsvImportConfig, DatasetSchema, Engine, LogicalDataset,
-    LogicalPredicate, Mutation, MutationConfig, Predicate,
+    add_index, apply_mutations, backup_dataset, dataset_stats, dataset_status, drop_index,
+    import_csv, list_generations, list_indexes, read_schema_file, rebuild_index,
+    resolve_dataset_root, restore_backup, rollback_generation, seal_dataset, vacuum_generations,
+    verify_dataset, CsvImportConfig, DatasetSchema, Engine, LogicalDataset, LogicalPredicate,
+    Mutation, MutationConfig, Predicate,
 };
 use serde_json::json;
 use std::{error::Error, fs, path::PathBuf, process};
@@ -21,8 +22,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Show dataset metadata and storage usage.
+    /// Show compact dataset metadata and storage usage.
     Status,
+    /// Show schema cardinalities, dictionary sizes, and exact/routing index details.
+    Stats,
     /// Verify manifest/segment/index structure and integrity seal when present.
     Verify,
     /// Compute SHA-256 checksums for all stable files in the current generation.
@@ -62,6 +65,11 @@ enum Command {
         #[arg(long, default_value_t = 67_108_864)]
         dictionary_run_bytes: usize,
     },
+    /// Add, drop, rebuild, or inspect exact accelerator indexes.
+    Indexes {
+        #[command(subcommand)]
+        command: IndexCommand,
+    },
     /// Back up the current resolved generation to a new destination.
     Backup {
         destination: PathBuf,
@@ -96,6 +104,31 @@ enum ImportCommand {
         max_sort_records: usize,
         #[arg(long, default_value_t = 67_108_864)]
         dictionary_run_bytes: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum IndexCommand {
+    /// List all routing and exact indexes, representation kinds, and file sizes.
+    List,
+    /// Build a new exact multi-column accelerator in a new immutable generation.
+    Add {
+        #[arg(value_name = "COLUMN", required = true, num_args = 2..)]
+        columns: Vec<String>,
+        #[arg(long, default_value_t = 250_000)]
+        max_sort_records: usize,
+    },
+    /// Drop an exact multi-column accelerator. Singleton correctness indexes are protected.
+    Drop {
+        #[arg(value_name = "COLUMN", required = true, num_args = 2..)]
+        columns: Vec<String>,
+    },
+    /// Rebuild an exact accelerator, allowing adaptive representation selection to run again.
+    Rebuild {
+        #[arg(value_name = "COLUMN", required = true, num_args = 2..)]
+        columns: Vec<String>,
+        #[arg(long, default_value_t = 250_000)]
+        max_sort_records: usize,
     },
 }
 
@@ -208,6 +241,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             print_json(&apply_mutations(&cli.root, &mutations, &config)?)?;
         }
+        Command::Indexes { command } => match command {
+            IndexCommand::List => print_json(&list_indexes(&cli.root)?)?,
+            IndexCommand::Add {
+                columns,
+                max_sort_records,
+            } => print_json(&add_index(&cli.root, &columns, max_sort_records)?)?,
+            IndexCommand::Drop { columns } => print_json(&drop_index(&cli.root, &columns)?)?,
+            IndexCommand::Rebuild {
+                columns,
+                max_sort_records,
+            } => print_json(&rebuild_index(&cli.root, &columns, max_sort_records)?)?,
+        },
         Command::Restore { backup } => {
             print_json(&restore_backup(&cli.root, backup)?)?;
         }
@@ -228,6 +273,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let dataset = resolve_dataset_root(&cli.root)?;
             match command {
                 Command::Status => print_json(&dataset_status(&dataset)?)?,
+                Command::Stats => print_json(&dataset_stats(&cli.root)?)?,
                 Command::Verify => {
                     let report = verify_dataset(&dataset)?;
                     print_json(&report)?;
@@ -302,6 +348,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 Command::Import { .. }
                 | Command::Mutate { .. }
+                | Command::Indexes { .. }
                 | Command::Restore { .. }
                 | Command::Generations { .. } => unreachable!(),
             }

@@ -29,6 +29,32 @@ fn write_record<W: Write>(w: &mut W, key: u64, row: u32) -> io::Result<()> {
     w.write_all(&row.to_le_bytes())
 }
 
+fn hierarchy_number(file: &str) -> Option<usize> {
+    let rest = file.strip_prefix('h')?;
+    let digits = rest
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    rest[..digits].parse().ok()
+}
+
+fn next_hierarchy_number(manifest: &Manifest) -> io::Result<usize> {
+    manifest
+        .hierarchies
+        .iter()
+        .filter_map(|hierarchy| hierarchy_number(&hierarchy.file))
+        .max()
+        .map(|number| {
+            number
+                .checked_add(1)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "hierarchy number overflow"))
+        })
+        .unwrap_or(Ok(0))
+}
+
 // Bit-slices are excellent for low/moderate cardinalities because composition becomes
 // word-wise equality-mask work instead of decoding very large row-id postings. Do not
 // extend them into sparse high-cardinality fields: the all-row word scan then dominates.
@@ -97,7 +123,10 @@ pub fn add_exact_hierarchies(
     let routing = root.join("routing");
     fs::create_dir_all(&temp)?;
     fs::create_dir_all(&routing)?;
-    let base = manifest.hierarchies.len();
+    // Hierarchies can now be dropped administratively. Manifest length is therefore not a safe
+    // file-number allocator: reusing a lower number could overwrite a surviving index. Always
+    // allocate above the greatest hierarchy number already present.
+    let base = next_hierarchy_number(&manifest)?;
     let spool_paths: Vec<_> = (0..specs.len())
         .map(|i| temp.join(format!("exact-{:04}.raw", base + i)))
         .collect();
@@ -141,7 +170,10 @@ pub fn add_exact_hierarchies(
     drop(writers);
 
     for (i, spec) in specs.iter().enumerate() {
-        let sorted = temp.join(format!("exact-{:04}.sorted", base + i));
+        let number = base
+            .checked_add(i)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "hierarchy number overflow"))?;
+        let sorted = temp.join(format!("exact-{number:04}.sorted"));
         let entries = external_sort(&spool_paths[i], &sorted, max_sort_records)?;
         fs::remove_file(&spool_paths[i])?;
         if entries != manifest.rows {
@@ -159,16 +191,14 @@ pub fn add_exact_hierarchies(
         let dense_bytes =
             DensePostingHierarchy::estimated_bytes(space, manifest.rows).unwrap_or(u64::MAX);
         let flat_bytes = FlatPostingHierarchy::estimated_bytes(manifest.rows).unwrap_or(u64::MAX);
-        let bitslice_bytes = if spec.columns.len() == 1
-            && bitslice_query_ok(space, manifest.rows)
-        {
+        let bitslice_bytes = if spec.columns.len() == 1 && bitslice_query_ok(space, manifest.rows) {
             BitSlicePostingHierarchy::estimated_bytes(space, manifest.rows).unwrap_or(u64::MAX)
         } else {
             u64::MAX
         };
 
         // Delta size depends on row locality, so measure the real file before choosing.
-        let delta_file = format!("h{:04}.dlt", base + i);
+        let delta_file = format!("h{number:04}.dlt");
         let delta_path = routing.join(&delta_file);
         DeltaPostingHierarchy::build_from_sorted(&sorted, &delta_path)?;
         let delta_bytes = fs::metadata(&delta_path)?.len();
@@ -187,7 +217,7 @@ pub fn add_exact_hierarchies(
 
         let (file, kind) = if prefer_bitslice {
             fs::remove_file(&delta_path)?;
-            let file = format!("h{:04}.bsl", base + i);
+            let file = format!("h{number:04}.bsl");
             BitSlicePostingHierarchy::build_from_sorted(
                 &sorted,
                 routing.join(&file),
@@ -200,14 +230,14 @@ pub fn add_exact_hierarchies(
             && flat_bytes <= sparse_bytes
         {
             fs::remove_file(&delta_path)?;
-            let file = format!("h{:04}.flat", base + i);
+            let file = format!("h{number:04}.flat");
             FlatPostingHierarchy::build_from_sorted(&sorted, routing.join(&file), manifest.rows)?;
             (file, "flatpost".to_string())
         } else if delta_bytes <= dense_bytes && delta_bytes <= sparse_bytes {
             (delta_file, "deltapost".to_string())
         } else if dense_bytes < sparse_bytes {
             fs::remove_file(&delta_path)?;
-            let file = format!("h{:04}.dpost", base + i);
+            let file = format!("h{number:04}.dpost");
             DensePostingHierarchy::build_from_sorted(
                 &sorted,
                 routing.join(&file),
@@ -217,7 +247,7 @@ pub fn add_exact_hierarchies(
             (file, "densepost".to_string())
         } else {
             fs::remove_file(&delta_path)?;
-            let file = format!("h{:04}.post", base + i);
+            let file = format!("h{number:04}.post");
             PostingHierarchy::build_from_sorted(&sorted, routing.join(&file), manifest.rows)?;
             (file, "postings".to_string())
         };
@@ -239,4 +269,39 @@ pub fn add_exact_hierarchies(
     )?;
     fs::rename(tmp, root.join("manifest.json"))?;
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hierarchy_numbers_ignore_manifest_holes() {
+        let manifest = Manifest {
+            format: "LHR/1".into(),
+            rows: 1,
+            columns: 2,
+            page_rows: 1,
+            pages: 1,
+            cardinalities: vec![2, 2],
+            segments: vec![],
+            hierarchies: vec![
+                HierarchyMeta {
+                    file: "h0000.dlt".into(),
+                    columns: vec![0],
+                    entries: 1,
+                    kind: "deltapost".into(),
+                    keyspace: 2,
+                },
+                HierarchyMeta {
+                    file: "h0007.flat".into(),
+                    columns: vec![0, 1],
+                    entries: 1,
+                    kind: "flatpost".into(),
+                    keyspace: 4,
+                },
+            ],
+        };
+        assert_eq!(next_hierarchy_number(&manifest).unwrap(), 8);
+    }
 }
