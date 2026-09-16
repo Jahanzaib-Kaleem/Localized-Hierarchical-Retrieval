@@ -24,6 +24,7 @@ pub mod operations;
 pub mod overlay;
 pub mod planner;
 pub mod postings;
+pub mod query_api;
 pub mod recovery;
 pub mod rowids;
 pub mod schema;
@@ -72,6 +73,7 @@ pub use overlay::{
 };
 pub use planner::choose_hierarchies;
 pub use postings::PostingHierarchy;
+pub use query_api::{execute_query, QueryApiRow, QueryApiStats, QueryFilter, QueryRequest, QueryResponse};
 pub use recovery::{recover_catalog, verify_versioned_dataset, RecoveryReport};
 pub use rowids::{RowIdMap, RowIdWriter, ROW_IDS_FILE};
 pub use schema::{
