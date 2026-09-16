@@ -1,14 +1,14 @@
 use super::McpState;
 use fs2::FileExt;
 use lhr::{
-    add_index, apply_mutations_delta, compact_dataset, dataset_stats, dataset_status,
-    execute_query, leased_generation_ids, list_generations, list_indexes, planner_indexes_for_request,
-    read_schema, rebuild_index, record_query, recover_catalog, resolve_dataset_root,
-    verify_versioned_dataset, vacuum_with_reader_leases, workload_report, CompactionConfig,
-    LogicalPredicate, Mutation, MutationConfig, QueryRequest, ServiceRole, VersionedDataset,
+    add_index, apply_mutations_delta, compact_dataset, dataset_stats, dataset_status, execute_query,
+    leased_generation_ids, list_generations, list_indexes, planner_indexes_for_request, read_schema,
+    rebuild_index, record_query, recover_catalog, resolve_dataset_root, verify_versioned_dataset,
+    vacuum_with_reader_leases, workload_report, CompactionConfig, LogicalPredicate, Mutation,
+    MutationConfig, QueryRequest, ServiceRole, VersionedDataset,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -52,6 +52,21 @@ fn query_schema() -> Value {
             "timeout_ms":{"type":["integer","null"],"minimum":1}
         },
         "additionalProperties":false
+    })
+}
+
+fn index_tool(name: &str, title: &str, description: &str, destructive: bool) -> Value {
+    json!({
+        "name":name,"title":title,"description":description,
+        "inputSchema":{
+            "type":"object","required":["columns"],
+            "properties":{
+                "columns":{"type":"array","minItems":2,"items":{"type":"string"}},
+                "max_sort_records":{"type":"integer","minimum":1}
+            },
+            "additionalProperties":false
+        },
+        "annotations":annotation(false,destructive,false)
     })
 }
 
@@ -144,14 +159,6 @@ fn all_tools() -> Vec<(ServiceRole, Value)> {
     ]
 }
 
-fn index_tool(name: &str, title: &str, description: &str, destructive: bool) -> Value {
-    json!({
-        "name":name,"title":title,"description":description,
-        "inputSchema":{"type":"object","required":["columns"],"properties":{"columns":{"type":"array","minItems":2,"items":{"type":"string"}},"max_sort_records":{"type":"integer","minimum":1}},"additionalProperties":false},
-        "annotations":annotation(false,destructive,false)
-    })
-}
-
 pub(super) fn tool_catalog(role: ServiceRole) -> Vec<Value> {
     all_tools()
         .into_iter()
@@ -161,9 +168,9 @@ pub(super) fn tool_catalog(role: ServiceRole) -> Vec<Value> {
 }
 
 pub(super) fn required_role(name: &str) -> Option<ServiceRole> {
-    all_tools()
-        .into_iter()
-        .find_map(|(role, tool)| (tool.get("name").and_then(Value::as_str) == Some(name)).then_some(role))
+    all_tools().into_iter().find_map(|(role, tool)| {
+        (tool.get("name").and_then(Value::as_str) == Some(name)).then_some(role)
+    })
 }
 
 pub(super) fn tool_ok(value: Value) -> Value {
@@ -285,7 +292,11 @@ fn mutation_config(options: &WriteOptions, state: &McpState) -> Result<MutationC
     {
         return Err("mutation build options exceed service resource ceilings".into());
     }
-    Ok(MutationConfig { batch_rows, max_sort_records, dictionary_run_bytes })
+    Ok(MutationConfig {
+        batch_rows,
+        max_sort_records,
+        dictionary_run_bytes,
+    })
 }
 
 fn compaction_config(options: &WriteOptions, state: &McpState) -> Result<CompactionConfig, String> {
@@ -302,16 +313,24 @@ fn compaction_config(options: &WriteOptions, state: &McpState) -> Result<Compact
     {
         return Err("compaction options exceed service resource ceilings".into());
     }
-    Ok(CompactionConfig { batch_rows, max_sort_records, dictionary_run_bytes })
+    Ok(CompactionConfig {
+        batch_rows,
+        max_sort_records,
+        dictionary_run_bytes,
+    })
 }
 
 fn audit(state: &McpState, actor: &str, action: &str, success: bool, detail: Value) {
     let path = state.root.join("audit").join("mcp-audit.jsonl");
-    let result = (|| -> io::Result<()> {
+    let _ = (|| -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new().create(true).append(true).read(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(path)?;
         file.lock_exclusive()?;
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -327,13 +346,15 @@ fn audit(state: &McpState, actor: &str, action: &str, success: bool, detail: Val
         FileExt::unlock(&file)?;
         Ok(())
     })();
-    if result.is_err() {
-        // Audit failure must not conceal the primary database result. The Studio/API audit path
-        // follows the same best-effort policy today.
-    }
 }
 
-fn mutating<T, F>(state: &McpState, actor: &str, action: &str, detail: Value, operation: F) -> Result<Value, String>
+fn mutating<T, F>(
+    state: &McpState,
+    actor: &str,
+    action: &str,
+    detail: Value,
+    operation: F,
+) -> Result<Value, String>
 where
     T: serde::Serialize,
     F: FnOnce() -> io::Result<T>,
@@ -341,11 +362,23 @@ where
     match operation() {
         Ok(report) => {
             let value = serde_json::to_value(report).map_err(|error| error.to_string())?;
-            audit(state, actor, action, true, json!({"request":detail,"report":value.clone()}));
+            audit(
+                state,
+                actor,
+                action,
+                true,
+                json!({"request":detail,"report":value.clone()}),
+            );
             Ok(value)
         }
         Err(error) => {
-            audit(state, actor, action, false, json!({"request":detail,"error":error.to_string()}));
+            audit(
+                state,
+                actor,
+                action,
+                false,
+                json!({"request":detail,"error":error.to_string()}),
+            );
             Err(error.to_string())
         }
     }
@@ -367,25 +400,29 @@ pub(super) fn call_tool(
         "lhr_query" => {
             let request = bounded_query(parse(arguments)?, state)?;
             let dataset = VersionedDataset::open(&state.root).map_err(|error| error.to_string())?;
-            let indexes = planner_indexes_for_request(&dataset, &request).map_err(|error| error.to_string())?;
+            let indexes = planner_indexes_for_request(&dataset, &request)
+                .map_err(|error| error.to_string())?;
             let response = execute_query(&dataset, &request).map_err(|error| error.to_string())?;
-            record_query(&state.root, &request, &response, indexes).map_err(|error| error.to_string())?;
+            record_query(&state.root, &request, &response, indexes)
+                .map_err(|error| error.to_string())?;
             serde_json::to_value(response).map_err(|error| error.to_string())
         }
         "lhr_row" => {
             let args: RowArgs = parse(arguments)?;
             let dataset = VersionedDataset::open(&state.root).map_err(|error| error.to_string())?;
-            let values = dataset.row_values(args.row_id).map_err(|error| error.to_string())?;
+            let values = dataset
+                .row_values(args.row_id)
+                .map_err(|error| error.to_string())?;
             Ok(match values {
                 Some(values) => {
-                    let row = dataset
-                        .schema()
-                        .columns
-                        .iter()
-                        .zip(values)
-                        .map(|(column, value)| (column.name.clone(), value))
-                        .collect::<serde_json::Map<String, Value>>();
-                    json!({"row_id":args.row_id,"values":row})
+                    let mut row = Map::new();
+                    for (column, value) in dataset.schema().columns.iter().zip(values.into_iter()) {
+                        row.insert(
+                            column.name.clone(),
+                            value.map(Value::String).unwrap_or(Value::Null),
+                        );
+                    }
+                    json!({"row_id":args.row_id,"found":true,"values":row})
                 }
                 None => json!({"row_id":args.row_id,"found":false}),
             })
@@ -395,8 +432,10 @@ pub(super) fn call_tool(
             let schema = read_schema(root).map_err(|error| error.to_string())?;
             serde_json::to_value(schema).map_err(|error| error.to_string())
         }
-        "lhr_stats" => serde_json::to_value(dataset_stats(&state.root).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string()),
+        "lhr_stats" => serde_json::to_value(
+            dataset_stats(&state.root).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         "lhr_explain" => {
             let args: ExplainArgs = parse(arguments)?;
             if args.predicates.is_empty() {
@@ -405,48 +444,70 @@ pub(super) fn call_tool(
             let predicates: Vec<_> = args
                 .predicates
                 .into_iter()
-                .map(|predicate| LogicalPredicate { column: predicate.column, value: predicate.value })
+                .map(|predicate| LogicalPredicate {
+                    column: predicate.column,
+                    value: predicate.value,
+                })
                 .collect();
             let dataset = VersionedDataset::open(&state.root).map_err(|error| error.to_string())?;
-            let plan = dataset.explain_values(&predicates).map_err(|error| error.to_string())?;
+            let plan = dataset
+                .explain_values(&predicates)
+                .map_err(|error| error.to_string())?;
             serde_json::to_value(plan).map_err(|error| error.to_string())
         }
-        "lhr_workload" => serde_json::to_value(workload_report(&state.root).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string()),
+        "lhr_workload" => serde_json::to_value(
+            workload_report(&state.root).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         "lhr_generations" => {
             let generations = list_generations(&state.root).map_err(|error| error.to_string())?;
             let leased = leased_generation_ids(&state.root).map_err(|error| error.to_string())?;
             Ok(json!({"generations":generations,"leased_generation_ids":leased}))
         }
-        "lhr_indexes" => serde_json::to_value(list_indexes(&state.root).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string()),
+        "lhr_indexes" => serde_json::to_value(
+            list_indexes(&state.root).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         "lhr_diagnostics" => diagnostics(state),
         "lhr_benchmark_query" => benchmark_query(state, arguments),
-        "lhr_verify" => serde_json::to_value(verify_versioned_dataset(&state.root).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string()),
+        "lhr_verify" => serde_json::to_value(
+            verify_versioned_dataset(&state.root).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
         "lhr_mutate" => {
             let args: MutationArgs = parse(arguments)?;
             if args.mutations.is_empty() || args.mutations.len() > state.config.max_mutation_ops {
-                return Err(format!("mutation operation count must be 1..={}", state.config.max_mutation_ops));
+                return Err(format!(
+                    "mutation operation count must be 1..={}",
+                    state.config.max_mutation_ops
+                ));
             }
             let config = mutation_config(&args.options, state)?;
             let detail = json!({"operations":args.mutations.len()});
-            mutating(state, actor, "mutate", detail, || apply_mutations_delta(&state.root, &args.mutations, &config))
+            mutating(state, actor, "mutate", detail, || {
+                apply_mutations_delta(&state.root, &args.mutations, &config)
+            })
         }
         "lhr_compact" => {
             let args: CompactArgs = parse(arguments)?;
             let config = compaction_config(&args.options, state)?;
-            mutating(state, actor, "compact", json!({}), || compact_dataset(&state.root, &config))
+            mutating(state, actor, "compact", json!({}), || {
+                compact_dataset(&state.root, &config)
+            })
         }
         "lhr_vacuum" => {
             let args: VacuumArgs = parse(arguments)?;
             if args.retain == 0 {
                 return Err("retain must be at least 1".into());
             }
-            let detail = json!({"retain":args.retain,"protect":args.protect});
-            mutating(state, actor, "vacuum", detail, || vacuum_with_reader_leases(&state.root, args.retain, &args.protect))
+            let detail = json!({"retain":args.retain,"protect":args.protect.clone()});
+            mutating(state, actor, "vacuum", detail, || {
+                vacuum_with_reader_leases(&state.root, args.retain, &args.protect)
+            })
         }
-        "lhr_recover" => mutating(state, actor, "recover", json!({}), || recover_catalog(&state.root)),
+        "lhr_recover" => mutating(state, actor, "recover", json!({}), || {
+            recover_catalog(&state.root)
+        }),
         "lhr_index_add" | "lhr_index_drop" | "lhr_index_rebuild" => {
             let args: IndexArgs = parse(arguments)?;
             if args.columns.len() < 2 {
@@ -454,14 +515,25 @@ pub(super) fn call_tool(
             }
             let max_sort_records = args.max_sort_records.unwrap_or(250_000);
             if max_sort_records == 0 || max_sort_records > state.config.max_sort_records {
-                return Err(format!("max_sort_records must be 1..={}", state.config.max_sort_records));
+                return Err(format!(
+                    "max_sort_records must be 1..={}",
+                    state.config.max_sort_records
+                ));
             }
-            let columns = args.columns.clone();
-            let detail = json!({"columns":columns,"max_sort_records":max_sort_records});
+            let detail = json!({
+                "columns":args.columns.clone(),
+                "max_sort_records":max_sort_records
+            });
             match name {
-                "lhr_index_add" => mutating(state, actor, "index_add", detail, || add_index(&state.root, &args.columns, max_sort_records)),
-                "lhr_index_drop" => mutating(state, actor, "index_drop", detail, || lhr::drop_index(&state.root, &args.columns)),
-                _ => mutating(state, actor, "index_rebuild", detail, || rebuild_index(&state.root, &args.columns, max_sort_records)),
+                "lhr_index_add" => mutating(state, actor, "index_add", detail, || {
+                    add_index(&state.root, &args.columns, max_sort_records)
+                }),
+                "lhr_index_drop" => mutating(state, actor, "index_drop", detail, || {
+                    lhr::drop_index(&state.root, &args.columns)
+                }),
+                _ => mutating(state, actor, "index_rebuild", detail, || {
+                    rebuild_index(&state.root, &args.columns, max_sort_records)
+                }),
             }
         }
         _ => Err(format!("unknown MCP tool {name}")),
@@ -469,19 +541,17 @@ pub(super) fn call_tool(
 }
 
 fn diagnostics(state: &McpState) -> Result<Value, String> {
-    let process = process_metrics();
-    let filesystem = json!({
-        "total_bytes":fs2::total_space(&state.root).ok(),
-        "available_bytes":fs2::available_space(&state.root).ok()
-    });
     let dataset = resolve_dataset_root(&state.root)
         .ok()
         .and_then(|root| dataset_status(root).ok())
         .and_then(|status| serde_json::to_value(status).ok());
     let leased = leased_generation_ids(&state.root).unwrap_or_default();
     Ok(json!({
-        "process":process,
-        "filesystem":filesystem,
+        "process":process_metrics(),
+        "filesystem":{
+            "total_bytes":fs2::total_space(&state.root).ok(),
+            "available_bytes":fs2::available_space(&state.root).ok()
+        },
         "dataset":dataset,
         "leased_generation_ids":leased,
         "mcp":{
@@ -504,7 +574,11 @@ fn process_metrics() -> Value {
     if let Ok(status) = fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if let Some(raw) = line.strip_prefix("VmRSS:") {
-                rss_bytes = raw.split_whitespace().next().and_then(|value| value.parse::<u64>().ok()).map(|kib| kib.saturating_mul(1024));
+                rss_bytes = raw
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(|kib| kib.saturating_mul(1024));
             }
         }
     }
@@ -513,10 +587,16 @@ fn process_metrics() -> Value {
     let mut write_bytes = None;
     if let Ok(io_text) = fs::read_to_string("/proc/self/io") {
         for line in io_text.lines() {
-            if let Some(value) = line.strip_prefix("read_bytes:").and_then(|value| value.trim().parse::<u64>().ok()) {
+            if let Some(value) = line
+                .strip_prefix("read_bytes:")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+            {
                 read_bytes = Some(value);
             }
-            if let Some(value) = line.strip_prefix("write_bytes:").and_then(|value| value.trim().parse::<u64>().ok()) {
+            if let Some(value) = line
+                .strip_prefix("write_bytes:")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+            {
                 write_bytes = Some(value);
             }
         }
@@ -531,8 +611,12 @@ fn process_metrics() -> Value {
 }
 
 fn process_faults() -> (u64, u64) {
-    let Ok(stat) = fs::read_to_string("/proc/self/stat") else { return (0, 0); };
-    let Some(end) = stat.rfind(')') else { return (0, 0); };
+    let Ok(stat) = fs::read_to_string("/proc/self/stat") else {
+        return (0, 0);
+    };
+    let Some(end) = stat.rfind(')') else {
+        return (0, 0);
+    };
     // After the executable name, index 0 is field 3 (state). minflt is field 10 and majflt field 12.
     let fields: Vec<_> = stat[end + 1..].split_whitespace().collect();
     let minor = fields.get(7).and_then(|value| value.parse().ok()).unwrap_or(0);
@@ -550,7 +634,7 @@ fn benchmark_query(state: &McpState, arguments: Value) -> Result<Value, String> 
     for _ in 0..args.warmup {
         execute_query(&dataset, &request).map_err(|error| error.to_string())?;
     }
-    let rss_before = process_metrics();
+    let process_before = process_metrics();
     let faults_before = process_faults();
     let mut elapsed = Vec::with_capacity(args.iterations);
     let mut last = None;
@@ -562,7 +646,6 @@ fn benchmark_query(state: &McpState, arguments: Value) -> Result<Value, String> 
     }
     elapsed.sort_unstable();
     let faults_after = process_faults();
-    let rss_after = process_metrics();
     Ok(json!({
         "iterations":args.iterations,
         "warmup":args.warmup,
@@ -573,8 +656,8 @@ fn benchmark_query(state: &McpState, arguments: Value) -> Result<Value, String> 
             "p99":percentile(&elapsed,0.99),
             "max":elapsed.last().copied().unwrap_or(0)
         },
-        "process_before":rss_before,
-        "process_after":rss_after,
+        "process_before":process_before,
+        "process_after":process_metrics(),
         "minor_faults_delta":faults_after.0.saturating_sub(faults_before.0),
         "major_faults_delta":faults_after.1.saturating_sub(faults_before.1),
         "last_query":last
