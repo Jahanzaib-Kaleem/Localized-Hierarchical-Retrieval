@@ -2,24 +2,51 @@ use crate::{
     mixed_radix_key, BitSlicePostingHierarchy, BitmapHierarchy, DeltaPostingHierarchy,
     DensePostingHierarchy, FlatPostingHierarchy, Hierarchy, Manifest, PostingHierarchy, Segment,
 };
+use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
     path::Path,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Predicate {
     pub column: usize,
     pub value: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct QueryStats {
     pub hits: u64,
     pub rows_checked: u64,
     pub pages_touched: u64,
     pub hierarchy_lookups: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QueryPlanIndex {
+    pub file: String,
+    pub kind: String,
+    pub columns: Vec<usize>,
+    pub key: u64,
+    pub candidate_count: u64,
+    pub role: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QueryExplain {
+    pub predicates: Vec<Predicate>,
+    pub satisfiable: bool,
+    pub route: String,
+    pub fully_covered: bool,
+    pub exact_result_proven: bool,
+    pub considered_indexes: u64,
+    pub selected_indexes: Vec<QueryPlanIndex>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_pages: Option<u64>,
+    pub canonical_verification_required: bool,
 }
 
 enum PageHierarchyData {
@@ -91,10 +118,14 @@ impl RowHierarchyData {
 }
 
 struct LoadedPageHierarchy {
+    file: String,
+    kind: String,
     columns: Vec<usize>,
     data: PageHierarchyData,
 }
 struct LoadedRowHierarchy {
+    file: String,
+    kind: String,
     columns: Vec<usize>,
     data: RowHierarchyData,
 }
@@ -103,10 +134,20 @@ struct LoadedSegment {
     row_start: u64,
     data: Segment,
 }
+
+#[derive(Clone)]
+struct RowPlanSelection {
+    count: usize,
+    index: usize,
+    key: u64,
+    columns: Vec<usize>,
+}
+
 struct RowPlan {
     rows: Vec<u32>,
     lookups: u64,
     fully_covered: bool,
+    selected: Vec<RowPlanSelection>,
 }
 
 pub struct Engine {
@@ -139,30 +180,44 @@ impl Engine {
             let path = root.join("routing").join(&hierarchy.file);
             match hierarchy.kind.as_str() {
                 "sparse" => page_hier.push(LoadedPageHierarchy {
+                    file: hierarchy.file.clone(),
+                    kind: hierarchy.kind.clone(),
                     columns: hierarchy.columns.clone(),
                     data: PageHierarchyData::Sparse(Hierarchy::open(path)?),
                 }),
                 "bitmap" => page_hier.push(LoadedPageHierarchy {
+                    file: hierarchy.file.clone(),
+                    kind: hierarchy.kind.clone(),
                     columns: hierarchy.columns.clone(),
                     data: PageHierarchyData::Bitmap(BitmapHierarchy::open(path)?),
                 }),
                 "postings" => row_hier.push(LoadedRowHierarchy {
+                    file: hierarchy.file.clone(),
+                    kind: hierarchy.kind.clone(),
                     columns: hierarchy.columns.clone(),
                     data: RowHierarchyData::Sparse(PostingHierarchy::open(path)?),
                 }),
                 "densepost" => row_hier.push(LoadedRowHierarchy {
+                    file: hierarchy.file.clone(),
+                    kind: hierarchy.kind.clone(),
                     columns: hierarchy.columns.clone(),
                     data: RowHierarchyData::Dense(DensePostingHierarchy::open(path)?),
                 }),
                 "deltapost" => row_hier.push(LoadedRowHierarchy {
+                    file: hierarchy.file.clone(),
+                    kind: hierarchy.kind.clone(),
                     columns: hierarchy.columns.clone(),
                     data: RowHierarchyData::Delta(DeltaPostingHierarchy::open(path)?),
                 }),
                 "flatpost" => row_hier.push(LoadedRowHierarchy {
+                    file: hierarchy.file.clone(),
+                    kind: hierarchy.kind.clone(),
                     columns: hierarchy.columns.clone(),
                     data: RowHierarchyData::Flat(FlatPostingHierarchy::open(path)?),
                 }),
                 "bitslice" => row_hier.push(LoadedRowHierarchy {
+                    file: hierarchy.file.clone(),
+                    kind: hierarchy.kind.clone(),
                     columns: hierarchy.columns.clone(),
                     data: RowHierarchyData::BitSlice(BitSlicePostingHierarchy::open(path)?),
                 }),
@@ -239,36 +294,31 @@ impl Engine {
                     rows: vec![],
                     lookups: 0,
                     fully_covered: true,
+                    selected: vec![],
                 })
             }
         };
-
-        #[derive(Clone)]
-        struct Candidate {
-            count: usize,
-            index: usize,
-            key: u64,
-            columns: Vec<usize>,
-        }
 
         let mut available = Vec::new();
         for (index, hierarchy) in self.row_hier.iter().enumerate() {
             if hierarchy.columns.iter().all(|c| query.contains_key(c)) {
                 let key = self.hierarchy_key(&hierarchy.columns, &query)?;
                 let count = hierarchy.data.row_count(key);
+                let candidate = RowPlanSelection {
+                    count,
+                    index,
+                    key,
+                    columns: hierarchy.columns.clone(),
+                };
                 if count == 0 {
                     return Some(RowPlan {
                         rows: vec![],
                         lookups: 1,
                         fully_covered: true,
+                        selected: vec![candidate],
                     });
                 }
-                available.push(Candidate {
-                    count,
-                    index,
-                    key,
-                    columns: hierarchy.columns.clone(),
-                });
+                available.push(candidate);
             }
         }
         if available.is_empty() {
@@ -346,6 +396,7 @@ impl Engine {
             rows,
             lookups: considered,
             fully_covered: uncovered.is_empty(),
+            selected,
         })
     }
 
@@ -385,6 +436,101 @@ impl Engine {
 
     pub fn candidate_pages(&self, predicates: &[Predicate]) -> Vec<u32> {
         self.candidate_pages_with_lookups(predicates).0
+    }
+
+    /// Return the actual planner route and candidate counts for this query. Exact-row routes run
+    /// the same intersection planner as a normal query, so `candidate_rows` is the real final
+    /// candidate/result count rather than a selectivity estimate.
+    pub fn explain(&self, predicates: &[Predicate]) -> QueryExplain {
+        let satisfiable = self.query_map(predicates).is_some();
+        if let Some(plan) = self.candidate_rows_with_lookups(predicates) {
+            let bitslice_pair = plan.selected.len() >= 2
+                && self.row_hier[plan.selected[0].index].kind == "bitslice"
+                && self.row_hier[plan.selected[1].index].kind == "bitslice";
+            let selected_indexes = plan
+                .selected
+                .iter()
+                .enumerate()
+                .map(|(position, selection)| {
+                    let hierarchy = &self.row_hier[selection.index];
+                    let role = if bitslice_pair && position < 2 {
+                        "bitslice_seed"
+                    } else if position == 0 {
+                        "seed"
+                    } else {
+                        "intersect"
+                    };
+                    QueryPlanIndex {
+                        file: hierarchy.file.clone(),
+                        kind: hierarchy.kind.clone(),
+                        columns: hierarchy.columns.clone(),
+                        key: selection.key,
+                        candidate_count: selection.count as u64,
+                        role: role.into(),
+                    }
+                })
+                .collect();
+            return QueryExplain {
+                predicates: predicates.to_vec(),
+                satisfiable,
+                route: if satisfiable {
+                    if plan.fully_covered {
+                        "exact_rows".into()
+                    } else {
+                        "row_candidates".into()
+                    }
+                } else {
+                    "empty".into()
+                },
+                fully_covered: plan.fully_covered,
+                exact_result_proven: plan.fully_covered,
+                considered_indexes: plan.lookups,
+                selected_indexes,
+                candidate_rows: Some(plan.rows.len() as u64),
+                candidate_pages: None,
+                canonical_verification_required: satisfiable && !plan.fully_covered,
+            };
+        }
+
+        let query = self.query_map(predicates).unwrap_or_default();
+        let (pages, lookups) = self.candidate_pages_with_lookups(predicates);
+        let mut available = Vec::new();
+        for hierarchy in &self.page_hier {
+            if hierarchy.columns.iter().all(|column| query.contains_key(column)) {
+                if let Some(key) = self.hierarchy_key(&hierarchy.columns, &query) {
+                    available.push((hierarchy.data.page_count(key), hierarchy, key));
+                }
+            }
+        }
+        available.sort_unstable_by_key(|x| x.0);
+        let selected_indexes = available
+            .iter()
+            .enumerate()
+            .map(|(position, (count, hierarchy, key))| QueryPlanIndex {
+                file: hierarchy.file.clone(),
+                kind: hierarchy.kind.clone(),
+                columns: hierarchy.columns.clone(),
+                key: *key,
+                candidate_count: *count as u64,
+                role: if position == 0 { "seed" } else { "intersect" }.into(),
+            })
+            .collect();
+        QueryExplain {
+            predicates: predicates.to_vec(),
+            satisfiable,
+            route: if available.is_empty() {
+                "canonical_scan".into()
+            } else {
+                "page_routing".into()
+            },
+            fully_covered: false,
+            exact_result_proven: false,
+            considered_indexes: lookups,
+            selected_indexes,
+            candidate_rows: None,
+            candidate_pages: Some(pages.len() as u64),
+            canonical_verification_required: true,
+        }
     }
 
     fn query_from_rows(
