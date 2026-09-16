@@ -14,6 +14,7 @@ pub mod external;
 pub mod flat_postings;
 pub mod hierarchy;
 pub mod import;
+pub mod ingest;
 pub mod intersect;
 pub mod key;
 pub mod logical;
@@ -55,6 +56,7 @@ pub use exact::add_exact_hierarchies;
 pub use flat_postings::FlatPostingHierarchy;
 pub use hierarchy::{Hierarchy, Record};
 pub use import::{import_csv, CsvImportConfig, CsvImportReport};
+pub use ingest::{import_external, ExternalFormat, ExternalImportConfig, ExternalImportReport};
 pub use intersect::intersect_sorted;
 pub use key::mixed_radix_key;
 pub use logical::{
