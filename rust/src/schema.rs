@@ -47,6 +47,45 @@ pub struct ColumnSchema {
     pub nullable: bool,
     #[serde(default = "default_normalization")]
     pub normalization: Normalization,
+    /// Raw input literals treated as NULL before normalization. This is explicit so an empty
+    /// string can remain a real value unless the schema intentionally lists it here.
+    #[serde(default)]
+    pub null_values: Vec<String>,
+}
+
+impl ColumnSchema {
+    pub fn is_null_literal(&self, raw: &str) -> bool {
+        self.nullable && self.null_values.iter().any(|x| x == raw)
+    }
+
+    /// Convert external text into the exact dictionary representation used by this column.
+    /// Numeric/boolean types are canonicalized so equivalent spellings receive one token.
+    pub fn canonicalize(&self, raw: &str) -> io::Result<String> {
+        let normalized = self.normalization.apply(raw);
+        match self.logical_type {
+            LogicalType::Text | LogicalType::Timestamp => Ok(normalized),
+            LogicalType::Unsigned => normalized.parse::<u64>().map(|x| x.to_string()).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("column {} expects unsigned integer: {e}", self.name),
+                )
+            }),
+            LogicalType::Signed => normalized.parse::<i64>().map(|x| x.to_string()).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("column {} expects signed integer: {e}", self.name),
+                )
+            }),
+            LogicalType::Boolean => match normalized.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => Ok("true".into()),
+                "false" | "0" => Ok("false".into()),
+                other => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("column {} expects boolean, got {other:?}", self.name),
+                )),
+            },
+        }
+    }
 }
 
 fn default_logical_type() -> LogicalType {
@@ -91,6 +130,12 @@ impl DatasetSchema {
                     format!("duplicate column name {}", column.name),
                 ));
             }
+            if !column.nullable && !column.null_values.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("non-nullable column {} declares null_values", column.name),
+                ));
+            }
         }
         Ok(())
     }
@@ -100,11 +145,15 @@ impl DatasetSchema {
     }
 }
 
-pub fn read_schema(root: impl AsRef<Path>) -> io::Result<DatasetSchema> {
-    let schema: DatasetSchema = serde_json::from_slice(&fs::read(root.as_ref().join("schema.json"))?)
+pub fn read_schema_file(path: impl AsRef<Path>) -> io::Result<DatasetSchema> {
+    let schema: DatasetSchema = serde_json::from_slice(&fs::read(path)?)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     schema.validate()?;
     Ok(schema)
+}
+
+pub fn read_schema(root: impl AsRef<Path>) -> io::Result<DatasetSchema> {
+    read_schema_file(root.as_ref().join("schema.json"))
 }
 
 pub fn write_schema(root: impl AsRef<Path>, schema: &DatasetSchema) -> io::Result<()> {
