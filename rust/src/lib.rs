@@ -65,7 +65,7 @@ pub use logical::{
     LogicalRow, NamedValue,
 };
 pub use maintenance::restore_backup;
-pub use manifest::{HierarchyMeta, Manifest, SegmentMeta};
+pub use manifest::{ensure_supported_format, HierarchyMeta, Manifest, SegmentMeta, DATASET_FORMAT};
 pub use mutation::{apply_mutations, Mutation, MutationConfig, MutationReport};
 pub use operations::{
     backup_dataset, dataset_status, read_integrity_manifest, seal_dataset, verify_dataset,
