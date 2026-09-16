@@ -1,6 +1,6 @@
 use crate::{
     read_schema, resolve_dataset_root, DatasetSchema, DecodedValue, Dictionary, Engine, Manifest,
-    Predicate,
+    Predicate, RowIdMap,
 };
 use serde::Serialize;
 use std::{
@@ -45,6 +45,8 @@ pub struct LogicalDataset {
     schema: DatasetSchema,
     dictionaries: Vec<Dictionary>,
     engine: Engine,
+    row_ids: RowIdMap,
+    rows: u64,
 }
 
 impl LogicalDataset {
@@ -77,11 +79,14 @@ impl LogicalDataset {
             dictionaries.push(dict);
         }
         let engine = Engine::open(&root)?;
+        let row_ids = RowIdMap::open_optional(&root, manifest.rows)?;
         Ok(Self {
             root,
             schema,
             dictionaries,
             engine,
+            row_ids,
+            rows: manifest.rows,
         })
     }
 
@@ -91,6 +96,49 @@ impl LogicalDataset {
 
     pub fn schema(&self) -> &DatasetSchema {
         &self.schema
+    }
+
+    pub fn physical_rows(&self) -> u64 {
+        self.rows
+    }
+
+    pub fn logical_row_id(&self, physical: u64) -> Option<u64> {
+        self.row_ids.logical(physical)
+    }
+
+    pub fn physical_row_id(&self, logical: u64) -> Option<u64> {
+        self.row_ids.physical(logical)
+    }
+
+    pub fn max_row_id(&self) -> Option<u64> {
+        self.row_ids.max_id()
+    }
+
+    pub fn contains_canonical_value(&self, column: usize, value: &str) -> bool {
+        self.dictionaries
+            .get(column)
+            .and_then(|dictionary| dictionary.token(value))
+            .is_some()
+    }
+
+    pub fn decode_physical_values(&self, physical: u64) -> io::Result<Vec<Option<String>>> {
+        let tokens = self.engine.row(physical).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "physical row ID does not exist")
+        })?;
+        let mut values = Vec::with_capacity(tokens.len());
+        for (column, raw_token) in tokens.into_iter().enumerate() {
+            let token = u32::try_from(raw_token).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "row token exceeds u32")
+            })?;
+            let decoded = self.dictionaries[column].decode(token).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "row token absent from dictionary")
+            })?;
+            values.push(match decoded {
+                DecodedValue::Null => None,
+                DecodedValue::Text(text) => Some(text.to_owned()),
+            });
+        }
+        Ok(values)
     }
 
     fn encoded_predicates(
@@ -167,29 +215,20 @@ impl LogicalDataset {
                 rows: Vec::new(),
             });
         };
-        let (row_ids, stats) = self.engine.query_row_ids(&encoded, limit);
-        let mut rows = Vec::with_capacity(row_ids.len());
-        for row_id in row_ids {
-            let tokens = self.engine.row(row_id).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "query returned invalid row id")
-            })?;
+        let (physical_ids, stats) = self.engine.query_row_ids(&encoded, limit);
+        let mut rows = Vec::with_capacity(physical_ids.len());
+        for physical in physical_ids {
+            let decoded = self.decode_physical_values(physical)?;
             let mut values = Vec::with_capacity(projection.len());
             for &column in &projection {
-                let token = u32::try_from(tokens[column]).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "row token exceeds u32")
-                })?;
-                let decoded = self.dictionaries[column].decode(token).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "row token absent from dictionary")
-                })?;
-                let value = match decoded {
-                    DecodedValue::Null => None,
-                    DecodedValue::Text(text) => Some(text.to_owned()),
-                };
                 values.push(NamedValue {
                     column: self.schema.columns[column].name.clone(),
-                    value,
+                    value: decoded[column].clone(),
                 });
             }
+            let row_id = self.row_ids.logical(physical).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "query returned unmapped row ID")
+            })?;
             rows.push(LogicalRow { row_id, values });
         }
         Ok(LogicalQueryResult {
