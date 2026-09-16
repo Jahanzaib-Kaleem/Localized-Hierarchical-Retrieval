@@ -4,16 +4,22 @@ umask 077
 
 ROOT="${LHR_ROOT:-/data}"
 TOKEN_FILE="$ROOT/.lhr-admin-token"
+INPUT_TOKEN_FILE="${LHR_API_TOKEN_FILE:-}"
 mkdir -p "$ROOT"
 
 if [ -n "${LHR_API_TOKEN:-}" ]; then
   TOKEN="$LHR_API_TOKEN"
+elif [ -n "$INPUT_TOKEN_FILE" ]; then
+  if [ ! -f "$INPUT_TOKEN_FILE" ]; then
+    printf '%s\n' "LHR_API_TOKEN_FILE does not exist: $INPUT_TOKEN_FILE" >&2
+    exit 66
+  fi
+  TOKEN="$(cat "$INPUT_TOKEN_FILE")"
 elif [ -f "$TOKEN_FILE" ]; then
   TOKEN="$(cat "$TOKEN_FILE")"
 else
   TOKEN="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
-  printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
-  printf '%s\n' "LHR generated an administrator token for this data volume." >&2
+  printf '%s\n' "LHR generated an administrator access secret for this data volume." >&2
   printf '%s\n' "Retrieve it with: docker exec <container> cat $TOKEN_FILE" >&2
 fi
 
@@ -27,6 +33,12 @@ case "$TOKEN" in
     exit 64
     ;;
 esac
+
+# Persist the effective credential inside the protected data volume. This makes a wizard- or
+# environment-provided secret survive ordinary container replacement while keeping permissions
+# restricted by the process umask.
+printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
+chmod 600 "$TOKEN_FILE" 2>/dev/null || true
 
 cat > /tmp/lhr-service.json <<EOF
 {
