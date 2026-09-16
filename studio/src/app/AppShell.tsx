@@ -2,7 +2,9 @@ import { Link, Outlet, useRouterState } from '@tanstack/react-router'
 import type { ComponentType, SVGProps } from 'react'
 import { DataIcon, GenerationsIcon, IndexIcon, MetricsIcon, OperationsIcon, OverviewIcon, QueryIcon, SettingsIcon, WorkloadIcon } from '../components/icons'
 
-const nav: Array<{ to: string; label: string; icon: ComponentType<SVGProps<SVGSVGElement>> }> = [
+type StudioPath = '/' | '/data' | '/query' | '/indexes' | '/workload' | '/generations' | '/operations' | '/metrics' | '/settings'
+
+const nav: Array<{ to: StudioPath; label: string; icon: ComponentType<SVGProps<SVGSVGElement>> }> = [
   { to: '/', label: 'Overview', icon: OverviewIcon },
   { to: '/data', label: 'Data', icon: DataIcon },
   { to: '/query', label: 'Query', icon: QueryIcon },
@@ -13,6 +15,11 @@ const nav: Array<{ to: string; label: string; icon: ComponentType<SVGProps<SVGSV
   { to: '/metrics', label: 'Metrics', icon: MetricsIcon },
   { to: '/settings', label: 'Settings', icon: SettingsIcon },
 ]
+
+function endpointLabel(): string {
+  if (import.meta.env.DEV) return '127.0.0.1:8787 via Vite proxy'
+  return window.location.host || 'same origin'
+}
 
 export function AppShell() {
   const pathname = useRouterState({ select: (state) => state.location.pathname })
@@ -38,14 +45,14 @@ export function AppShell() {
         </nav>
 
         <div className="sidebar__footer">
-          <div className="runtime-badge"><span className="status-mark" /><span>local control</span></div>
+          <div className="runtime-badge"><span className="status-mark" /><span>control plane</span></div>
           <span className="runtime-version">LHR/1</span>
         </div>
       </aside>
 
       <main className="main-stage">
         <div className="topbar">
-          <div className="topbar__identity"><span className="topbar__label">Active endpoint</span><strong>localhost:8787</strong></div>
+          <div className="topbar__identity"><span className="topbar__label">Active endpoint</span><strong>{endpointLabel()}</strong></div>
           <div className="topbar__meta"><span>Exact database</span><span className="topbar__separator" /><span>Bounded client</span></div>
         </div>
         <div className="main-scroll"><Outlet /></div>
