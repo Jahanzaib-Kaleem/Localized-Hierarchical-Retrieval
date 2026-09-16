@@ -24,6 +24,7 @@ pub mod operations;
 pub mod overlay;
 pub mod planner;
 pub mod postings;
+pub mod recovery;
 pub mod rowids;
 pub mod schema;
 pub mod segment;
@@ -70,6 +71,7 @@ pub use overlay::{
 };
 pub use planner::choose_hierarchies;
 pub use postings::PostingHierarchy;
+pub use recovery::{recover_catalog, verify_versioned_dataset, RecoveryReport};
 pub use rowids::{RowIdMap, RowIdWriter, ROW_IDS_FILE};
 pub use schema::{
     read_schema, read_schema_file, write_schema, ColumnSchema, DatasetSchema, LogicalType,
