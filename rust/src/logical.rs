@@ -1,9 +1,21 @@
-use crate::{read_schema, resolve_dataset_root, DatasetSchema, DecodedValue, Dictionary, Engine, Manifest, Predicate};
+use crate::{
+    read_schema, resolve_dataset_root, DatasetSchema, DecodedValue, Dictionary, Engine, Manifest,
+    Predicate,
+};
 use serde::Serialize;
-use std::{fs, io, path::{Path, PathBuf}};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct NamedValue {
+    pub column: String,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LogicalPredicate {
     pub column: String,
     pub value: Option<String>,
 }
@@ -81,15 +93,37 @@ impl LogicalDataset {
         &self.schema
     }
 
-    fn encoded_predicates(&self, predicates: &[(String, String)]) -> io::Result<Option<Vec<Predicate>>> {
+    fn encoded_predicates(
+        &self,
+        predicates: &[LogicalPredicate],
+    ) -> io::Result<Option<Vec<Predicate>>> {
         let mut out = Vec::with_capacity(predicates.len());
-        for (name, value) in predicates {
-            let index = self.schema.column_index(name).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("unknown column {name}"))
+        for predicate in predicates {
+            let index = self.schema.column_index(&predicate.column).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown column {}", predicate.column),
+                )
             })?;
-            let normalized = self.schema.columns[index].normalization.apply(value);
-            let Some(token) = self.dictionaries[index].token(&normalized) else {
-                return Ok(None);
+            let column = &self.schema.columns[index];
+            let token = match predicate.value.as_deref() {
+                None => {
+                    if !column.nullable {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("column {} is not nullable", column.name),
+                        ));
+                    }
+                    0
+                }
+                Some(raw) if column.is_null_literal(raw) => 0,
+                Some(raw) => {
+                    let canonical = column.canonicalize(raw)?;
+                    let Some(token) = self.dictionaries[index].token(&canonical) else {
+                        return Ok(None);
+                    };
+                    token
+                }
             };
             out.push(Predicate {
                 column: index,
@@ -106,16 +140,19 @@ impl LogicalDataset {
                 .iter()
                 .map(|name| {
                     self.schema.column_index(name).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, format!("unknown selected column {name}"))
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("unknown selected column {name}"),
+                        )
                     })
                 })
                 .collect(),
         }
     }
 
-    pub fn query_eq(
+    pub fn query_values(
         &self,
-        predicates: &[(String, String)],
+        predicates: &[LogicalPredicate],
         select: Option<&[String]>,
         limit: usize,
     ) -> io::Result<LogicalQueryResult> {
@@ -163,5 +200,22 @@ impl LogicalDataset {
             hierarchy_lookups: stats.hierarchy_lookups,
             rows,
         })
+    }
+
+    /// Compatibility helper for non-null equality predicates.
+    pub fn query_eq(
+        &self,
+        predicates: &[(String, String)],
+        select: Option<&[String]>,
+        limit: usize,
+    ) -> io::Result<LogicalQueryResult> {
+        let predicates: Vec<_> = predicates
+            .iter()
+            .map(|(column, value)| LogicalPredicate {
+                column: column.clone(),
+                value: Some(value.clone()),
+            })
+            .collect();
+        self.query_values(&predicates, select, limit)
     }
 }
