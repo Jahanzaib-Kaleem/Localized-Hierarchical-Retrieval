@@ -2,7 +2,7 @@ name: LHR Container
 
 on:
   push:
-    branches: [lhr-studio, main]
+    branches: [mcp-control-plane, main]
     tags: ['v*']
     paths:
       - 'Dockerfile'
@@ -39,14 +39,14 @@ jobs:
         with:
           images: ghcr.io/jahanzaib-kaleem/lhr
           tags: |
-            type=raw,value=studio,enable=${{ github.ref == 'refs/heads/lhr-studio' }}
+            type=raw,value=mcp,enable=${{ github.ref == 'refs/heads/mcp-control-plane' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          platforms: ${{ github.ref == 'refs/heads/lhr-studio' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          platforms: ${{ github.ref == 'refs/heads/mcp-control-plane' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
