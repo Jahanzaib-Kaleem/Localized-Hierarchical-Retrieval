@@ -52,12 +52,14 @@ fn named_query_encodes_and_decodes_values() {
             logical_type: LogicalType::Text,
             nullable: false,
             normalization: Normalization::TrimLowercase,
+            null_values: vec![],
         },
         ColumnSchema {
             name: "name".into(),
             logical_type: LogicalType::Text,
             nullable: false,
             normalization: Normalization::None,
+            null_values: vec![],
         },
     ])
     .unwrap();
