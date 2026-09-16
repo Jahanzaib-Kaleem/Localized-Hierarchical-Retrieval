@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
 use lhr::{
     apply_mutations, backup_dataset, dataset_status, import_csv, list_generations,
-    read_schema_file, resolve_dataset_root, rollback_generation, seal_dataset, verify_dataset,
-    CsvImportConfig, DatasetSchema, Engine, LogicalDataset, LogicalPredicate, Mutation,
-    MutationConfig, Predicate,
+    read_schema_file, resolve_dataset_root, restore_backup, rollback_generation, seal_dataset,
+    vacuum_generations, verify_dataset, CsvImportConfig, DatasetSchema, Engine, LogicalDataset,
+    LogicalPredicate, Mutation, MutationConfig, Predicate,
 };
 use serde_json::json;
 use std::{error::Error, fs, path::PathBuf, process};
@@ -66,7 +66,11 @@ enum Command {
     Backup {
         destination: PathBuf,
     },
-    /// Inspect or repoint immutable dataset generations.
+    /// Restore a verified standalone generation backup as a new CURRENT generation.
+    Restore {
+        backup: PathBuf,
+    },
+    /// Inspect, repoint, or prune immutable dataset generations.
     Generations {
         #[command(subcommand)]
         command: GenerationCommand,
@@ -103,6 +107,15 @@ enum GenerationCommand {
     Current,
     /// Atomically repoint CURRENT to an existing verified generation.
     Rollback { id: u64 },
+    /// Delete old generations while always preserving CURRENT.
+    Vacuum {
+        /// Keep at least this many newest published generations in addition to CURRENT/protected IDs.
+        #[arg(long, default_value_t = 2)]
+        retain: usize,
+        /// Explicit generation ID to preserve. Repeatable.
+        #[arg(long = "protect")]
+        protected: Vec<u64>,
+    },
 }
 
 fn parse_predicate(raw: &str) -> Result<Predicate, Box<dyn Error>> {
@@ -195,6 +208,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             print_json(&apply_mutations(&cli.root, &mutations, &config)?)?;
         }
+        Command::Restore { backup } => {
+            print_json(&restore_backup(&cli.root, backup)?)?;
+        }
         Command::Generations { command } => match command {
             GenerationCommand::List => print_json(&list_generations(&cli.root)?)?,
             GenerationCommand::Current => {
@@ -203,6 +219,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             GenerationCommand::Rollback { id } => {
                 print_json(&rollback_generation(&cli.root, id)?)?;
+            }
+            GenerationCommand::Vacuum { retain, protected } => {
+                print_json(&vacuum_generations(&cli.root, retain, &protected)?)?;
             }
         },
         command => {
@@ -281,9 +300,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "verification": report,
                     }))?;
                 }
-                Command::Import { .. } | Command::Mutate { .. } | Command::Generations { .. } => {
-                    unreachable!()
-                }
+                Command::Import { .. }
+                | Command::Mutate { .. }
+                | Command::Restore { .. }
+                | Command::Generations { .. } => unreachable!(),
             }
         }
     }
