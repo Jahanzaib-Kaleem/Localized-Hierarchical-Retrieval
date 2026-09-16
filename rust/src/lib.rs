@@ -28,6 +28,7 @@ pub mod recovery;
 pub mod rowids;
 pub mod schema;
 pub mod segment;
+pub mod snapshot;
 pub mod versioned;
 
 pub use admin::{
@@ -78,4 +79,7 @@ pub use schema::{
     Normalization, SCHEMA_FORMAT,
 };
 pub use segment::Segment;
+pub use snapshot::{
+    leased_generation_ids, vacuum_with_reader_leases, SafeVacuumReport, SnapshotLease,
+};
 pub use versioned::VersionedDataset;
