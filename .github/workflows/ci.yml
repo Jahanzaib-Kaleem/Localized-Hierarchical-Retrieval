@@ -90,6 +90,36 @@ jobs:
           assert d['hwm_kb'] < 1048576, d
           assert d['index_amplification'] < 1.0, d
           PY
+      - name: Lead-like sparse/high-cardinality 5M benchmark
+        working-directory: rust
+        shell: bash
+        run: |
+          cargo run --release --bin lead_scale -- 5000000 90 | tee lead-5m.json
+          cat lead-5m.json >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json
+          d=json.load(open('lead-5m.json'))
+          assert d['exact']=='10/10', d
+          assert d['kinds']['6_7']=='flatpost', d
+          assert d['kinds']['8_9']=='flatpost', d
+          assert d['hwm_kb'] < 1048576, d
+          assert d['index_amplification'] < 2.5, d
+          PY
+      - name: Lead-like sparse/high-cardinality 10M stress benchmark
+        working-directory: rust
+        shell: bash
+        run: |
+          cargo run --release --bin lead_scale -- 10000000 45 | tee lead-10m.json
+          cat lead-10m.json >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json
+          d=json.load(open('lead-10m.json'))
+          assert d['exact']=='10/10', d
+          assert d['kinds']['6_7']=='flatpost', d
+          assert d['kinds']['8_9']=='flatpost', d
+          assert d['hwm_kb'] < 1048576, d
+          assert d['index_amplification'] < 2.0, d
+          PY
       - name: Packed Hybrid comparison sweep
         working-directory: rust
         shell: bash

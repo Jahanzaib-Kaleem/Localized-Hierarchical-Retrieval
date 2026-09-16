@@ -4,6 +4,7 @@ use crate::{
     delta_postings::DeltaPostingHierarchy,
     dense_postings::{count_unique_sorted, DensePostingHierarchy},
     external::external_sort,
+    flat_postings::FlatPostingHierarchy,
     manifest::{HierarchyMeta, Manifest},
     postings::PostingHierarchy,
     Segment,
@@ -13,6 +14,8 @@ use std::{
     io::{self, BufWriter, Write},
     path::Path,
 };
+
+const BITSLICE_STORAGE_BUDGET_MULTIPLIER: u64 = 2;
 
 fn keyspace(spec: &HierarchySpec, card: &[u64]) -> io::Result<u64> {
     spec.columns.iter().try_fold(1u64, |a, &c| {
@@ -80,7 +83,7 @@ pub fn add_exact_hierarchies(
         if manifest.hierarchies.iter().any(|h| {
             matches!(
                 h.kind.as_str(),
-                "postings" | "densepost" | "deltapost" | "bitslice"
+                "postings" | "densepost" | "deltapost" | "bitslice" | "flatpost"
             ) && h.columns == spec.columns
         }) {
             return Err(io::Error::new(
@@ -155,6 +158,7 @@ pub fn add_exact_hierarchies(
             .saturating_add(manifest.rows.saturating_mul(4));
         let dense_bytes =
             DensePostingHierarchy::estimated_bytes(space, manifest.rows).unwrap_or(u64::MAX);
+        let flat_bytes = FlatPostingHierarchy::estimated_bytes(manifest.rows).unwrap_or(u64::MAX);
         let bitslice_bytes = if spec.columns.len() == 1
             && bitslice_query_ok(space, manifest.rows)
         {
@@ -169,10 +173,19 @@ pub fn add_exact_hierarchies(
         DeltaPostingHierarchy::build_from_sorted(&sorted, &delta_path)?;
         let delta_bytes = fs::metadata(&delta_path)?.len();
 
-        let (file, kind) = if bitslice_bytes <= delta_bytes
-            && bitslice_bytes <= dense_bytes
-            && bitslice_bytes <= sparse_bytes
-        {
+        let best_non_bitslice = delta_bytes
+            .min(dense_bytes)
+            .min(sparse_bytes)
+            .min(flat_bytes);
+        // For low-cardinality fields, a small storage premium is worthwhile because two
+        // bit-sliced predicates can be composed directly as word masks without materializing
+        // huge postings. The query-work guard above keeps this speed budget away from sparse
+        // high-cardinality fields.
+        let prefer_bitslice = bitslice_bytes != u64::MAX
+            && bitslice_bytes
+                <= best_non_bitslice.saturating_mul(BITSLICE_STORAGE_BUDGET_MULTIPLIER);
+
+        let (file, kind) = if prefer_bitslice {
             fs::remove_file(&delta_path)?;
             let file = format!("h{:04}.bsl", base + i);
             BitSlicePostingHierarchy::build_from_sorted(
@@ -182,6 +195,14 @@ pub fn add_exact_hierarchies(
                 manifest.rows,
             )?;
             (file, "bitslice".to_string())
+        } else if flat_bytes <= delta_bytes
+            && flat_bytes <= dense_bytes
+            && flat_bytes <= sparse_bytes
+        {
+            fs::remove_file(&delta_path)?;
+            let file = format!("h{:04}.flat", base + i);
+            FlatPostingHierarchy::build_from_sorted(&sorted, routing.join(&file), manifest.rows)?;
+            (file, "flatpost".to_string())
         } else if delta_bytes <= dense_bytes && delta_bytes <= sparse_bytes {
             (delta_file, "deltapost".to_string())
         } else if dense_bytes < sparse_bytes {
