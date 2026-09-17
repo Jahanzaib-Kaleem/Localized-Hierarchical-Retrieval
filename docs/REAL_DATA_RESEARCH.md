@@ -120,13 +120,11 @@ The implementation passed the full repository PR validation suite on 2026-09-17:
 
 ## 7. Remaining pagination concern after Hypothesis A
 
-Even after removing prefix replay, `candidate_rows_with_lookups` currently produces a complete `Vec<u32>` for the final exact candidate set before the caller takes a limited page.
+Even after removing prefix replay, `candidate_rows_with_lookups` could still produce a complete `Vec<u32>` for the final exact candidate set before the caller took a limited page.
 
-At 1.9M rows this can be fast and manageable. At the 1 TB target, a query with hundreds of millions or billions of matches cannot be allowed to require a correspondingly large transient candidate vector merely to return a 1,000-row page.
+At 1.9M rows this could be fast and manageable. At the 1 TB target, a query with hundreds of millions or billions of matches cannot be allowed to require a correspondingly large transient candidate vector merely to return a 1,000-row page.
 
-**Next research question:** can exact posting/bit-slice composition expose a sorted seekable iterator (or bounded chunk stream) that supports `lower_bound(row_id)` and limited output without materializing the full final set?
-
-This should be tested only after Hypothesis A establishes the simpler lower-bound baseline; otherwise two independent changes would be confounded.
+This concern led to the single-exact bounded-materialization experiment recorded in section 13. That experiment removes the full-vector requirement for the common broad single-predicate `bitslice` and `densepost` paths, but the general multi-index and remaining representation problem still exists.
 
 ## 8. Memory-residency observation
 
@@ -194,18 +192,58 @@ Hypothesis B0 therefore avoids dictionary-order assumptions entirely. For a requ
 8. preserve total exact hit count by summing each disjoint equality stream's hit count once;
 9. keep wider, open-ended, mixed-predicate, or unindexed ranges on the existing exact scan fallback.
 
-The 256-value cap is deliberately conservative. It bounds hierarchy lookups and heap state while covering the real Shopify failure `10000..10100`, which spans 101 integer values. This is an experiment, not a claim that 256 is the final threshold.
+The 256-value cap is deliberately conservative. It bounds hierarchy lookups and heap state while covering the real Shopify failure `10000..10100`, which spans 101 integer values. This is not a claim that 256 is the final threshold.
 
-Expected properties:
+Targeted tests prove that a six-value range with 12 total matches paginates exactly under `max_rows_examined=10` with zero rows examined. A separate 401-value range retains the scan fallback and trips the same resource cap. Versioned tests update a row out of the range, delete another, update another into the range and insert a new matching row while preserving exact hit count and order.
 
-- zero new index bytes and zero format change;
-- RAM bounded approximately by range width plus requested page, rather than dataset size;
-- exact cursor ordering inherited from the accepted equality seek path;
-- exact delta/tombstone semantics inherited from the versioned equality layer;
-- narrow ranges can avoid canonical row scans entirely when exact singletons exist;
-- latency may still be dominated by repeated equality lookups, especially with many delta visibility overrides;
-- broad ranges remain unresolved and require a different representation/algorithm if B0 is accepted only as a narrow-range specialization.
+The implementation passed the full repository PR validation suite on 2026-09-17, including release tests, the 1 GiB virtual-memory ceiling and every existing 1M/10M benchmark gate. It was merged to `main` in PR #21 with no new index files or format change.
 
-Targeted tests on the research branch require a six-value range with 12 total matches to paginate exactly while `max_rows_examined=10` and report zero rows examined. A 401-value range is required to retain the scan fallback and trip the same resource cap, proving the experiment does not silently broaden its scope.
+**Decision:** accept Hypothesis B0 as the narrow bounded-integer range baseline. It is intentionally a specialization, not the general broad-range solution.
 
-**Status:** implementation pending repository CI and live Shopify rebenchmark. No latency improvement is claimed until the actual `estimated_monthly_visits 10000..10100` query is rerun on the 1 GB VPS with storage/RSS/fault/read measurements.
+**Remaining validation:** rerun `estimated_monthly_visits 10000..10100` on the real Shopify generation and record first-hit/warm latency, RSS/peak RSS, faults and read bytes. Until that A/B exists, no real-data speedup should be claimed. Broad/open-ended/mixed ranges remain on the deterministic scan fallback.
+
+## 13. Pagination Hypothesis C0 — bounded materialization for broad single exact predicates
+
+Hypothesis A removed geometric cursor replay but did not prevent a broad exact singleton from constructing the complete final row-ID vector before taking a small page. The real first-page benchmark already contained a ~1.9M-hit query, making this a concrete RAM-scaling concern rather than a purely theoretical one.
+
+The existing physical representations showed that a full vector was not always required:
+
+- `densepost` stores sorted row IDs behind directly addressable posting bounds;
+- `bitslice` already reconstructs equality masks word-by-word.
+
+Hypothesis C0 therefore changes only those two safely seekable singleton routes:
+
+1. only activate for one exact predicate;
+2. read total hit count directly from the exact singleton index;
+3. for `densepost`, binary-search the posting to the requested physical lower bound and take at most `limit` rows;
+4. for `bitslice`, jump directly to the cursor's bitmap word, mask earlier bits in that word and enumerate only until `limit` rows are collected;
+5. preserve all other exact representations and every multi-index plan on the established planner path.
+
+This adds no index bytes and changes no durable format. Representation-level tests cover bounded seeking, and an integration test queries a 10,000-hit bit-sliced equality around row 18,000 while returning only five rows with zero canonical rows examined.
+
+The complete PR validation suite passed against the range-enabled `main`: Rust release tests, the 1 GiB virtual-memory ceiling, all existing 1M/10M benchmark gates, Python tests and Studio. The implementation was merged to `main` in PR #22.
+
+**Decision:** accept C0 for single-predicate `bitslice` and `densepost` queries. Broad pages on these representations no longer need to materialize the complete matching row-ID set merely to return a bounded page.
+
+**Remaining validation:** rerun the real ~1.9M-hit broad equality at page 0 and deep cursors, recording process/peak RSS, faults and read bytes. `deltapost`, `flatpost`, generic `postings`, and especially multi-index intersections remain separate streaming/seek research problems; their current behavior must not be generalized from C0.
+
+## 14. Scale Hypothesis D0 — compose multiple compact LHR/1 physical shards
+
+The 1 TB target makes the `u32` physical posting ceiling active. Source inspection found an important asymmetry: canonical segment metadata already uses `u64` row starts and row counts, while the exact posting bodies use compact `u32` physical row references. This suggests that widening every posting reference may be unnecessary.
+
+A research prototype on `tb-shard-catalog-research` tests a higher-level alternative: keep each physical shard as an ordinary LHR/1 dataset with its existing compact indexes, assign shards non-overlapping global logical row-ID ranges, query each shard independently, sum exact hit counts and concatenate bounded result pages in global row-ID order.
+
+The prototype intentionally does **not** yet define a durable shard catalog or mutation protocol. That omission is deliberate. Before this can become an accepted architecture, the project must settle:
+
+- atomic snapshot publication across all physical shards;
+- durable shard metadata and integrity sealing;
+- global logical-ID allocation for inserts;
+- update/delete routing;
+- compaction across or within shard boundaries;
+- shard sizing and rebuild economics;
+- whether one query should open all shards or use conservative shard-level routing;
+- how workload telemetry and index administration aggregate across shards.
+
+Targeted branch tests cover exact hit counts across two shards, a page crossing a shard boundary, a deep cursor inside the second shard, and rejection of overlapping global row-ID ranges.
+
+**Status:** promising query-composition prototype, not accepted and not merged. It must compile/test cleanly and the catalog/mutation semantics must be designed before it becomes part of the durable LHR architecture.
