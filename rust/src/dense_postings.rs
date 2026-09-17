@@ -117,6 +117,18 @@ impl DensePostingHierarchy {
         let Some((start, len)) = self.bounds(key) else { return Vec::new(); };
         (start..start+len).map(|i| self.row_at(i)).collect()
     }
+    pub fn rows_from(&self, key: u64, first_row: u32, limit: usize) -> Vec<u32> {
+        if limit == 0 { return Vec::new(); }
+        let Some((start, len)) = self.bounds(key) else { return Vec::new(); };
+        let end = start + len;
+        let mut lo = start;
+        let mut hi = end;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.row_at(mid) < first_row { lo = mid + 1; } else { hi = mid; }
+        }
+        (lo..end).take(limit).map(|i| self.row_at(i)).collect()
+    }
     pub fn intersect_rows(&self, key: u64, seed: &[u32]) -> Vec<u32> {
         let Some((start, len)) = self.bounds(key) else { return Vec::new(); };
         let mut out = Vec::with_capacity(seed.len().min(len));
@@ -146,6 +158,8 @@ mod tests {
         DensePostingHierarchy::build_from_sorted(&s,&p,10,5).unwrap();
         let x = DensePostingHierarchy::open(p).unwrap();
         assert_eq!(x.row_count(0),0); assert_eq!(x.rows(1),vec![0,3]); assert_eq!(x.rows(4),vec![1,8]); assert_eq!(x.row_count(9),0);
+        assert_eq!(x.rows_from(4, 2, 1), vec![8]);
+        assert_eq!(x.rows_from(1, 3, 10), vec![3]);
         assert_eq!(x.intersect_rows(4,&[0,1,3,8,12]),vec![1,8]);
         assert_eq!(x.total_rows(),5);
     }
