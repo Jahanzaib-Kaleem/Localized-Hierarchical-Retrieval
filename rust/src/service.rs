@@ -1,12 +1,13 @@
 use crate::{
     add_index, apply_mutations_delta, compact_dataset, dataset_stats, dataset_status, drop_index,
-    execute_query, leased_generation_ids, list_generations, planner_indexes_for_request,
+    execute_query, import_csv, leased_generation_ids, list_generations, planner_indexes_for_request,
     rebuild_index, record_query, recover_catalog, resolve_dataset_root, vacuum_with_reader_leases,
-    workload_report, CompactionConfig, Mutation, MutationConfig, QueryRequest, VersionedDataset,
+    workload_report, CompactionConfig, CsvImportConfig, DatasetSchema, Mutation, MutationConfig,
+    QueryRequest, VersionedDataset,
 };
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, OriginalUri, State},
+    extract::{DefaultBodyLimit, Multipart, OriginalUri, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -29,7 +30,7 @@ use std::{
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{fs as tokio_fs, io::AsyncWriteExt, sync::{OwnedSemaphorePermit, Semaphore}};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +45,7 @@ pub struct ServiceApiKey {
 
 fn default_bind() -> String { "127.0.0.1:8787".into() }
 fn default_body_bytes() -> usize { 8 * 1024 * 1024 }
+fn default_import_bytes() -> usize { 512 * 1024 * 1024 }
 fn default_concurrency() -> usize { 64 }
 fn default_rate_limit() -> u64 { 600 }
 fn default_query_limit() -> usize { 10_000 }
@@ -62,6 +64,8 @@ pub struct ServiceConfig {
     pub api_keys: Vec<ServiceApiKey>,
     #[serde(default = "default_body_bytes")]
     pub max_body_bytes: usize,
+    #[serde(default = "default_import_bytes")]
+    pub max_import_bytes: usize,
     #[serde(default = "default_concurrency")]
     pub max_concurrent_requests: usize,
     #[serde(default = "default_rate_limit")]
@@ -93,11 +97,12 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(), api_keys: Vec::new(), max_body_bytes: default_body_bytes(),
-            max_concurrent_requests: default_concurrency(), rate_limit_per_minute: default_rate_limit(),
-            max_query_limit: default_query_limit(), max_rows_examined: default_rows_examined(),
-            max_query_timeout_ms: default_timeout_ms(), max_mutation_ops: default_mutation_ops(),
-            max_batch_rows: default_batch_rows(), max_sort_records: default_sort_records(),
-            max_dictionary_run_bytes: default_dictionary_bytes(), behind_tls_proxy: false, audit_log: None,
+            max_import_bytes: default_import_bytes(), max_concurrent_requests: default_concurrency(),
+            rate_limit_per_minute: default_rate_limit(), max_query_limit: default_query_limit(),
+            max_rows_examined: default_rows_examined(), max_query_timeout_ms: default_timeout_ms(),
+            max_mutation_ops: default_mutation_ops(), max_batch_rows: default_batch_rows(),
+            max_sort_records: default_sort_records(), max_dictionary_run_bytes: default_dictionary_bytes(),
+            behind_tls_proxy: false, audit_log: None,
         }
     }
 }
@@ -118,7 +123,7 @@ impl ServiceConfig {
         if !bind.ip().is_loopback() && self.api_keys.is_empty() {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "remote service listeners require at least one API key"));
         }
-        if self.max_body_bytes == 0 || self.max_concurrent_requests == 0 || self.max_query_limit == 0
+        if self.max_body_bytes == 0 || self.max_import_bytes == 0 || self.max_concurrent_requests == 0 || self.max_query_limit == 0
             || self.max_rows_examined == 0 || self.max_query_timeout_ms == 0 || self.max_mutation_ops == 0
             || self.max_batch_rows == 0 || self.max_sort_records == 0 || self.max_dictionary_run_bytes == 0
         {
@@ -175,6 +180,10 @@ impl IntoResponse for ApiError {
 
 struct RequestGuard { request_id: u64, actor: String, metrics: Arc<RuntimeMetrics>, _permit: OwnedSemaphorePermit }
 impl Drop for RequestGuard { fn drop(&mut self) { self.metrics.active.fetch_sub(1, Ordering::Relaxed); } }
+
+struct TempFileGuard { path: PathBuf }
+impl TempFileGuard { fn new(path: PathBuf) -> Self { Self { path } } }
+impl Drop for TempFileGuard { fn drop(&mut self) { let _ = fs::remove_file(&self.path); } }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
@@ -281,6 +290,82 @@ async fn query(State(state): State<ServiceState>, headers: HeaderMap, Json(mut r
         }
         Err(error) => {
             state.metrics.query_failures.fetch_add(1, Ordering::Relaxed); state.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()))
+        }
+    }
+}
+
+fn csv_import_config(config: &ServiceConfig) -> CsvImportConfig {
+    let defaults = CsvImportConfig::default();
+    CsvImportConfig {
+        page_rows: defaults.page_rows,
+        batch_rows: defaults.batch_rows.min(config.max_batch_rows),
+        max_sort_records: defaults.max_sort_records.min(config.max_sort_records),
+        dictionary_run_bytes: defaults.dictionary_run_bytes.min(config.max_dictionary_run_bytes),
+        accelerators: Vec::new(),
+    }
+}
+
+async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap, mut multipart: Multipart) -> Result<Json<Value>, ApiError> {
+    let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
+    let upload_dir = state.root.join("temp").join("studio-uploads");
+    tokio_fs::create_dir_all(&upload_dir).await.map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))?;
+    let upload_path = upload_dir.join(format!("upload-{}.csv", guard.request_id));
+    let _upload_cleanup = TempFileGuard::new(upload_path.clone());
+    let mut schema: Option<DatasetSchema> = None;
+    let mut uploaded = false;
+    let mut uploaded_bytes = 0usize;
+
+    while let Some(mut field) = multipart.next_field().await.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("invalid multipart upload: {e}")))? {
+        let name = field.name().unwrap_or_default().to_owned();
+        match name.as_str() {
+            "schema" => {
+                let text = field.text().await.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("invalid schema field: {e}")))?;
+                let parsed: DatasetSchema = serde_json::from_str(&text).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("invalid schema JSON: {e}")))?;
+                parsed.validate().map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))?;
+                schema = Some(parsed);
+            }
+            "file" => {
+                if uploaded {
+                    return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "upload contains more than one file"));
+                }
+                let mut output = tokio_fs::File::create(&upload_path).await.map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))?;
+                while let Some(chunk) = field.chunk().await.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("failed reading upload: {e}")))? {
+                    uploaded_bytes = uploaded_bytes.checked_add(chunk.len()).ok_or_else(|| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, guard.request_id, "upload size overflow"))?;
+                    if uploaded_bytes > state.config.max_import_bytes {
+                        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, guard.request_id, format!("CSV exceeds the {} byte Studio import limit", state.config.max_import_bytes)));
+                    }
+                    output.write_all(&chunk).await.map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))?;
+                }
+                output.flush().await.map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))?;
+                uploaded = true;
+            }
+            _ => {}
+        }
+    }
+
+    let Some(schema) = schema else {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "missing schema field"));
+    };
+    if !uploaded || uploaded_bytes == 0 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "missing or empty CSV file"));
+    }
+
+    let root = state.root.clone();
+    let import_path = upload_path.clone();
+    let config = csv_import_config(&state.config);
+    let result = tokio::task::spawn_blocking(move || import_csv(root, import_path, &schema, &config))
+        .await.map_err(|e| join_error(guard.request_id, e))?;
+
+    match result {
+        Ok(report) => {
+            state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"import_csv", success:true, detail:json!({"bytes":uploaded_bytes,"report":report}) });
+            Ok(Json(json!({"request_id":guard.request_id,"result":report})))
+        }
+        Err(error) => {
+            state.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"import_csv", success:false, detail:json!({"bytes":uploaded_bytes,"error":error.to_string()}) });
             Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()))
         }
     }
@@ -544,10 +629,12 @@ pub async fn serve(root: impl AsRef<Path>, config: ServiceConfig) -> io::Result<
     };
     // The control plane is allowed to start before a dataset exists. /readyz remains false and
     // data endpoints return ordinary errors until an initial generation is imported/published.
+    let import_limit = config.max_import_bytes.saturating_add(1024 * 1024);
     let app = Router::new()
         .route("/healthz", get(healthz)).route("/readyz", get(readyz)).route("/metrics", get(metrics))
         .route("/v1/query", post(query)).route("/v1/stats", get(stats)).route("/v1/workload", get(workload))
         .route("/v1/generations", get(generations)).route("/v1/mutate", post(mutate))
+        .route("/v1/admin/import/csv", post(import_csv_upload).layer(DefaultBodyLimit::max(import_limit)))
         .route("/v1/admin/compact", post(compact)).route("/v1/admin/vacuum", post(vacuum)).route("/v1/admin/recover", post(recover))
         .route("/v1/admin/index/add", post(index_add)).route("/v1/admin/index/drop", post(index_drop)).route("/v1/admin/index/rebuild", post(index_rebuild))
         .fallback(studio)
@@ -578,6 +665,22 @@ mod tests {
     #[test]
     fn role_order_matches_authorization_strength() {
         assert!(ServiceRole::Admin > ServiceRole::Write); assert!(ServiceRole::Write > ServiceRole::Read);
+    }
+    #[test]
+    fn import_limit_must_be_nonzero() {
+        let mut config = ServiceConfig::default();
+        config.max_import_bytes = 0;
+        assert!(config.validate().is_err());
+    }
+    #[test]
+    fn temp_file_guard_removes_file_on_drop() {
+        let path = env::temp_dir().join(format!("lhr-service-upload-{}-{}.csv", std::process::id(), now_ms()));
+        fs::write(&path, b"test").unwrap();
+        {
+            let _guard = TempFileGuard::new(path.clone());
+            assert!(path.is_file());
+        }
+        assert!(!path.exists());
     }
     #[test]
     fn studio_mime_types_are_stable() {

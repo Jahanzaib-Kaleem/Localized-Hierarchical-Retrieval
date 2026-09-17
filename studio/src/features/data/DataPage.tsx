@@ -1,65 +1,133 @@
-import { useEffect, useState } from 'react'
+import { useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client'
-import type { MutationOperation, QueryResponse } from '../../api/types'
+import type { CsvImportReport, ImportDatasetSchema, LogicalType, Normalization } from '../../api/types'
 import { formatBytes, numberFormat } from '../../components/format'
-import { ResultTable } from '../../components/ResultTable'
-import { ActionResult, Notice, PageHeader, Panel } from '../../components/ui'
+import { FileIcon, UploadIcon } from '../../components/icons'
+import { Notice, PageHeader, Panel } from '../../components/ui'
+import { previewCsv, type CsvPreview } from './csv'
 
-const mutationExample = `[
-  {
-    "op": "update",
-    "row_id": 42,
-    "values": { "company": "Example" }
-  }
-]`
+const logicalTypes: Array<{ value: LogicalType; label: string }> = [
+  { value: 'text', label: 'Text' },
+  { value: 'unsigned', label: 'Unsigned integer' },
+  { value: 'signed', label: 'Signed integer' },
+  { value: 'boolean', label: 'Boolean' },
+  { value: 'timestamp', label: 'Timestamp' },
+]
+const normalizations: Array<{ value: Normalization; label: string }> = [
+  { value: 'none', label: 'None' },
+  { value: 'trim', label: 'Trim' },
+  { value: 'lowercase', label: 'Lowercase' },
+  { value: 'trim_lowercase', label: 'Trim + lowercase' },
+]
 
 export function DataPage() {
   const queryClient = useQueryClient()
-  const stats = useQuery({ queryKey: ['stats'], queryFn: ({ signal }) => api.stats(signal), staleTime: 30_000 })
-  const [column, setColumn] = useState('')
-  const [value, setValue] = useState('')
-  const [limit, setLimit] = useState(50)
-  const [result, setResult] = useState<QueryResponse>()
-  const [mutationText, setMutationText] = useState(mutationExample)
-  const [mutationError, setMutationError] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+  const stats = useQuery({ queryKey: ['stats'], queryFn: ({ signal }) => api.stats(signal), staleTime: 30_000, retry: false })
+  const [file, setFile] = useState<File | null>(null)
+  const [preview, setPreview] = useState<CsvPreview | null>(null)
+  const [fileError, setFileError] = useState('')
+  const [dragging, setDragging] = useState(false)
+  const [lastImport, setLastImport] = useState<CsvImportReport | null>(null)
 
-  useEffect(() => { if (!column && stats.data?.column_stats[0]) setColumn(stats.data.column_stats[0].name) }, [column, stats.data])
+  const selectFile = async (next: File) => {
+    setFileError('')
+    setLastImport(null)
+    if (!next.name.toLowerCase().endsWith('.csv')) {
+      setFileError('Choose a .csv file.')
+      return
+    }
+    try {
+      const nextPreview = await previewCsv(next)
+      setFile(next)
+      setPreview(nextPreview)
+    } catch (error) {
+      setFile(null)
+      setPreview(null)
+      setFileError(error instanceof Error ? error.message : String(error))
+    }
+  }
 
-  const lookup = useMutation({ mutationFn: () => api.query({ filters: [{ op: 'eq', column, value }], limit, max_rows_examined: 1_000_000, timeout_ms: 5000 }), onSuccess: setResult })
-  const mutate = useMutation({
+  const updateSchema = (updater: (schema: ImportDatasetSchema) => ImportDatasetSchema) => {
+    setPreview((current) => current ? { ...current, schema: updater(current.schema) } : current)
+  }
+
+  const importData = useMutation({
     mutationFn: async () => {
-      setMutationError('')
-      const parsed: unknown = JSON.parse(mutationText)
-      if (!Array.isArray(parsed) || parsed.length === 0) throw new Error('Mutation payload must be a non-empty JSON array.')
-      return api.mutate(parsed as MutationOperation[])
+      if (!file || !preview) throw new Error('Choose a CSV first.')
+      return api.importCsv(file, preview.schema)
     },
-    onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ['stats'] }); await queryClient.invalidateQueries({ queryKey: ['generations'] }) },
-    onError: (error) => setMutationError(error instanceof Error ? error.message : String(error)),
+    onSuccess: async (report) => {
+      setLastImport(report)
+      setFile(null)
+      setPreview(null)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['stats'] }),
+        queryClient.invalidateQueries({ queryKey: ['ready'] }),
+        queryClient.invalidateQueries({ queryKey: ['generations'] }),
+      ])
+    },
   })
 
+  const startImport = () => {
+    if (!file || !preview) return
+    if (stats.data && !window.confirm('Importing this CSV will publish it as the new current dataset. The previous generation remains available for recovery. Continue?')) return
+    importData.mutate()
+  }
+
   return <div className="page stack stack--lg">
-    <PageHeader eyebrow="Logical data" title="Data" description="Inspect exact bounded result sets and submit explicit transactional row mutations without materializing the dataset in the browser." />
-    {stats.error ? <Notice title="Schema unavailable">{stats.error.message}</Notice> : null}
-    <div className="content-grid content-grid--3-2">
-      <Panel title="Exact row lookup" eyebrow="Bounded read">
-        <form className="form-grid" onSubmit={(event) => { event.preventDefault(); if (column) lookup.mutate() }}>
-          <label className="field"><span>Column</span><select value={column} onChange={(event) => setColumn(event.target.value)}>{(stats.data?.column_stats ?? []).map((item) => <option key={item.id} value={item.name}>{item.name}</option>)}</select></label>
-          <label className="field field--grow"><span>Value</span><input value={value} onChange={(event) => setValue(event.target.value)} placeholder="Exact canonical value" /></label>
-          <label className="field field--compact"><span>Rows</span><input type="number" min={1} max={500} value={limit} onChange={(event) => setLimit(Math.max(1, Math.min(500, Number(event.target.value) || 1)))} /></label>
-          <button className="button" disabled={!column || lookup.isPending} type="submit">{lookup.isPending ? 'Running…' : 'Run lookup'}</button>
-        </form>
-        {lookup.error ? <Notice title="Query failed">{lookup.error.message}</Notice> : null}
-      </Panel>
-      <Panel title="Dataset contract" eyebrow="Current schema">
-        <dl className="definition-list"><div><dt>Rows</dt><dd>{stats.data ? numberFormat.format(stats.data.rows) : '—'}</dd></div><div><dt>Columns</dt><dd>{stats.data ? numberFormat.format(stats.data.columns) : '—'}</dd></div><div><dt>Total bytes</dt><dd>{stats.data ? formatBytes(stats.data.total_bytes) : '—'}</dd></div><div><dt>Read policy</dt><dd>bounded + cursor-safe</dd></div></dl>
-      </Panel>
-    </div>
-    <Panel title="Rows" eyebrow="Query result"><ResultTable result={result} /></Panel>
-    <Panel title="Mutation transaction" eyebrow="Write API">
-      <div className="stack"><p className="support-copy">Submit one JSON array of insert, update, and/or delete operations. The server validates the complete transaction and publishes an immutable delta generation. Studio never retries writes automatically.</p><textarea className="code-editor" spellCheck={false} value={mutationText} onChange={(event) => setMutationText(event.target.value)} />
-      <div className="cluster cluster--spread"><span className="field-hint">Large bulk ingest remains a local CLI operation by design.</span><button className="button" type="button" disabled={mutate.isPending} onClick={() => { if (window.confirm('Apply this mutation transaction?')) mutate.mutate() }}>{mutate.isPending ? 'Applying…' : 'Apply transaction'}</button></div>
-      {mutationError ? <Notice title="Mutation rejected">{mutationError}</Notice> : null}{mutate.data ? <ActionResult value={mutate.data} /> : null}</div>
+    <PageHeader eyebrow="Dataset" title="Data" description="Import a CSV, review its schema, and keep the current dataset understandable at a glance." />
+
+    {lastImport ? <Notice title="Dataset imported">Published generation {lastImport.generation.id} with {numberFormat.format(lastImport.rows)} rows.</Notice> : null}
+
+    <Panel title={stats.data ? 'Import or replace dataset' : 'Import your first dataset'} eyebrow="CSV">
+      <div className="stack">
+        <div
+          className="drop-zone"
+          data-dragging={dragging ? 'true' : 'false'}
+          onDragEnter={(event) => { event.preventDefault(); setDragging(true) }}
+          onDragOver={(event) => event.preventDefault()}
+          onDragLeave={(event) => { event.preventDefault(); if (event.currentTarget === event.target) setDragging(false) }}
+          onDrop={(event) => { event.preventDefault(); setDragging(false); const dropped = event.dataTransfer.files[0]; if (dropped) void selectFile(dropped) }}
+          onClick={() => inputRef.current?.click()}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') inputRef.current?.click() }}
+        >
+          <input ref={inputRef} className="visually-hidden" type="file" accept=".csv,text/csv" onChange={(event) => { const selected = event.target.files?.[0]; if (selected) void selectFile(selected); event.currentTarget.value = '' }} />
+          <div className="drop-zone__icon">{file ? <FileIcon /> : <UploadIcon />}</div>
+          <div className="drop-zone__copy">
+            <strong>{file ? file.name : 'Drop a CSV here'}</strong>
+            <span>{file ? `${formatBytes(file.size)} · click to choose another file` : 'or click to choose a file'}</span>
+          </div>
+          <span className="button button--quiet">Choose CSV</span>
+        </div>
+        {fileError ? <Notice title="Could not read CSV">{fileError}</Notice> : null}
+        <p className="field-hint">Studio previews only a small sample in the browser. The actual import is streamed to LHR and built on the server.</p>
+      </div>
     </Panel>
+
+    {preview ? <>
+      <Panel title="Review columns" eyebrow={`${preview.schema.columns.length} detected`} action={<button className="button button--primary" disabled={importData.isPending} type="button" onClick={startImport}>{importData.isPending ? 'Importing…' : stats.data ? 'Import as new dataset' : 'Create dataset'}</button>}>
+        <div className="table-wrap schema-editor-wrap"><table className="data-table schema-editor"><thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Normalization</th></tr></thead><tbody>
+          {preview.schema.columns.map((column, index) => <tr key={`${column.name}-${index}`}>
+            <td className="data-table__primary">{column.name}</td>
+            <td><select value={column.logical_type} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, logical_type: event.target.value as LogicalType } : item) }))}>{logicalTypes.map((type) => <option value={type.value} key={type.value}>{type.label}</option>)}</select></td>
+            <td><label className="toggle-field"><input type="checkbox" checked={column.nullable} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, nullable: event.target.checked, null_values: event.target.checked ? [''] : [] } : item) }))} /><span>{column.nullable ? 'Yes' : 'No'}</span></label></td>
+            <td><select value={column.normalization} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, normalization: event.target.value as Normalization } : item) }))}>{normalizations.map((normalization) => <option value={normalization.value} key={normalization.value}>{normalization.label}</option>)}</select></td>
+          </tr>)}
+        </tbody></table></div>
+        {importData.error ? <Notice title="Import failed">{importData.error.message}</Notice> : null}
+      </Panel>
+
+      <Panel title="Preview" eyebrow="First complete rows">
+        <div className="table-wrap preview-table-wrap"><table className="data-table"><thead><tr>{preview.headers.map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>{preview.rows.map((row, rowIndex) => <tr key={rowIndex}>{preview.headers.map((header, columnIndex) => <td key={`${rowIndex}-${header}`} title={row[columnIndex] ?? ''}>{row[columnIndex] || <span className="null-value">empty</span>}</td>)}</tr>)}</tbody></table></div>
+      </Panel>
+    </> : null}
+
+    {stats.data ? <Panel title="Current schema" eyebrow={`${numberFormat.format(stats.data.rows)} rows · ${formatBytes(stats.data.total_bytes)}`}>
+      <div className="table-wrap"><table className="data-table"><thead><tr><th>Column</th><th>Type</th><th>Cardinality</th><th>Nullable</th></tr></thead><tbody>{stats.data.column_stats.map((column) => <tr key={column.id}><td className="data-table__primary">{column.name}</td><td><span className="code-chip">{column.logical_type}</span></td><td className="mono">{numberFormat.format(column.cardinality)}</td><td>{column.nullable ? 'Yes' : 'No'}</td></tr>)}</tbody></table></div>
+    </Panel> : null}
   </div>
 }
