@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client'
-import type { ImportDatasetSchema, LogicalType, Normalization } from '../../api/types'
+import type { CsvImportReport, ImportDatasetSchema, LogicalType, Normalization } from '../../api/types'
 import { formatBytes, numberFormat } from '../../components/format'
 import { FileIcon, UploadIcon } from '../../components/icons'
 import { Notice, PageHeader, Panel } from '../../components/ui'
@@ -29,9 +29,11 @@ export function DataPage() {
   const [preview, setPreview] = useState<CsvPreview | null>(null)
   const [fileError, setFileError] = useState('')
   const [dragging, setDragging] = useState(false)
+  const [lastImport, setLastImport] = useState<CsvImportReport | null>(null)
 
   const selectFile = async (next: File) => {
     setFileError('')
+    setLastImport(null)
     if (!next.name.toLowerCase().endsWith('.csv')) {
       setFileError('Choose a .csv file.')
       return
@@ -56,7 +58,8 @@ export function DataPage() {
       if (!file || !preview) throw new Error('Choose a CSV first.')
       return api.importCsv(file, preview.schema)
     },
-    onSuccess: async () => {
+    onSuccess: async (report) => {
+      setLastImport(report)
       setFile(null)
       setPreview(null)
       await Promise.all([
@@ -75,6 +78,8 @@ export function DataPage() {
 
   return <div className="page stack stack--lg">
     <PageHeader eyebrow="Dataset" title="Data" description="Import a CSV, review its schema, and keep the current dataset understandable at a glance." />
+
+    {lastImport ? <Notice title="Dataset imported">Published generation {lastImport.generation.id} with {numberFormat.format(lastImport.rows)} rows.</Notice> : null}
 
     <Panel title={stats.data ? 'Import or replace dataset' : 'Import your first dataset'} eyebrow="CSV">
       <div className="stack">
@@ -114,7 +119,6 @@ export function DataPage() {
           </tr>)}
         </tbody></table></div>
         {importData.error ? <Notice title="Import failed">{importData.error.message}</Notice> : null}
-        {importData.data ? <Notice title="Dataset imported">Published generation {importData.data.generation.id} with {numberFormat.format(importData.data.rows)} rows.</Notice> : null}
       </Panel>
 
       <Panel title="Preview" eyebrow="First complete rows">
