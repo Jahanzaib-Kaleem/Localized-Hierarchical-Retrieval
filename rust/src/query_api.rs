@@ -1,6 +1,13 @@
 use crate::{DatasetSchema, LogicalPredicate, LogicalType, NamedValue, VersionedDataset};
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, io, time::{Duration, Instant}};
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::BinaryHeap,
+    io,
+    time::{Duration, Instant},
+};
+
+const MAX_EXACT_RANGE_VALUES: u64 = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -68,6 +75,16 @@ fn deadline(request: &QueryRequest, start: Instant) -> Option<Instant> {
 fn enforce_deadline(deadline: Option<Instant>) -> io::Result<()> {
     if deadline.is_some_and(|x| Instant::now() >= x) {
         return Err(io::Error::new(io::ErrorKind::TimedOut, "query timeout exceeded"));
+    }
+    Ok(())
+}
+
+fn enforce_rows_examined(max: Option<u64>, rows_examined: u64) -> io::Result<()> {
+    if max.is_some_and(|limit| rows_examined > limit) {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "query row-examination limit exceeded",
+        ));
     }
     Ok(())
 }
@@ -190,6 +207,49 @@ fn equality_predicates(filters: &[PreparedFilter], schema: &DatasetSchema) -> Op
     Some(out)
 }
 
+fn bounded_integer_range_values(
+    filters: &[PreparedFilter],
+    schema: &DatasetSchema,
+) -> Option<(usize, Vec<String>)> {
+    if filters.len() != 1 {
+        return None;
+    }
+    let PreparedFilter::Range { column, gte, lte } = &filters[0] else {
+        return None;
+    };
+    let (Some(gte), Some(lte)) = (gte.as_deref(), lte.as_deref()) else {
+        return None;
+    };
+
+    match schema.columns[*column].logical_type {
+        LogicalType::Unsigned => {
+            let lo = gte.parse::<u64>().ok()?;
+            let hi = lte.parse::<u64>().ok()?;
+            let width = hi.checked_sub(lo)?.checked_add(1)?;
+            if width > MAX_EXACT_RANGE_VALUES {
+                return None;
+            }
+            let values = (0..width)
+                .map(|offset| lo.checked_add(offset).map(|value| value.to_string()))
+                .collect::<Option<Vec<_>>>()?;
+            Some((*column, values))
+        }
+        LogicalType::Signed => {
+            let lo = gte.parse::<i64>().ok()? as i128;
+            let hi = lte.parse::<i64>().ok()? as i128;
+            let width = hi.checked_sub(lo)?.checked_add(1)?;
+            if width <= 0 || width > MAX_EXACT_RANGE_VALUES as i128 {
+                return None;
+            }
+            let values = (0..width as u64)
+                .map(|offset| lo.checked_add(offset as i128).map(|value| value.to_string()))
+                .collect::<Option<Vec<_>>>()?;
+            Some((*column, values))
+        }
+        _ => None,
+    }
+}
+
 pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::Result<QueryResponse> {
     if request.limit == 0 { return Err(invalid("query limit must be > 0")); }
     let start = Instant::now();
@@ -207,9 +267,7 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
             request.after_row_id,
             request.limit,
         )?;
-        if request.max_rows_examined.is_some_and(|max| result.rows_checked > max) {
-            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "query row-examination limit exceeded"));
-        }
+        enforce_rows_examined(request.max_rows_examined, result.rows_checked)?;
         enforce_deadline(deadline)?;
         let mut rows: Vec<_> = result.rows.into_iter()
             .map(|row| QueryApiRow { row_id: row.row_id, values: row.values })
@@ -230,6 +288,97 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
         });
     }
 
+    // Hypothesis B0: a narrow bounded integer range can be answered exactly with the existing
+    // singleton equality indexes. Each integer value becomes one exact equality stream; the
+    // streams are merged by stable logical row ID while retaining at most one head row per value.
+    // This deliberately spends extra hierarchy lookups to avoid adding an on-disk range index.
+    if let Some((column, range_values)) = bounded_integer_range_values(&prepared, dataset.schema()) {
+        if dataset.has_exact_singleton(column) {
+            let column_name = dataset.schema().columns[column].name.clone();
+            let select = if request.select.is_empty() {
+                None
+            } else {
+                Some(request.select.as_slice())
+            };
+            let mut heads: Vec<Option<QueryApiRow>> =
+                (0..range_values.len()).map(|_| None).collect();
+            let mut heap = BinaryHeap::<Reverse<(u64, usize)>>::new();
+            let mut hits = 0u64;
+            let mut rows_examined = 0u64;
+            let mut pages_touched = 0u64;
+            let mut hierarchy_lookups = 0u64;
+
+            for (stream, value) in range_values.iter().enumerate() {
+                enforce_deadline(deadline)?;
+                let predicate = [LogicalPredicate {
+                    column: column_name.clone(),
+                    value: Some(value.clone()),
+                }];
+                let result =
+                    dataset.query_values_after(&predicate, select, request.after_row_id, 1)?;
+                hits = hits.saturating_add(result.hits);
+                rows_examined = rows_examined.saturating_add(result.rows_checked);
+                pages_touched = pages_touched.saturating_add(result.pages_touched);
+                hierarchy_lookups = hierarchy_lookups.saturating_add(result.hierarchy_lookups);
+                enforce_rows_examined(request.max_rows_examined, rows_examined)?;
+                if let Some(row) = result.rows.into_iter().next() {
+                    let row = QueryApiRow { row_id: row.row_id, values: row.values };
+                    heap.push(Reverse((row.row_id, stream)));
+                    heads[stream] = Some(row);
+                }
+            }
+
+            let mut rows = Vec::with_capacity(request.limit);
+            while rows.len() < request.limit {
+                let Some(Reverse((row_id, stream))) = heap.pop() else {
+                    break;
+                };
+                let Some(row) = heads[stream].take() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "range stream heap/head state diverged",
+                    ));
+                };
+                rows.push(row);
+                if rows.len() >= request.limit {
+                    break;
+                }
+
+                enforce_deadline(deadline)?;
+                let predicate = [LogicalPredicate {
+                    column: column_name.clone(),
+                    value: Some(range_values[stream].clone()),
+                }];
+                let result = dataset.query_values_after(&predicate, select, Some(row_id), 1)?;
+                rows_examined = rows_examined.saturating_add(result.rows_checked);
+                pages_touched = pages_touched.saturating_add(result.pages_touched);
+                hierarchy_lookups = hierarchy_lookups.saturating_add(result.hierarchy_lookups);
+                enforce_rows_examined(request.max_rows_examined, rows_examined)?;
+                if let Some(next) = result.rows.into_iter().next() {
+                    let next = QueryApiRow { row_id: next.row_id, values: next.values };
+                    heap.push(Reverse((next.row_id, stream)));
+                    heads[stream] = Some(next);
+                }
+            }
+
+            enforce_deadline(deadline)?;
+            let next_cursor = (rows.len() == request.limit).then(|| rows.last().unwrap().row_id);
+            return Ok(QueryResponse {
+                returned: rows.len(),
+                rows,
+                next_cursor,
+                stats: QueryApiStats {
+                    hits,
+                    rows_examined,
+                    pages_touched,
+                    hierarchy_lookups,
+                    elapsed_micros: start.elapsed().as_micros(),
+                    optimized_equality_route: false,
+                },
+            });
+        }
+    }
+
     // Set/range filters use the exact canonical/versioned fallback. It is deliberately slower but
     // never probabilistic and is bounded by explicit resource controls.
     let mut rows_examined = 0u64;
@@ -237,9 +386,7 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
     let mut rows = Vec::new();
     dataset.for_each_visible_row(|row_id, values| {
         rows_examined = rows_examined.saturating_add(1);
-        if request.max_rows_examined.is_some_and(|max| rows_examined > max) {
-            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "query row-examination limit exceeded"));
-        }
+        enforce_rows_examined(request.max_rows_examined, rows_examined)?;
         if rows_examined % 1024 == 0 { enforce_deadline(deadline)?; }
         if !matches_filters(dataset.schema(), &values, &prepared)? { return Ok(()); }
         hits = hits.saturating_add(1);
