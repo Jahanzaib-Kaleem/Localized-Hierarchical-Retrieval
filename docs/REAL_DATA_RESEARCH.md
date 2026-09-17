@@ -112,9 +112,11 @@ Expected properties:
 - delta visibility/tombstones preserved;
 - current broad exact path still materializes the complete candidate vector, so this is **not yet the final TB-scale streaming solution**.
 
-Implementation is on the `real-data-research` branch with targeted base/delta cursor tests. It is not accepted until CI passes and the real Shopify pagination matrix is rerun.
+The implementation passed the full repository PR validation suite on 2026-09-17: Rust release tests, the 1 GiB virtual-memory ceiling, all 1M/10M benchmark gates, Python tests and the Studio build. Targeted tests prove cursor seeking for ordinary logical IDs and for versioned/delta visibility. The change was merged to `main` in PR #20.
 
-**Status:** implementation pending validation.
+**Decision:** accept Hypothesis A as the new implementation baseline. It adds no index/storage bytes and removes the geometric prefix-replay mechanism.
+
+**Remaining validation:** rerun the Shopify pagination matrix at row 0 / 1k / 10k / 100k / 500k / 1M / 1.5M on the live 1 GB VPS. Until those measurements exist, the original real-data latency table remains the authoritative before-state and no after-latency claim should be published.
 
 ## 7. Remaining pagination concern after Hypothesis A
 
@@ -156,3 +158,20 @@ For each optimization:
 10. keep rejected experiments in the research record.
 
 The next major scale milestone should be a real dataset materially larger than RAM (initially 5–10 GB on the same 1 GB VPS), followed by progressively larger real runs toward the 1 TB target.
+
+## 11. Scale blocker discovered: `u32` physical row addressing
+
+Source inspection after the first real-data fix exposed a separate long-range constraint. The current LHR/1 exact row-posting families use `u32` physical row IDs. The exact hierarchy builder explicitly rejects a physical dataset above `u32::MAX` rows, so one current physical layer cannot exceed roughly 4.29 billion rows.
+
+This was already documented as an on-disk format limit, but the 1 TB target makes it an active architectural concern rather than a distant compatibility note.
+
+The first Shopify generation stores about 121.7 MB of canonical bytes for 1.902M rows, or roughly 64 canonical bytes per row. A 1 TB dataset at a similar density would therefore contain on the order of 15 billion rows, materially above the current single-layer address ceiling. Real future schemas may have different bytes/row, so this is not a universal row-count forecast; it is enough to prove that 1 TB cannot assume the present single-layer `u32` ceiling is harmless.
+
+Two broad directions exist:
+
+1. widen physical row references to `u64`, which is straightforward conceptually but can materially increase posting/index bytes;
+2. preserve compact local `u32` row IDs inside bounded physical shards and add a higher-level shard/local address composition layer.
+
+The second direction is more consistent with LHR's storage objective because it keeps the dominant local row reference compact while allowing total dataset size to exceed the local address space. It also matches the existing principle that physical organization is an optimization below stable logical row IDs.
+
+**Decision:** do not silently widen LHR/1 posting formats. Treat >4.29B-row support as a separate sharded-addressing / future-format research problem. Any design must preserve stable logical IDs, exact cross-shard query composition, bounded query RAM and current compact posting economics. A format-incompatible solution must follow the explicit LHR format-versioning policy.
