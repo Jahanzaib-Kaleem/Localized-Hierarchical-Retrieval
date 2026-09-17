@@ -34,6 +34,23 @@ export type DatasetStats = {
   indexes: IndexInfo[]
 }
 
+export type LogicalType = 'text' | 'unsigned' | 'signed' | 'boolean' | 'timestamp'
+export type Normalization = 'none' | 'trim' | 'lowercase' | 'trim_lowercase'
+export type ImportColumnSchema = {
+  name: string
+  logical_type: LogicalType
+  nullable: boolean
+  normalization: Normalization
+  null_values: string[]
+}
+export type ImportDatasetSchema = { format: 'LHR-SCHEMA/1'; columns: ImportColumnSchema[] }
+export type CsvImportReport = {
+  generation: GenerationInfo
+  rows: number
+  cardinalities: number[]
+  exact_hierarchies: number
+}
+
 export type NamedValue = { column: string; value: string | null }
 export type QueryFilter =
   | { op: 'eq'; column: string; value: string | null }
