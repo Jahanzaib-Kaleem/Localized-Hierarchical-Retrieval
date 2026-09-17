@@ -171,6 +171,30 @@ impl BitSlicePostingHierarchy {
         out
     }
 
+    pub fn rows_from(&self, key: u64, first_row: u32, limit: usize) -> Vec<u32> {
+        if key >= self.keyspace || limit == 0 || first_row >= self.rows {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(limit.min(self.count_at(key)));
+        let first_word = first_row as usize / 64;
+        let first_bit = first_row as usize % 64;
+        for word in first_word..self.words {
+            let mut mask = self.equality_word(key, word);
+            if word == first_word && first_bit != 0 {
+                mask &= !((1u64 << first_bit) - 1);
+            }
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                out.push((word * 64 + bit) as u32);
+                if out.len() == limit {
+                    return out;
+                }
+                mask &= mask - 1;
+            }
+        }
+        out
+    }
+
     pub fn intersect_rows(&self, key: u64, seed: &[u32]) -> Vec<u32> {
         if key >= self.keyspace || seed.is_empty() { return Vec::new(); }
         let mut out = Vec::with_capacity(seed.len().min(self.count_at(key)));
@@ -230,6 +254,8 @@ mod tests {
         assert_eq!(x.rows(0), vec![0, 3]);
         assert_eq!(x.rows(1), vec![1, 4]);
         assert_eq!(x.rows(2), vec![2, 5]);
+        assert_eq!(x.rows_from(1, 2, 1), vec![4]);
+        assert_eq!(x.rows_from(2, 2, 10), vec![2, 5]);
         assert_eq!(x.intersect_rows(1, &[0, 1, 2, 4, 5]), vec![1, 4]);
         assert_eq!(x.intersect_rows(1, &[4, 1, 5]), vec![4, 1]);
 
