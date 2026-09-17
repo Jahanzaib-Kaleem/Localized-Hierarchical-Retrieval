@@ -10,7 +10,7 @@ Remote listeners also require at least one API key. Keys have one of three roles
 
 - `read`: query, stats, workload, generations, metrics;
 - `write`: all read operations plus mutations;
-- `admin`: all operations including compaction, vacuum, recovery, and index changes.
+- `admin`: all operations including imports, compaction, vacuum, recovery, and index changes.
 
 Bearer tokens are hashed before lookup and are never written to telemetry or audit logs.
 
@@ -25,6 +25,7 @@ Example configuration:
     {"id": "admin", "token": "replace-with-a-third-long-random-token", "role": "admin"}
   ],
   "max_body_bytes": 8388608,
+  "max_import_bytes": 536870912,
   "max_concurrent_requests": 64,
   "rate_limit_per_minute": 600,
   "max_query_limit": 10000,
@@ -67,6 +68,7 @@ For a reverse-proxy deployment, bind LHR to a private/loopback listener whenever
 
 ### Administrative API
 
+- `POST /v1/admin/import/csv` — streamed multipart CSV import used by Studio; publishes a new immutable generation after the normal exact import/verification pipeline succeeds.
 - `POST /v1/admin/compact`
 - `POST /v1/admin/vacuum`
 - `POST /v1/admin/recover`
@@ -75,6 +77,21 @@ For a reverse-proxy deployment, bind LHR to a private/loopback listener whenever
 - `POST /v1/admin/index/rebuild`
 
 Filesystem-path operations such as arbitrary backup/restore destinations are intentionally kept out of the network API. They remain local administrative CLI operations so a compromised HTTP credential cannot be turned directly into arbitrary filesystem reads/writes.
+
+### Studio CSV import
+
+`POST /v1/admin/import/csv` accepts multipart form data with exactly one CSV file plus a reviewed LHR schema JSON field. It requires an `admin` credential.
+
+The upload path is deliberately disk-first:
+
+1. the multipart file is consumed in chunks and written to `<catalog>/temp/studio-uploads/`;
+2. bytes are counted against `max_import_bytes` while streaming;
+3. the uploaded schema is parsed and validated as `LHR-SCHEMA/1`;
+4. the temporary file is passed to the existing two-pass `import_csv` engine;
+5. dictionary construction, exact-index construction, verification, sealing, and atomic publication follow the same rules as a CLI CSV import;
+6. the temporary upload is removed after the build completes.
+
+Studio uses a bounded browser-side sample only for preview and schema inference. The full CSV is not accumulated in browser state. Large imports that exceed the HTTP convenience limit should continue to use the local CLI rather than raising the network limit indiscriminately.
 
 ## Query protocol
 
@@ -102,7 +119,7 @@ Supported exact predicates:
 - set membership (`in`);
 - inclusive numeric range (`range`) on signed/unsigned columns.
 
-Pure equality queries retain the optimized LHR exact-index path. Set/range queries use a deterministic exact fallback over the versioned logical view until dedicated exact accelerators are defined for them.
+Pure equality queries retain the optimized LHR exact-index path. Narrow bounded integer ranges may reuse the exact singleton backbone when the bounded decomposition route is applicable; wider/open-ended/mixed set/range shapes retain the deterministic versioned fallback until additional exact accelerators are justified.
 
 Pagination is based on stable logical row IDs (`after_row_id`), not physical row offsets. Compaction therefore does not invalidate the logical cursor ordering.
 
@@ -110,7 +127,8 @@ Pagination is based on stable logical row IDs (`after_row_id`), not physical row
 
 The service enforces independent ceilings for:
 
-- request body size;
+- ordinary JSON/request body size;
+- Studio CSV import bytes;
 - concurrent requests;
 - requests per API key per minute;
 - query return limit;
@@ -153,7 +171,7 @@ Persistent per-query telemetry is separate from process counters. It records que
 
 The database is generation-based. Readers pin a generation with a snapshot lease; publication of a new generation does not change an in-flight reader's view. Lease-aware vacuum will not remove a generation still held by an active reader.
 
-Writers still obey the catalog's single-writer publication lock. Expensive mutations, compaction, recovery, and index administration run outside the async HTTP executor on blocking worker threads.
+Writers still obey the catalog's single-writer publication lock. Expensive imports, mutations, compaction, recovery, and index administration run outside the async HTTP executor on blocking worker threads after any network upload has been streamed to disk.
 
 ## Graceful shutdown
 
