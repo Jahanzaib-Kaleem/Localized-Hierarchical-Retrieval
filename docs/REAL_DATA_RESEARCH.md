@@ -175,3 +175,37 @@ Two broad directions exist:
 The second direction is more consistent with LHR's storage objective because it keeps the dominant local row reference compact while allowing total dataset size to exceed the local address space. It also matches the existing principle that physical organization is an optimization below stable logical row IDs.
 
 **Decision:** do not silently widen LHR/1 posting formats. Treat >4.29B-row support as a separate sharded-addressing / future-format research problem. Any design must preserve stable logical IDs, exact cross-shard query composition, bounded query RAM and current compact posting economics. A format-incompatible solution must follow the explicit LHR format-versioning policy.
+
+## 12. Range Hypothesis B0 — bounded equality decomposition with zero new storage
+
+Before designing a new on-disk range representation, inspect whether the exact singleton backbone already contains enough information to accelerate the real narrow-range failure.
+
+A tempting shortcut is to treat dictionary token IDs as ordered numeric values. That is incorrect: dictionaries are sorted lexicographically by canonical string bytes. For example, numeric strings such as `100`, `11`, and `2` do not receive tokens in numeric order. A correct range route cannot infer numeric adjacency from token adjacency.
+
+Hypothesis B0 therefore avoids dictionary-order assumptions entirely. For a request containing exactly one bounded signed/unsigned range:
+
+1. canonicalize and parse the numeric lower/upper bounds;
+2. only consider ranges spanning at most 256 integer values;
+3. require an exact singleton index for the range column in the base and every delta layer;
+4. expand the numeric interval into its exact integer values;
+5. run each value through the existing exact equality path;
+6. retain only one head row from each equality stream;
+7. merge those streams by stable logical row ID with a min-heap;
+8. preserve total exact hit count by summing each disjoint equality stream's hit count once;
+9. keep wider, open-ended, mixed-predicate, or unindexed ranges on the existing exact scan fallback.
+
+The 256-value cap is deliberately conservative. It bounds hierarchy lookups and heap state while covering the real Shopify failure `10000..10100`, which spans 101 integer values. This is an experiment, not a claim that 256 is the final threshold.
+
+Expected properties:
+
+- zero new index bytes and zero format change;
+- RAM bounded approximately by range width plus requested page, rather than dataset size;
+- exact cursor ordering inherited from the accepted equality seek path;
+- exact delta/tombstone semantics inherited from the versioned equality layer;
+- narrow ranges can avoid canonical row scans entirely when exact singletons exist;
+- latency may still be dominated by repeated equality lookups, especially with many delta visibility overrides;
+- broad ranges remain unresolved and require a different representation/algorithm if B0 is accepted only as a narrow-range specialization.
+
+Targeted tests on the research branch require a six-value range with 12 total matches to paginate exactly while `max_rows_examined=10` and report zero rows examined. A 401-value range is required to retain the scan fallback and trip the same resource cap, proving the experiment does not silently broaden its scope.
+
+**Status:** implementation pending repository CI and live Shopify rebenchmark. No latency improvement is claimed until the actual `estimated_monthly_visits 10000..10100` query is rerun on the 1 GB VPS with storage/RSS/fault/read measurements.
