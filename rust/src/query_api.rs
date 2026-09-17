@@ -198,25 +198,20 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
     let projection = projection(dataset.schema(), &request.select)?;
 
     if let Some(eq) = equality_predicates(&prepared, dataset.schema()) {
-        // Equality predicates retain the optimized exact-index route. Cursor pagination grows the
-        // returned prefix geometrically rather than forcing a canonical scan.
-        let after = request.after_row_id;
-        let mut fetch = request.limit.max(64);
-        let result = loop {
-            enforce_deadline(deadline)?;
-            let result = dataset.query_values(&eq, if request.select.is_empty() { None } else { Some(&request.select) }, fetch)?;
-            let enough = result.rows.iter().filter(|row| after.map_or(true, |cursor| row.row_id > cursor)).take(request.limit).count() >= request.limit;
-            let exhausted = result.returned < fetch || result.returned as u64 >= result.hits;
-            if enough || exhausted || after.is_none() { break result; }
-            fetch = fetch.saturating_mul(2).max(fetch + 1);
-        };
+        // Equality predicates retain the optimized exact-index route. The stable logical-row cursor
+        // is translated to a lower bound inside each layer instead of replaying a growing prefix.
+        enforce_deadline(deadline)?;
+        let result = dataset.query_values_after(
+            &eq,
+            if request.select.is_empty() { None } else { Some(&request.select) },
+            request.after_row_id,
+            request.limit,
+        )?;
         if request.max_rows_examined.is_some_and(|max| result.rows_checked > max) {
             return Err(io::Error::new(io::ErrorKind::OutOfMemory, "query row-examination limit exceeded"));
         }
         enforce_deadline(deadline)?;
         let mut rows: Vec<_> = result.rows.into_iter()
-            .filter(|row| after.map_or(true, |cursor| row.row_id > cursor))
-            .take(request.limit)
             .map(|row| QueryApiRow { row_id: row.row_id, values: row.values })
             .collect();
         let next_cursor = (rows.len() == request.limit).then(|| rows.last().unwrap().row_id);

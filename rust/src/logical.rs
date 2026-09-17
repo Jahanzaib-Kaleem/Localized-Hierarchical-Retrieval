@@ -206,6 +206,23 @@ impl LogicalDataset {
         }
     }
 
+    fn first_physical_after(&self, after_row_id: Option<u64>) -> u64 {
+        let Some(cursor) = after_row_id else {
+            return 0;
+        };
+        let mut lo = 0u64;
+        let mut hi = self.rows;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.row_ids.logical(mid) {
+                Some(row_id) if row_id <= cursor => lo = mid + 1,
+                Some(_) => hi = mid,
+                None => hi = mid,
+            }
+        }
+        lo
+    }
+
     pub fn explain_values(&self, predicates: &[LogicalPredicate]) -> io::Result<LogicalExplain> {
         let encoded = self.encoded_predicates(predicates)?;
         Ok(match encoded {
@@ -228,6 +245,16 @@ impl LogicalDataset {
         select: Option<&[String]>,
         limit: usize,
     ) -> io::Result<LogicalQueryResult> {
+        self.query_values_after(predicates, select, None, limit)
+    }
+
+    pub fn query_values_after(
+        &self,
+        predicates: &[LogicalPredicate],
+        select: Option<&[String]>,
+        after_row_id: Option<u64>,
+        limit: usize,
+    ) -> io::Result<LogicalQueryResult> {
         let projection = self.projection(select)?;
         let Some(encoded) = self.encoded_predicates(predicates)? else {
             return Ok(LogicalQueryResult {
@@ -239,7 +266,9 @@ impl LogicalDataset {
                 rows: Vec::new(),
             });
         };
-        let (physical_ids, stats) = self.engine.query_row_ids(&encoded, limit);
+        let first_physical = self.first_physical_after(after_row_id);
+        let (physical_ids, stats) =
+            self.engine.query_row_ids_from(&encoded, limit, first_physical);
         let mut rows = Vec::with_capacity(physical_ids.len());
         for physical in physical_ids {
             let decoded = self.decode_physical_values(physical)?;
