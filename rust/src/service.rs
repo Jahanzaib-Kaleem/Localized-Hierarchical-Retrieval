@@ -181,6 +181,10 @@ impl IntoResponse for ApiError {
 struct RequestGuard { request_id: u64, actor: String, metrics: Arc<RuntimeMetrics>, _permit: OwnedSemaphorePermit }
 impl Drop for RequestGuard { fn drop(&mut self) { self.metrics.active.fetch_sub(1, Ordering::Relaxed); } }
 
+struct TempFileGuard { path: PathBuf }
+impl TempFileGuard { fn new(path: PathBuf) -> Self { Self { path } } }
+impl Drop for TempFileGuard { fn drop(&mut self) { let _ = fs::remove_file(&self.path); } }
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
 }
@@ -307,6 +311,7 @@ async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap
     let upload_dir = state.root.join("temp").join("studio-uploads");
     tokio_fs::create_dir_all(&upload_dir).await.map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))?;
     let upload_path = upload_dir.join(format!("upload-{}.csv", guard.request_id));
+    let _upload_cleanup = TempFileGuard::new(upload_path.clone());
     let mut schema: Option<DatasetSchema> = None;
     let mut uploaded = false;
     let mut uploaded_bytes = 0usize;
@@ -322,15 +327,12 @@ async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap
             }
             "file" => {
                 if uploaded {
-                    let _ = tokio_fs::remove_file(&upload_path).await;
                     return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "upload contains more than one file"));
                 }
                 let mut output = tokio_fs::File::create(&upload_path).await.map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))?;
                 while let Some(chunk) = field.chunk().await.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("failed reading upload: {e}")))? {
                     uploaded_bytes = uploaded_bytes.checked_add(chunk.len()).ok_or_else(|| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, guard.request_id, "upload size overflow"))?;
                     if uploaded_bytes > state.config.max_import_bytes {
-                        drop(output);
-                        let _ = tokio_fs::remove_file(&upload_path).await;
                         return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, guard.request_id, format!("CSV exceeds the {} byte Studio import limit", state.config.max_import_bytes)));
                     }
                     output.write_all(&chunk).await.map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))?;
@@ -343,11 +345,9 @@ async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap
     }
 
     let Some(schema) = schema else {
-        let _ = tokio_fs::remove_file(&upload_path).await;
         return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "missing schema field"));
     };
     if !uploaded || uploaded_bytes == 0 {
-        let _ = tokio_fs::remove_file(&upload_path).await;
         return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "missing or empty CSV file"));
     }
 
@@ -356,7 +356,6 @@ async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap
     let config = csv_import_config(&state.config);
     let result = tokio::task::spawn_blocking(move || import_csv(root, import_path, &schema, &config))
         .await.map_err(|e| join_error(guard.request_id, e))?;
-    let _ = tokio_fs::remove_file(&upload_path).await;
 
     match result {
         Ok(report) => {
@@ -672,6 +671,16 @@ mod tests {
         let mut config = ServiceConfig::default();
         config.max_import_bytes = 0;
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn temp_file_guard_removes_file_on_drop() {
+        let path = env::temp_dir().join(format!("lhr-service-upload-{}-{}.csv", std::process::id(), now_ms()));
+        fs::write(&path, b"test").unwrap();
+        {
+            let _guard = TempFileGuard::new(path.clone());
+            assert!(path.is_file());
+        }
+        assert!(!path.exists());
     }
     #[test]
     fn studio_mime_types_are_stable() {
