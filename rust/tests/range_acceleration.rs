@@ -1,8 +1,9 @@
 use lhr::{
-    execute_query, import_csv, ColumnSchema, CsvImportConfig, DatasetSchema, LogicalType,
-    Normalization, QueryFilter, QueryRequest, VersionedDataset,
+    apply_mutations_delta, execute_query, import_csv, ColumnSchema, CsvImportConfig, DatasetSchema,
+    LogicalType, Mutation, MutationConfig, Normalization, QueryFilter, QueryRequest,
+    VersionedDataset,
 };
-use std::{fs, io};
+use std::{collections::BTreeMap, fs, io};
 
 fn schema() -> DatasetSchema {
     DatasetSchema::new(vec![
@@ -31,6 +32,14 @@ fn import_config() -> CsvImportConfig {
         max_sort_records: 4_096,
         dictionary_run_bytes: 16 * 1024,
         accelerators: vec![],
+    }
+}
+
+fn mutation_config() -> MutationConfig {
+    MutationConfig {
+        batch_rows: 64,
+        max_sort_records: 1_024,
+        dictionary_run_bytes: 8 * 1024,
     }
 }
 
@@ -94,6 +103,47 @@ fn bounded_integer_range_reuses_exact_singletons_without_scanning_rows() {
     assert_eq!(
         third.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(),
         vec![1104, 1105]
+    );
+}
+
+#[test]
+fn bounded_integer_range_preserves_delta_updates_deletes_and_inserts() {
+    let catalog = build_dataset();
+    apply_mutations_delta(
+        catalog.path(),
+        &[
+            Mutation::Update {
+                row_id: 100,
+                values: BTreeMap::from([("visits".into(), Some("900".into()))]),
+            },
+            Mutation::Delete { row_id: 101 },
+            Mutation::Update {
+                row_id: 106,
+                values: BTreeMap::from([("visits".into(), Some("102".into()))]),
+            },
+            Mutation::Insert {
+                values: BTreeMap::from([
+                    ("id".into(), Some("2000".into())),
+                    ("visits".into(), Some("103".into())),
+                ]),
+            },
+        ],
+        &mutation_config(),
+    )
+    .unwrap();
+
+    let dataset = VersionedDataset::open(catalog.path()).unwrap();
+    let mut request = bounded_request(None);
+    request.limit = 20;
+    let response = execute_query(&dataset, &request).unwrap();
+
+    assert_eq!(response.stats.hits, 12);
+    assert_eq!(response.stats.rows_examined, 0);
+    assert_eq!(response.returned, 12);
+    assert_eq!(response.next_cursor, None);
+    assert_eq!(
+        response.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+        vec![102, 103, 104, 105, 106, 1100, 1101, 1102, 1103, 1104, 1105, 2000]
     );
 }
 
