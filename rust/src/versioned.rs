@@ -96,6 +96,14 @@ impl VersionedDataset {
                 .any(|x| x.dataset.contains_canonical_value(column, value))
     }
 
+    pub fn has_exact_singleton(&self, column: usize) -> bool {
+        self.base.has_exact_singleton(column)
+            && self
+                .deltas
+                .iter()
+                .all(|layer| layer.dataset.has_exact_singleton(column))
+    }
+
     fn layer(&self, id: u32) -> Option<&LogicalDataset> {
         if id == 0 {
             return Some(&self.base);
