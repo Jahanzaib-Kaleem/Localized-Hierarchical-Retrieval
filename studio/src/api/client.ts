@@ -1,6 +1,7 @@
 import type {
-  ApiEnvelope, ApiFailure, DatasetStats, GenerationInfo, HealthResponse, IndexChangeReport,
-  MutationOperation, MutationReport, QueryRequest, QueryResponse, ReadyResponse, VacuumReport, WorkloadReport,
+  ApiEnvelope, ApiFailure, CsvImportReport, DatasetStats, GenerationInfo, HealthResponse, ImportDatasetSchema,
+  IndexChangeReport, MutationOperation, MutationReport, QueryRequest, QueryResponse, ReadyResponse, VacuumReport,
+  WorkloadReport,
 } from './types'
 
 const TOKEN_KEY = 'lhr.studio.api-token'
@@ -27,7 +28,7 @@ export function setApiToken(token: string): void {
 async function request<T>(path: string, init: RequestInit = {}, authenticated = true): Promise<T> {
   const headers = new Headers(init.headers)
   const token = getApiToken()
-  if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json')
+  if (init.body && !(init.body instanceof FormData) && !headers.has('content-type')) headers.set('content-type', 'application/json')
   if (authenticated && token) headers.set('authorization', `Bearer ${token}`)
   const response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
   const contentType = response.headers.get('content-type') ?? ''
@@ -49,6 +50,12 @@ export const api = {
   generations: async (signal?: AbortSignal) => (await request<ApiEnvelope<GenerationInfo[]>>('/v1/generations', { signal })).result,
   metrics: (signal?: AbortSignal) => request<string>('/metrics', { signal }),
   query: async (body: QueryRequest, signal?: AbortSignal) => (await request<ApiEnvelope<QueryResponse>>('/v1/query', { method: 'POST', body: json(body), signal })).result,
+  importCsv: async (file: File, schema: ImportDatasetSchema) => {
+    const form = new FormData()
+    form.append('schema', JSON.stringify(schema))
+    form.append('file', file, file.name)
+    return (await request<ApiEnvelope<CsvImportReport>>('/v1/admin/import/csv', { method: 'POST', body: form })).result
+  },
   mutate: async (mutations: MutationOperation[]) => (await request<ApiEnvelope<MutationReport>>('/v1/mutate', { method: 'POST', body: json({ mutations }) })).result,
   indexChange: async (action: 'add' | 'drop' | 'rebuild', columns: string[]) => (await request<ApiEnvelope<IndexChangeReport>>(`/v1/admin/index/${action}`, { method: 'POST', body: json({ columns }) })).result,
   compact: async () => (await request<ApiEnvelope<unknown>>('/v1/admin/compact', { method: 'POST', body: json({}) })).result,
