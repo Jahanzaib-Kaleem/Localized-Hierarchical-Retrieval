@@ -100,6 +100,13 @@ impl RowHierarchyData {
             Self::BitSlice(x) => x.rows(key),
         }
     }
+    fn bounded_rows_from(&self, key: u64, first_row: u32, limit: usize) -> Option<Vec<u32>> {
+        match self {
+            Self::Dense(x) => Some(x.rows_from(key, first_row, limit)),
+            Self::BitSlice(x) => Some(x.rows_from(key, first_row, limit)),
+            _ => None,
+        }
+    }
     fn intersect_rows(&self, key: u64, seed: &[u32]) -> Vec<u32> {
         match self {
             Self::Sparse(x) => x.intersect_rows(key, seed),
@@ -284,6 +291,30 @@ impl Engine {
             values.push((column, *query.get(&column)?));
         }
         mixed_radix_key(&values, &self.card)
+    }
+
+    fn bounded_single_selection(&self, predicates: &[Predicate]) -> Option<RowPlanSelection> {
+        if predicates.len() != 1 {
+            return None;
+        }
+        let query = self.query_map(predicates)?;
+        let column = predicates[0].column;
+        for (index, hierarchy) in self.row_hier.iter().enumerate() {
+            if hierarchy.columns.len() != 1 || hierarchy.columns[0] != column {
+                continue;
+            }
+            if !matches!(hierarchy.data, RowHierarchyData::Dense(_) | RowHierarchyData::BitSlice(_)) {
+                continue;
+            }
+            let key = self.hierarchy_key(&hierarchy.columns, &query)?;
+            return Some(RowPlanSelection {
+                count: hierarchy.data.row_count(key),
+                index,
+                key,
+                columns: hierarchy.columns.clone(),
+            });
+        }
+        None
     }
 
     fn candidate_rows_with_lookups(&self, predicates: &[Predicate]) -> Option<RowPlan> {
@@ -644,6 +675,29 @@ impl Engine {
         let first_row = first_row.min(self.rows);
         let pred: Vec<_> = predicates.iter().map(|x| (x.column, x.value)).collect();
         let mut out = Vec::with_capacity(limit.min(1024));
+
+        // A single exact predicate already has its total hit count in the singleton index. For
+        // directly seekable representations, take only the requested page instead of materializing
+        // the complete posting/mask result first. Other representations keep the established path.
+        if let Some(selection) = self.bounded_single_selection(predicates) {
+            let first_row_u32 = first_row as u32;
+            if let Some(rows) = self.row_hier[selection.index]
+                .data
+                .bounded_rows_from(selection.key, first_row_u32, limit)
+            {
+                out.extend(rows.into_iter().map(|row| row as u64));
+                return (
+                    out,
+                    QueryStats {
+                        hits: selection.count as u64,
+                        rows_checked: 0,
+                        pages_touched: 0,
+                        hierarchy_lookups: 1,
+                    },
+                );
+            }
+        }
+
         if let Some(plan) = self.candidate_rows_with_lookups(predicates) {
             if plan.fully_covered {
                 let start = plan.rows.partition_point(|&x| (x as u64) < first_row);
