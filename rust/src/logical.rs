@@ -55,6 +55,7 @@ pub struct LogicalDataset {
     engine: Engine,
     row_ids: RowIdMap,
     rows: u64,
+    exact_singletons: Vec<bool>,
 }
 
 impl LogicalDataset {
@@ -68,6 +69,20 @@ impl LogicalDataset {
                 io::ErrorKind::InvalidData,
                 "schema column count does not match manifest",
             ));
+        }
+        let mut exact_singletons = vec![false; manifest.columns];
+        for hierarchy in &manifest.hierarchies {
+            if hierarchy.columns.len() == 1
+                && matches!(
+                    hierarchy.kind.as_str(),
+                    "postings" | "densepost" | "deltapost" | "flatpost" | "bitslice"
+                )
+            {
+                let column = hierarchy.columns[0];
+                if column < exact_singletons.len() {
+                    exact_singletons[column] = true;
+                }
+            }
         }
         let mut dictionaries = Vec::with_capacity(schema.columns.len());
         for (index, column) in schema.columns.iter().enumerate() {
@@ -95,6 +110,7 @@ impl LogicalDataset {
             engine,
             row_ids,
             rows: manifest.rows,
+            exact_singletons,
         })
     }
 
@@ -108,6 +124,10 @@ impl LogicalDataset {
 
     pub fn physical_rows(&self) -> u64 {
         self.rows
+    }
+
+    pub fn has_exact_singleton(&self, column: usize) -> bool {
+        self.exact_singletons.get(column).copied().unwrap_or(false)
     }
 
     pub fn logical_row_id(&self, physical: u64) -> Option<u64> {
