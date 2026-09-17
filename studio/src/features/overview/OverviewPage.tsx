@@ -1,21 +1,54 @@
+import { Link } from '@tanstack/react-router'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { formatBytes, numberFormat } from '../../components/format'
-import { Metric, Panel, StatusMark } from '../../components/ui'
-import { RefreshIcon } from '../../components/icons'
+import { ApiIcon, ArrowIcon, DataIcon, QueryIcon, UploadIcon } from '../../components/icons'
+import { Metric, Notice, PageHeader, Panel } from '../../components/ui'
 
 export function OverviewPage() {
-  const health = useQuery({ queryKey: ['health'], queryFn: ({ signal }) => api.health(signal), staleTime: 10_000, refetchInterval: 30_000 })
   const ready = useQuery({ queryKey: ['ready'], queryFn: ({ signal }) => api.ready(signal), staleTime: 10_000, refetchInterval: 30_000 })
-  const stats = useQuery({ queryKey: ['stats'], queryFn: ({ signal }) => api.stats(signal), staleTime: 30_000 })
-  const isHealthy = health.data?.status === 'ok'
+  const stats = useQuery({ queryKey: ['stats'], queryFn: ({ signal }) => api.stats(signal), staleTime: 30_000, retry: false })
   const isReady = ready.data?.status === 'ready'
+
   return <div className="page stack stack--lg">
-    <header className="page-header"><div className="stack stack--xs"><span className="eyebrow">Database control plane</span><h1 className="page-title">Overview</h1><p className="page-description">A bounded view of the current LHR dataset, storage topology, and service state.</p></div><button className="button button--quiet" type="button" onClick={() => void Promise.all([health.refetch(), ready.refetch(), stats.refetch()])}><RefreshIcon className="button__icon" />Refresh</button></header>
-    <div className="status-strip" aria-label="Service state"><div className="status-strip__item"><StatusMark active={isHealthy} /><span>Process</span><strong>{health.isPending ? 'Checking' : isHealthy ? 'Healthy' : 'Unavailable'}</strong></div><div className="status-strip__item"><StatusMark active={isReady} /><span>Dataset</span><strong>{ready.isPending ? 'Checking' : isReady ? 'Ready' : 'Not ready'}</strong></div><div className="status-strip__item status-strip__item--end"><span>Transport</span><strong>Same origin</strong></div></div>
-    {stats.error ? <div className="notice"><strong>{isReady ? 'Statistics unavailable.' : 'No published dataset yet.'}</strong><span>{isReady ? stats.error.message : 'The control plane is running. Import an initial dataset locally, then refresh Studio.'}</span></div> : null}
-    <div className="metric-grid"><Metric label="Logical rows" value={stats.data ? numberFormat.format(stats.data.rows) : '—'} detail="stable row IDs" /><Metric label="Columns" value={stats.data ? numberFormat.format(stats.data.columns) : '—'} detail={stats.data ? `${stats.data.indexes.length} exact / routing indexes` : '—'} /><Metric label="Dataset bytes" value={stats.data ? formatBytes(stats.data.total_bytes) : '—'} detail="canonical + routing" /><Metric label="Pages" value={stats.data ? numberFormat.format(stats.data.pages) : '—'} detail="canonical page topology" /></div>
-    <div className="content-grid content-grid--3-2"><Panel title="Storage composition" eyebrow="Physical footprint"><div className="stack"><div className="storage-row"><span>Canonical</span><strong>{stats.data ? formatBytes(stats.data.canonical_bytes) : '—'}</strong></div><div className="storage-track"><span style={{ width: stats.data?.total_bytes ? `${Math.max(2, (stats.data.canonical_bytes / stats.data.total_bytes) * 100)}%` : '0%' }} /></div><div className="storage-row"><span>Routing + indexes</span><strong>{stats.data ? formatBytes(stats.data.routing_bytes) : '—'}</strong></div><div className="storage-track"><span style={{ width: stats.data?.total_bytes ? `${Math.max(2, (stats.data.routing_bytes / stats.data.total_bytes) * 100)}%` : '0%' }} /></div><div className="divider" /><div className="storage-row storage-row--total"><span>Total</span><strong>{stats.data ? formatBytes(stats.data.total_bytes) : '—'}</strong></div></div></Panel><Panel title="Service posture" eyebrow="Runtime contract"><dl className="definition-list"><div><dt>Process</dt><dd>{isHealthy ? 'responding' : 'unavailable'}</dd></div><div><dt>Dataset</dt><dd>{isReady ? 'queryable' : 'not initialized'}</dd></div><div><dt>Frontend</dt><dd>static client</dd></div><div><dt>API path</dt><dd>/v1</dd></div><div><dt>Studio policy</dt><dd>bounded requests</dd></div></dl></Panel></div>
-    <Panel title="Columns" eyebrow="Schema and dictionaries"><div className="table-wrap"><table className="data-table"><thead><tr><th>Column</th><th>Type</th><th>Cardinality</th><th>Dictionary</th><th>Nullable</th></tr></thead><tbody>{(stats.data?.column_stats ?? []).map((column) => <tr key={column.id}><td className="data-table__primary">{column.name}</td><td><span className="code-chip">{column.logical_type}</span></td><td className="mono">{numberFormat.format(column.cardinality)}</td><td className="mono">{formatBytes(column.dictionary_bytes)}</td><td>{column.nullable ? 'yes' : 'no'}</td></tr>)}{!stats.isPending && !stats.data?.column_stats.length ? <tr><td colSpan={5} className="data-table__empty">No columns reported.</td></tr> : null}</tbody></table></div></Panel>
+    <PageHeader eyebrow="Workspace" title="Your LHR database" description={isReady ? 'Import data, run exact queries, or connect your application.' : 'Get a dataset into LHR, then query it from Studio or your application.'} />
+
+    {!isReady ? <section className="onboarding-card">
+      <div className="onboarding-card__icon"><UploadIcon /></div>
+      <div className="onboarding-card__copy">
+        <span className="eyebrow">Start here</span>
+        <h2>Add your first dataset</h2>
+        <p>Bring in a CSV, review the detected columns, and create an exact indexed dataset.</p>
+      </div>
+      <Link className="button button--primary" to="/data">Import data <ArrowIcon className="button__icon" /></Link>
+    </section> : null}
+
+    {ready.error ? <Notice title="LHR is not responding">Check the service connection in Settings.</Notice> : null}
+
+    <div className="quick-action-grid">
+      <Link className="quick-action" to="/data"><div className="quick-action__icon"><DataIcon /></div><div><strong>Data</strong><span>Import CSVs and inspect your schema.</span></div><ArrowIcon /></Link>
+      <Link className="quick-action" to="/query"><div className="quick-action__icon"><QueryIcon /></div><div><strong>Query</strong><span>Build exact filters and inspect results.</span></div><ArrowIcon /></Link>
+      <Link className="quick-action" to="/api"><div className="quick-action__icon"><ApiIcon /></div><div><strong>API</strong><span>Copy a working request into your app.</span></div><ArrowIcon /></Link>
+    </div>
+
+    {stats.data ? <>
+      <div className="metric-grid metric-grid--home">
+        <Metric label="Rows" value={numberFormat.format(stats.data.rows)} />
+        <Metric label="Columns" value={numberFormat.format(stats.data.columns)} />
+        <Metric label="Storage" value={formatBytes(stats.data.total_bytes)} />
+        <Metric label="Indexes" value={numberFormat.format(stats.data.indexes.length)} />
+      </div>
+
+      <Panel title="Schema" eyebrow="Current dataset" action={<Link className="text-link" to="/data">Open data <ArrowIcon /></Link>}>
+        <div className="schema-list">
+          {stats.data.column_stats.slice(0, 8).map((column) => <div className="schema-row" key={column.id}>
+            <div><strong>{column.name}</strong><span>{column.nullable ? 'nullable' : 'required'}</span></div>
+            <span className="code-chip">{column.logical_type}</span>
+            <span className="schema-row__meta">{numberFormat.format(column.cardinality)} values</span>
+          </div>)}
+          {stats.data.column_stats.length > 8 ? <Link className="schema-more" to="/data">+ {stats.data.column_stats.length - 8} more columns</Link> : null}
+        </div>
+      </Panel>
+    </> : null}
   </div>
 }
