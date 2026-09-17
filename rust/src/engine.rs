@@ -303,7 +303,7 @@ impl Engine {
             if hierarchy.columns.len() != 1 || hierarchy.columns[0] != column {
                 continue;
             }
-            if !matches!(hierarchy.data, RowHierarchyData::Dense(_) | RowHierarchyData::BitSlice(_)) {
+            if !matches!(&hierarchy.data, RowHierarchyData::Dense(_) | RowHierarchyData::BitSlice(_)) {
                 continue;
             }
             let key = self.hierarchy_key(&hierarchy.columns, &query)?;
