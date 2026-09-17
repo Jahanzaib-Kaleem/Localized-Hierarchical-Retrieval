@@ -1,6 +1,7 @@
 services:
   lhr:
     image: ghcr.io/jahanzaib-kaleem/lhr:latest
+    pull_policy: always
     container_name: lhr
     restart: unless-stopped
     ports:
@@ -11,3 +12,4 @@ services:
 
 volumes:
   lhr-data:
+    name: ${LHR_DATA_VOLUME:-lhr-data}
