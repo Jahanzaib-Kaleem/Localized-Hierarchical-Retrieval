@@ -31,6 +31,7 @@ pub mod rowids;
 pub mod schema;
 pub mod segment;
 pub mod service;
+pub mod sharded;
 pub mod snapshot;
 pub mod telemetry;
 pub mod versioned;
@@ -86,6 +87,7 @@ pub use schema::{
 };
 pub use segment::Segment;
 pub use service::{serve, ServiceApiKey, ServiceConfig, ServiceRole};
+pub use sharded::{ShardSpec, ShardedDataset};
 pub use snapshot::{
     leased_generation_ids, vacuum_with_reader_leases, SafeVacuumReport, SnapshotLease,
 };
