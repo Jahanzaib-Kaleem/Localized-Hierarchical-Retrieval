@@ -46,7 +46,7 @@ POST /v1/admin/imports/{id}/complete
 GET  /v1/admin/imports/{id}
 ```
 
-The browser uploads sequential **4 MiB chunks**. Each HTTP request is therefore bounded independently of total CSV size. Upload state is persisted under:
+The browser uploads sequential **4 MiB chunks**. Each HTTP request is therefore bounded independently of total CSV size. Authenticated admin chunk requests do not consume the ordinary per-principal query/control-plane request-per-minute bucket; otherwise the chunk protocol itself would cap multi-GB throughput. Chunks remain protected by authentication, the global concurrency ceiling, sequential byte offsets, the fixed per-request chunk ceiling, disk preflight, and the aggregate import-size ceiling. Upload state is persisted under:
 
 ```text
 <service-root>/temp/import-jobs/

@@ -535,7 +535,12 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
 }
 
-async fn begin_request(state: &ServiceState, headers: &HeaderMap, required: ServiceRole) -> Result<RequestGuard, ApiError> {
+async fn begin_request_inner(
+    state: &ServiceState,
+    headers: &HeaderMap,
+    required: ServiceRole,
+    enforce_rate_limit: bool,
+) -> Result<RequestGuard, ApiError> {
     let request_id = state.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     state.metrics.requests.fetch_add(1, Ordering::Relaxed);
     let principal = if state.principals.is_empty() {
@@ -555,7 +560,7 @@ async fn begin_request(state: &ServiceState, headers: &HeaderMap, required: Serv
         state.metrics.auth_failures.fetch_add(1, Ordering::Relaxed); state.metrics.errors.fetch_add(1, Ordering::Relaxed);
         return Err(ApiError::new(StatusCode::FORBIDDEN, request_id, "insufficient API-key role"));
     }
-    if state.config.rate_limit_per_minute > 0 {
+    if enforce_rate_limit && state.config.rate_limit_per_minute > 0 {
         let mut rates = state.rates.lock().map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, request_id, "rate limiter lock poisoned"))?;
         let now = Instant::now();
         let window = rates.entry(principal.id.clone()).or_insert(RateWindow { started: now, count: 0 });
@@ -572,6 +577,25 @@ async fn begin_request(state: &ServiceState, headers: &HeaderMap, required: Serv
     })?;
     state.metrics.active.fetch_add(1, Ordering::Relaxed);
     Ok(RequestGuard { request_id, actor: principal.id, metrics: state.metrics.clone(), _permit: permit })
+}
+
+async fn begin_request(
+    state: &ServiceState,
+    headers: &HeaderMap,
+    required: ServiceRole,
+) -> Result<RequestGuard, ApiError> {
+    begin_request_inner(state, headers, required, true).await
+}
+
+async fn begin_upload_chunk_request(
+    state: &ServiceState,
+    headers: &HeaderMap,
+) -> Result<RequestGuard, ApiError> {
+    // Upload chunks are admin-only, fixed-size, sequential-offset constrained, aggregate-size
+    // capped, disk-preflighted, and still subject to the global concurrency ceiling. Counting each
+    // 4 MiB chunk against the ordinary request-per-minute bucket would make multi-GB ingestion
+    // fail merely because the transport is intentionally chunked.
+    begin_request_inner(state, headers, ServiceRole::Admin, false).await
 }
 
 #[derive(Debug, Serialize)]
@@ -792,7 +816,7 @@ async fn import_job_chunk(
     AxumQuery(query): AxumQuery<ImportChunkQuery>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
+    let guard = begin_upload_chunk_request(&state, &headers).await?;
     let job_semaphore = import_job_semaphore(&state, &id)
         .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
     let _job_permit = job_semaphore
