@@ -346,12 +346,16 @@ async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap
     let upload_path = upload_dir.join(format!("upload-{}.csv", guard.request_id));
     let _upload_cleanup = TempFileGuard::new(upload_path.clone());
     let mut schema: Option<DatasetSchema> = None;
+    let mut bucket = default_bucket();
     let mut uploaded = false;
     let mut uploaded_bytes = 0usize;
 
     while let Some(mut field) = multipart.next_field().await.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("invalid multipart upload: {e}")))? {
         let name = field.name().unwrap_or_default().to_owned();
         match name.as_str() {
+            "bucket" => {
+                bucket = field.text().await.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("invalid bucket field: {e}")))?;
+            }
             "schema" => {
                 let text = field.text().await.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("invalid schema field: {e}")))?;
                 let parsed: DatasetSchema = serde_json::from_str(&text).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("invalid schema JSON: {e}")))?;
@@ -384,7 +388,7 @@ async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap
         return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "missing or empty CSV file"));
     }
 
-    let root = state.root.clone();
+    let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
     let import_path = upload_path.clone();
     let config = csv_import_config(&state.config);
     let result = tokio::task::spawn_blocking(move || import_csv(root, import_path, &schema, &config))
@@ -393,12 +397,12 @@ async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap
     match result {
         Ok(report) => {
             state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"import_csv", success:true, detail:json!({"bytes":uploaded_bytes,"report":report}) });
-            Ok(Json(json!({"request_id":guard.request_id,"result":report})))
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"import_csv", success:true, detail:json!({"bucket":bucket,"bytes":uploaded_bytes,"report":report}) });
+            Ok(Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":report})))
         }
         Err(error) => {
             state.metrics.errors.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"import_csv", success:false, detail:json!({"bytes":uploaded_bytes,"error":error.to_string()}) });
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"import_csv", success:false, detail:json!({"bucket":bucket,"bytes":uploaded_bytes,"error":error.to_string()}) });
             Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()))
         }
     }
