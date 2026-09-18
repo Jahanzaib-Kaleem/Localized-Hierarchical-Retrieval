@@ -287,22 +287,26 @@ fn selected_bucket_root(state: &ServiceState, bucket: &str, request_id: u64) -> 
 async fn healthz() -> impl IntoResponse { Json(json!({"status":"ok"})) }
 async fn readyz(State(state): State<ServiceState>) -> Response {
     let root = state.root.clone();
-    match tokio::task::spawn_blocking(move || VersionedDataset::open(root).map(|_| ())).await {
-        Ok(Ok(())) => (StatusCode::OK, Json(json!({"status":"ready"}))).into_response(),
+    match tokio::task::spawn_blocking(move || list_buckets(root)).await {
+        Ok(Ok(buckets)) if buckets.iter().any(|bucket| bucket.ready) => {
+            (StatusCode::OK, Json(json!({"status":"ready"}))).into_response()
+        }
         _ => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"status":"not_ready"}))).into_response(),
     }
 }
 
-async fn query(State(state): State<ServiceState>, headers: HeaderMap, Json(mut request): Json<QueryRequest>) -> Result<Json<Value>, ApiError> {
+async fn query(State(state): State<ServiceState>, headers: HeaderMap, Json(payload): Json<ServiceQueryRequest>) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Read).await?;
+    let bucket = payload.bucket;
+    let mut request = payload.query;
     if request.limit > state.config.max_query_limit {
         state.metrics.errors.fetch_add(1, Ordering::Relaxed);
         return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "query limit exceeds server maximum"));
     }
     request.max_rows_examined = Some(request.max_rows_examined.unwrap_or(state.config.max_rows_examined).min(state.config.max_rows_examined));
     request.timeout_ms = Some(request.timeout_ms.unwrap_or(state.config.max_query_timeout_ms).min(state.config.max_query_timeout_ms));
-    let root = state.root.clone();
-    let telemetry_root = state.root.clone();
+    let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
+    let telemetry_root = root.clone();
     let request_copy = request.clone();
     state.metrics.queries.fetch_add(1, Ordering::Relaxed);
     let result = tokio::task::spawn_blocking(move || -> io::Result<_> {
@@ -315,7 +319,7 @@ async fn query(State(state): State<ServiceState>, headers: HeaderMap, Json(mut r
     match result {
         Ok(response) => {
             state.metrics.query_micros.fetch_add(response.stats.elapsed_micros.min(u64::MAX as u128) as u64, Ordering::Relaxed);
-            Ok(Json(json!({"request_id":guard.request_id,"result":response})))
+            Ok(Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":response})))
         }
         Err(error) => {
             state.metrics.query_failures.fetch_add(1, Ordering::Relaxed); state.metrics.errors.fetch_add(1, Ordering::Relaxed);
