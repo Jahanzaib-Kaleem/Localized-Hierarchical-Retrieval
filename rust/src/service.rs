@@ -1,5 +1,5 @@
 use crate::{
-    add_index, apply_mutations_delta, bucket_root, combine_buckets, compact_dataset, create_bucket,
+    add_index, apply_mutations_delta, combine_buckets, compact_dataset, create_bucket,
     dataset_stats, dataset_status, delete_bucket, drop_index, execute_query, import_csv,
     leased_generation_ids, list_buckets, list_generations, planner_indexes_for_request,
     rebuild_index, record_query, recover_catalog, rename_bucket, require_bucket_root,
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     net::SocketAddr,
     path::{Component, Path, PathBuf},
