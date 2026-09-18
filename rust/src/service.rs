@@ -1,13 +1,15 @@
 use crate::{
-    add_index, apply_mutations_delta, compact_dataset, dataset_stats, dataset_status, drop_index,
-    execute_query, import_csv, leased_generation_ids, list_generations, planner_indexes_for_request,
-    rebuild_index, record_query, recover_catalog, resolve_dataset_root, vacuum_with_reader_leases,
-    workload_report, CompactionConfig, CsvImportConfig, DatasetSchema, Mutation, MutationConfig,
-    QueryRequest, VersionedDataset,
+    add_index, apply_mutations_delta, bucket_root, combine_buckets, compact_dataset, create_bucket,
+    dataset_stats, dataset_status, delete_bucket, drop_index, execute_query, import_csv,
+    leased_generation_ids, list_buckets, list_generations, planner_indexes_for_request,
+    rebuild_index, record_query, recover_catalog, rename_bucket, require_bucket_root,
+    resolve_dataset_root, transfer_rows, vacuum_with_reader_leases, workload_report,
+    CompactionConfig, CsvImportConfig, DatasetSchema, Mutation, MutationConfig, QueryRequest,
+    VersionedDataset, DEFAULT_BUCKET,
 };
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, OriginalUri, State},
+    extract::{DefaultBodyLimit, Multipart, OriginalUri, Query as AxumQuery, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -167,6 +169,27 @@ struct ServiceState {
 fn hash_token(token: &str) -> [u8; 32] { Sha256::digest(token.as_bytes()).into() }
 fn now_ms() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() }
 
+fn default_bucket() -> String { DEFAULT_BUCKET.into() }
+
+#[derive(Debug, Clone, Deserialize)]
+struct BucketSelector {
+    #[serde(default = "default_bucket")]
+    bucket: String,
+}
+
+impl Default for BucketSelector {
+    fn default() -> Self { Self { bucket: default_bucket() } }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ServiceQueryRequest {
+    #[serde(default = "default_bucket")]
+    bucket: String,
+    #[serde(flatten)]
+    query: QueryRequest,
+}
+
+
 #[derive(Debug)]
 struct ApiError { status: StatusCode, message: String, request_id: u64 }
 impl ApiError {
@@ -254,6 +277,12 @@ fn io_status(error: &io::Error) -> StatusCode {
 fn join_error(request_id: u64, error: tokio::task::JoinError) -> ApiError {
     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, request_id, format!("blocking task failed: {error}"))
 }
+
+fn selected_bucket_root(state: &ServiceState, bucket: &str, request_id: u64) -> Result<PathBuf, ApiError> {
+    require_bucket_root(&state.root, bucket)
+        .map_err(|error| ApiError::new(io_status(&error), request_id, error.to_string()))
+}
+
 
 async fn healthz() -> impl IntoResponse { Json(json!({"status":"ok"})) }
 async fn readyz(State(state): State<ServiceState>) -> Response {
