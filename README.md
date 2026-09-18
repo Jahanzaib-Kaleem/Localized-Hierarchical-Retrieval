@@ -1,10 +1,12 @@
 # Localized Hierarchical Retrieval (LHR)
 
-LHR is a deterministic exact database/retrieval system for very large structured datasets, designed around low query-time RAM, low data touched, and expensive-but-bounded preprocessing.
+LHR is a deterministic exact structured database and retrieval system for very large datasets, designed around low query-time RAM, low data touched, and expensive-but-bounded preprocessing.
 
 The project began from a practical question: can a 50M-100M+ row lead dataset remain fast and exact on unusually constrained hardware without depending on embeddings, semantic retrieval, or a large analytical database stack?
 
-The answer evolved into a Rust storage engine plus a full operational database layer built around immutable generations, exact adaptive indexes, delta mutations, compaction, typed queries, recovery, observability, an industrial browser Studio, an authenticated HTTP service, and a first-class MCP operator control plane.
+The current retrieval core is best described as an **adaptive exact inverted-index engine**: external values are tokenized deterministically, compound predicates use mixed-radix keys, the builder chooses among several exact row-index representations, and the planner greedily composes overlapping indexes before falling back to conservative page routing and canonical verification when necessary.
+
+Around that engine, LHR now provides a full operational database layer built around immutable generations, stable logical row IDs, delta mutations, compaction, typed queries, integrity/recovery, bucket workspaces, observability, a browser Studio, an authenticated HTTP service, and a first-class MCP operator control plane.
 
 No LLM, embeddings, semantic similarity, or probabilistic retrieval is required. Values and columns have no inherent meaning to the engine.
 
@@ -84,6 +86,8 @@ The production-oriented implementation lives under `rust/`. It now includes:
 - SHA-256 integrity seals, verified backup/restore, rollback, and recovery;
 - exact index administration, statistics, and EXPLAIN;
 - typed equality / set / numeric-range queries with stable cursor pagination and resource limits;
+- exact decomposition of a single bounded signed/unsigned integer range spanning at most 256 values when exact singleton coverage is available;
+- cursor lower-bound seeking for equality queries, including bounded result production for broad single-predicate `bitslice` and `densepost` paths;
 - CSV, JSONL, and streaming JSON-array ingestion with rejects, progress, disk preflight, and resumable preparation;
 - persistent workload telemetry with P50/P95/P99 and workload-based accelerator recommendations;
 - an authenticated role-based HTTP service with rate/concurrency/body/resource limits, audit logging, health/readiness, and Prometheus-style metrics;
@@ -116,7 +120,7 @@ These are CI architecture-validation results, not universal production guarantee
 
 A difficult mixed-cardinality query returning roughly **2.5 million rows** fell from about **7.25 ms** to **2.22 ms** after the measured storage/speed tradeoff justified bit-slicing the cardinality-64 field.
 
-The release suite is also exercised under a **1 GiB virtual-memory ceiling**, and the 10M stress jobs carry an explicit sub-1-GiB RSS gate. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for methodology, historical A/Bs, and caveats.
+The release suite is also exercised under a **1 GiB virtual-memory ceiling**, and the 10M stress jobs carry an explicit sub-1-GiB RSS gate. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for methodology, historical A/Bs, and caveats. The first non-synthetic record is preserved separately in [`benchmarks/REAL_DATA_SHOPIFY_1_9M_BASELINE.md`](benchmarks/REAL_DATA_SHOPIFY_1_9M_BASELINE.md): a 1,902,012-row Shopify generation on the ~1 GiB VPS. That baseline intentionally predates the accepted cursor-seek, bounded integer-range, and bounded single-exact pagination changes, so it is not rewritten with post-fix claims.
 
 ## Why the architecture changed over time
 
@@ -136,11 +140,13 @@ The current design comes from measured failures rather than a one-shot design:
 - once those semantics were proven, mutations moved to immutable delta layers + visibility maps to remove routine full-rebuild write amplification;
 - compaction then became a separate streaming maintenance operation;
 - set/range predicates were added through deterministic exact fallback first rather than inventing an unsafe accelerator;
+- real-data testing then justified a zero-storage specialization for one narrow bounded integer range: up to 256 exact integer values can be decomposed into singleton equality streams and merged by stable logical row ID;
+- real-data deep-pagination testing also replaced geometric prefix replay with logical-row cursor seeking, then added bounded page production for broad single-predicate `bitslice` and `densepost` results;
 - workload telemetry/recommendations were added only as optimization inputs, never correctness dependencies;
 - the network service deliberately keeps arbitrary filesystem backup/restore paths local to reduce remote administrative capability;
 - the MCP control plane follows the same rule: AI clients can operate/query the database, but bulk filesystem import and path-based backup/restore remain local operator actions.
 
-The full retrieval research history is in [`docs/RESEARCH.md`](docs/RESEARCH.md). The operational/product decisions are documented in [`docs/OPERATIONS_RESEARCH.md`](docs/OPERATIONS_RESEARCH.md).
+The original retrieval/index research history is in [`docs/RESEARCH.md`](docs/RESEARCH.md). The operational/product decisions are documented in [`docs/OPERATIONS_RESEARCH.md`](docs/OPERATIONS_RESEARCH.md), and the first real-data investigation plus the accepted cursor/range/materialization experiments are recorded separately in [`docs/REAL_DATA_RESEARCH.md`](docs/REAL_DATA_RESEARCH.md).
 
 ## Operational model
 
@@ -163,7 +169,11 @@ The low-level engine accepts encoded equality predicates. The typed API adds:
 - query timeouts;
 - row-examination ceilings.
 
-Equality queries retain the optimized exact-index path. Predicate families without a dedicated exact accelerator use a deterministic versioned-row fallback.
+Pure equality queries retain the optimized exact-index path. Equality pagination seeks from the stable logical-row cursor rather than replaying an ever-growing prefix; for a broad single exact predicate backed by `bitslice` or `densepost`, the engine can produce only the requested page while taking the total hit count directly from the index.
+
+A request containing exactly one bounded signed/unsigned integer range can also use the exact singleton backbone when the interval spans at most 256 integer values and every visible layer has singleton coverage. LHR expands the interval into disjoint equality streams and merges them in stable logical-row order. Wider, open-ended, mixed, set-membership, or otherwise unaccelerated shapes retain the deterministic versioned-row fallback under explicit row/time ceilings.
+
+An empty filter list is the exact table-browse path used by Studio/API clients: it advances directly by stable logical row ID and materializes only the requested page.
 
 ## HTTP service and Studio
 
@@ -203,9 +213,10 @@ See [`docs/FORMAT.md`](docs/FORMAT.md).
 
 ## Documentation
 
-- [`docs/RESEARCH.md`](docs/RESEARCH.md) — chronological retrieval research: experiments, failures, benchmark-driven decisions.
+- [`docs/RESEARCH.md`](docs/RESEARCH.md) — chronological retrieval/index research: experiments, failures, benchmark-driven decisions.
+- [`docs/REAL_DATA_RESEARCH.md`](docs/REAL_DATA_RESEARCH.md) — first real-data investigation, deep-pagination/range findings, the LHR/1 physical-row scale limit, and the still-unmerged shard research.
 - [`docs/OPERATIONS_RESEARCH.md`](docs/OPERATIONS_RESEARCH.md) — why the database/product layer evolved from full-generation transactions to deltas, compaction, telemetry, and service hardening.
-- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — benchmark ledger and historical comparisons.
+- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — synthetic benchmark ledger, historical A/B comparisons, and links to preserved real-data measurements.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — retrieval/build architecture.
 - [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — implemented database operations and invariants.
 - [`docs/SERVICE.md`](docs/SERVICE.md) — HTTP security, API, metrics, and deployment contract.
@@ -246,10 +257,12 @@ See [`docs/FORMAT.md`](docs/FORMAT.md).
 
 The database/product/control-plane surface is substantially implemented. Remaining work is primarily validation and optional expansion rather than a missing storage/transaction foundation:
 
-- 25M/50M/70M+ end-to-end scale runs;
-- long-running mixed read/write/compaction workloads;
-- real lead-data distributions;
+- 25M/50M/70M+ end-to-end scale runs and cold-cache/block-device characterization on the target low-RAM host;
+- repeat the post-PR #20/#21/#22 Shopify pagination/range measurements with peak/system-level memory and I/O counters;
+- long-running mixed read/write/compaction workloads and broader real lead-data distributions;
+- general bounded/streaming pagination for `deltapost`, `flatpost`, generic `postings`, and multi-index result plans where full final candidate materialization can still occur;
 - dedicated exact indexes for additional predicate families if workload measurements justify them;
+- a durable scale-out design beyond the current LHR/1 local `u32` physical-row addressing ceiling; the D0 multi-shard prototype remains research and is not merged architecture;
 - optional Parquet/pre-tokenized ingest;
 - incremental backup/retention policies;
 - optional systemd/native deployment conveniences beyond the Docker appliance;
