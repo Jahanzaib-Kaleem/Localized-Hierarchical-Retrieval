@@ -12,7 +12,27 @@ This file is the compact benchmark record. For the chronological reasoning behin
 
 CI timings are useful for relative comparisons but are not dedicated-hardware latency guarantees. Small run-to-run differences are expected.
 
-## Current merged benchmarks
+## Preserved real-data baseline
+
+The first non-synthetic benchmark is intentionally preserved separately rather than folded into synthetic CI tables:
+
+- [`../benchmarks/REAL_DATA_SHOPIFY_1_9M_BASELINE.md`](../benchmarks/REAL_DATA_SHOPIFY_1_9M_BASELINE.md)
+- 1,902,012 Shopify rows;
+- 16 columns;
+- ~375.6 MB total sealed generation;
+- production Docker/MCP instance on the ~1 GiB VPS.
+
+That run demonstrated microsecond-to-sub-millisecond warm exact equality paths for selective predicates and efficient mixed exact intersections, but it also exposed two important product-level failures: narrow numeric ranges fell back to a full visible-row scan, and deep equality pagination replayed/materialized too much earlier work.
+
+The baseline is a **before-state** and must not be rewritten after fixes. Subsequent merged work:
+
+- PR #20 replaced geometric equality-prefix replay with stable logical-row lower-bound seeking;
+- PR #21 added zero-new-storage exact decomposition for one bounded signed/unsigned integer range spanning at most 256 values;
+- PR #22 added bounded result production for one broad exact predicate when the singleton representation is `bitslice` or `densepost`.
+
+Post-change real-VPS latency/RSS/I/O measurements remain separate validation work. See [`REAL_DATA_RESEARCH.md`](REAL_DATA_RESEARCH.md) for the accepted hypotheses, caveats, and the still-unmerged shard research.
+
+## Current merged synthetic benchmarks
 
 ### Hybrid-7 synthetic
 
@@ -241,8 +261,11 @@ A performance result is not accepted unless correctness remains exact. Benchmark
 
 Before production claims, repeat the important suites on:
 
-1. the actual 1 GB Oracle VPS;
+1. the actual ~1 GiB target VPS and relevant block device;
 2. warm and cold filesystem cache;
 3. 25M / 50M / 70M+ rows;
 4. realistic dictionary/token distributions;
-5. repeated runs sufficient for stable p50/p95/p99 and page-fault/RSS measurements.
+5. repeated runs sufficient for stable p50/p95/p99 plus RSS/HWM, page-fault and process/whole-system I/O measurements;
+6. the preserved Shopify query matrix after the accepted PR #20/#21/#22 changes, without overwriting the original baseline.
+
+The current LHR/1 local `u32` physical-row addressing ceiling and any future multi-shard composition must be evaluated as a separate scale architecture question rather than inferred from the 10M CI results.
