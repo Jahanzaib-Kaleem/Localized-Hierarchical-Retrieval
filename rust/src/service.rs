@@ -269,7 +269,7 @@ fn io_status(error: &io::Error) -> StatusCode {
         io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
         io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
         io::ErrorKind::TimedOut => StatusCode::REQUEST_TIMEOUT,
-        io::ErrorKind::WouldBlock => StatusCode::CONFLICT,
+        io::ErrorKind::WouldBlock | io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
         io::ErrorKind::OutOfMemory => StatusCode::PAYLOAD_TOO_LARGE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
