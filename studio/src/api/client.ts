@@ -83,11 +83,18 @@ async function waitForImport(
   }
 }
 
+async function fileFingerprint(file: File): Promise<string> {
+  const bytes = await file.slice(0, 1024 * 1024).arrayBuffer()
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
 async function createOrResumeImport(
   file: File,
   schema: ImportDatasetSchema,
   bucket: string,
   mode: ImportMode,
+  fingerprint: string,
 ): Promise<ImportJobStatus> {
   const active = sessionStorage.getItem(ACTIVE_IMPORT_KEY)
   if (active) {
@@ -98,6 +105,7 @@ async function createOrResumeImport(
         && job.bucket === bucket
         && job.mode === mode
         && job.file_name === file.name
+        && job.file_fingerprint === fingerprint
         && job.bytes_total === file.size
       ) {
         return job
@@ -121,6 +129,7 @@ async function createOrResumeImport(
       mode,
       schema,
       file_name: file.name,
+      file_fingerprint: fingerprint,
       bytes_total: file.size,
     }),
   })).result
@@ -135,7 +144,8 @@ async function uploadImport(
   mode: ImportMode,
   onProgress?: (job: ImportJobStatus) => void,
 ): Promise<CsvImportResult> {
-  let job = await createOrResumeImport(file, schema, bucket, mode)
+  const fingerprint = await fileFingerprint(file)
+  let job = await createOrResumeImport(file, schema, bucket, mode, fingerprint)
   onProgress?.(job)
 
   while (job.bytes_received < file.size) {

@@ -210,6 +210,7 @@ impl TempFileGuard { fn new(path: PathBuf) -> Self { Self { path } } }
 impl Drop for TempFileGuard { fn drop(&mut self) { let _ = fs::remove_file(&self.path); } }
 
 const IMPORT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const IMPORT_FINGERPRINT_BYTES: usize = 1024 * 1024;
 const IMPORT_JOB_MAX_AGE_MS: u128 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -227,6 +228,7 @@ struct ImportJob {
     status: String,
     stage: String,
     file_name: String,
+    file_fingerprint: String,
     bytes_received: u64,
     bytes_total: u64,
     rows_parsed: Option<u64>,
@@ -245,6 +247,7 @@ struct ImportJobCreateRequest {
     mode: ImportMode,
     schema: DatasetSchema,
     file_name: String,
+    file_fingerprint: String,
     bytes_total: u64,
 }
 
@@ -621,6 +624,15 @@ async fn import_job_create(
             format!("CSV exceeds the {} byte import limit", state.config.max_import_bytes),
         ));
     }
+    if request.file_fingerprint.len() != 64
+        || !request.file_fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            guard.request_id,
+            "file_fingerprint must be a 64-character SHA-256 hex digest",
+        ));
+    }
     request
         .schema
         .validate()
@@ -679,6 +691,7 @@ async fn import_job_create(
         status: "uploading".into(),
         stage: "uploading".into(),
         file_name,
+        file_fingerprint: request.file_fingerprint.to_ascii_lowercase(),
         bytes_received: 0,
         bytes_total: request.bytes_total,
         rows_parsed: None,
@@ -726,6 +739,27 @@ async fn import_job_chunk(
             format!("chunk offset mismatch: server expects {}", job.bytes_received),
         ));
     }
+    if query.offset == 0 {
+        let required = usize::try_from(job.bytes_total.min(IMPORT_FINGERPRINT_BYTES as u64))
+            .unwrap_or(IMPORT_FINGERPRINT_BYTES);
+        if body.len() < required {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                guard.request_id,
+                format!("first import chunk must contain at least {required} bytes for fingerprint validation"),
+            ));
+        }
+        let digest = Sha256::digest(&body[..required]);
+        let actual = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        if actual != job.file_fingerprint {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                guard.request_id,
+                "selected file does not match the import job fingerprint",
+            ));
+        }
+    }
+
     let chunk_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
     let next = job
         .bytes_received
