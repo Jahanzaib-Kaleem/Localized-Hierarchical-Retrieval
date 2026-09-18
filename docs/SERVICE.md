@@ -8,9 +8,9 @@ The safe default is loopback-only HTTP (`127.0.0.1:8787`). A non-loopback bind i
 
 Remote listeners also require at least one API key. Keys have one of three roles:
 
-- `read`: query, stats, workload, generations, metrics;
-- `write`: all read operations plus mutations;
-- `admin`: all operations including imports, compaction, vacuum, recovery, and index changes.
+- `read`: bucket discovery, query, stats, workload, generations, metrics;
+- `write`: all read operations plus row mutations and selected-row bucket transfers;
+- `admin`: all operations including imports, bucket management/combine, compaction, vacuum, recovery, and index changes.
 
 Bearer tokens are hashed before lookup and are never written to telemetry or audit logs.
 
