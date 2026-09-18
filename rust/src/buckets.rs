@@ -1,7 +1,7 @@
 use crate::{
-    apply_mutations_delta, dataset_stats, import_csv, leased_generation_ids, seal_dataset,
-    write_schema, CsvImportConfig, DatasetSchema, Mutation, MutationConfig, MutationReport,
-    VersionedDataset,
+    abandon_generation, apply_mutations_delta, begin_generation, dataset_stats, import_csv,
+    leased_generation_ids, publish_generation, write_schema, CsvImportConfig, CsvImportReport,
+    DatasetSchema, GenerationInfo, Mutation, MutationConfig, MutationReport, VersionedDataset,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -280,6 +280,33 @@ fn choose_null_sentinels(
         .collect()
 }
 
+
+fn publish_csv_generation(
+    catalog_root: &Path,
+    csv_path: &Path,
+    public_schema: &DatasetSchema,
+    import_schema: &DatasetSchema,
+    config: &CsvImportConfig,
+) -> io::Result<(GenerationInfo, CsvImportReport)> {
+    let stage = begin_generation(catalog_root)?;
+    let build_catalog = catalog_root.join(format!(
+        ".bucket-build-{}-{}",
+        stage.id,
+        std::process::id()
+    ));
+    let result = (|| -> io::Result<(GenerationInfo, CsvImportReport)> {
+        let built = import_csv(&build_catalog, csv_path, import_schema, config)?;
+        fs::remove_dir_all(&stage.path)?;
+        fs::rename(&built.generation.path, &stage.path)?;
+        let _ = fs::remove_file(stage.path.join("integrity.json"));
+        write_schema(&stage.path, public_schema)?;
+        let generation = publish_generation(stage)?;
+        Ok((generation, built))
+    })();
+    let _ = fs::remove_dir_all(&build_catalog);
+    result
+}
+
 pub fn combine_buckets(
     root: impl AsRef<Path>,
     sources: &[String],
@@ -364,9 +391,8 @@ pub fn combine_buckets(
         if rows == 0 {
             return Err(invalid("cannot combine empty buckets into an LHR/1 dataset"));
         }
-        let report = import_csv(&target_root, &temp_csv, &import_schema, config)?;
-        write_schema(&report.generation.path, &schema)?;
-        seal_dataset(&report.generation.path)?;
+        let (_generation, _report) =
+            publish_csv_generation(&target_root, &temp_csv, &schema, &import_schema, config)?;
         let target = info(&target_root, target_id, created.name.clone());
         Ok(BucketCombineReport {
             target,
