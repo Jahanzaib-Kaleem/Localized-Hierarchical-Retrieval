@@ -66,7 +66,7 @@ The default aggregate CSV ceiling is currently 64 GiB (`max_import_bytes`) and i
 
 Studio stores the active job ID in browser `sessionStorage`. A page reload can reconnect to a queued/running server-side job. If a reload interrupts the browser upload, the user can re-select the same local file and Studio resumes from the server's persisted byte offset.
 
-Name and size are not considered sufficient identity. Studio hashes only the first 1 MiB with SHA-256 (bounded browser memory), and the server verifies that fingerprint from the first uploaded chunk. A different same-name/same-size file is therefore rejected rather than spliced onto a partial upload.
+Name and size are not considered sufficient identity. The server hashes the first 1 MiB of the first uploaded chunk with SHA-256 and persists that fingerprint. When Studio resumes, it re-sends only the first bounded chunk at offset zero for identity verification; the server compares the first 1 MiB and returns the already-durable offset without appending those bytes again. This avoids depending on browser Web Crypto or a secure HTTPS origin while still preventing a different same-name/same-size file from being spliced onto a partial upload.
 
 A chunk whose response is lost is also safe to retry: Studio first asks the server for the persisted byte offset. The server accepts only the next sequential offset and persists progress only after the chunk has been flushed and synced.
 

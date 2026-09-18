@@ -83,18 +83,11 @@ async function waitForImport(
   }
 }
 
-async function fileFingerprint(file: File): Promise<string> {
-  const bytes = await file.slice(0, 1024 * 1024).arrayBuffer()
-  const digest = await crypto.subtle.digest('SHA-256', bytes)
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
-}
-
 async function createOrResumeImport(
   file: File,
   schema: ImportDatasetSchema,
   bucket: string,
   mode: ImportMode,
-  fingerprint: string,
 ): Promise<ImportJobStatus> {
   const active = sessionStorage.getItem(ACTIVE_IMPORT_KEY)
   if (active) {
@@ -105,10 +98,17 @@ async function createOrResumeImport(
         && job.bucket === bucket
         && job.mode === mode
         && job.file_name === file.name
-        && job.file_fingerprint === fingerprint
         && job.bytes_total === file.size
       ) {
-        return job
+        const verificationChunk = file.slice(0, Math.min(file.size, IMPORT_CHUNK_BYTES))
+        return (await request<ApiEnvelope<ImportJobStatus>>(
+          `/v1/admin/imports/${encodeURIComponent(job.id)}/chunk?offset=0`,
+          {
+            method: 'PUT',
+            headers: { 'content-type': 'application/octet-stream' },
+            body: verificationChunk,
+          },
+        )).result
       }
       if (job.status !== 'complete' && job.status !== 'failed') {
         throw new ApiError(
@@ -129,7 +129,6 @@ async function createOrResumeImport(
       mode,
       schema,
       file_name: file.name,
-      file_fingerprint: fingerprint,
       bytes_total: file.size,
     }),
   })).result
@@ -144,8 +143,7 @@ async function uploadImport(
   mode: ImportMode,
   onProgress?: (job: ImportJobStatus) => void,
 ): Promise<CsvImportResult> {
-  const fingerprint = await fileFingerprint(file)
-  let job = await createOrResumeImport(file, schema, bucket, mode, fingerprint)
+  let job = await createOrResumeImport(file, schema, bucket, mode)
   onProgress?.(job)
 
   while (job.bytes_received < file.size) {

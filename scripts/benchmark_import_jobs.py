@@ -9,7 +9,6 @@ row counts and exact lookups, and cleans benchmark buckets by default.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shutil
@@ -136,13 +135,6 @@ def generate_csv(path: Path, target_bytes: int, first_id: int) -> tuple[int, int
     return rows, path.stat().st_size
 
 
-def fingerprint(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        digest.update(source.read(FINGERPRINT_BYTES))
-    return digest.hexdigest()
-
-
 def parse_metrics(text: str) -> dict[str, int]:
     metrics: dict[str, int] = {}
     for line in text.splitlines():
@@ -252,7 +244,6 @@ def create_job(
             "mode": mode,
             "schema": SCHEMA,
             "file_name": path.name,
-            "file_fingerprint": fingerprint(path),
             "bytes_total": path.stat().st_size,
         },
     )

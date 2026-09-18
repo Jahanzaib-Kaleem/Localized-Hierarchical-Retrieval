@@ -94,7 +94,7 @@ export type ImportJobStatus = {
   status: 'uploading' | 'queued' | 'running' | 'complete' | 'failed'
   stage: 'uploading' | 'queued' | 'validating' | 'parsing' | 'building' | 'indexing' | 'publishing' | 'complete' | 'failed'
   file_name: string
-  file_fingerprint: string
+  file_fingerprint: string | null
   bytes_received: number
   bytes_total: number
   rows_parsed: number | null
