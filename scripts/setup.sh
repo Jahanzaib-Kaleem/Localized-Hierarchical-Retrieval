@@ -141,6 +141,111 @@ if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || 
   rollback_upgrade "The new LHR container exited during startup."
 fi
 
+install_self_update_agent() {
+  # Self-update is intentionally a host-side privilege boundary. The LHR container never receives
+  # the Docker socket. Admin MCP can only create a narrowly-scoped request file under /data/control;
+  # this root-owned systemd helper performs the already-supported safe installer workflow.
+  if [ "$(id -u)" -ne 0 ] || ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+    echo "MCP self-update was not enabled (root + systemd are required on the host)." >&2
+    return 0
+  fi
+
+  HOST_DATA_PATH="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+  if [ -z "$HOST_DATA_PATH" ] || [ ! -d "$HOST_DATA_PATH" ]; then
+    echo "MCP self-update was not enabled (could not resolve the host /data mount)." >&2
+    return 0
+  fi
+  case "$HOST_DATA_PATH" in
+    *'
+'*|*' '*)
+      echo "MCP self-update was not enabled because the host data path contains unsupported whitespace." >&2
+      return 0
+      ;;
+  esac
+
+  CONTROL_DIR="$HOST_DATA_PATH/control"
+  install -d -m 0700 -o 10001 -g 10001 "$CONTROL_DIR"
+
+  cat > /usr/local/sbin/lhr-self-update-agent <<'EOF'
+#!/bin/sh
+set -eu
+
+CONTROL_DIR="${1:?control directory is required}"
+CONTAINER_NAME="${2:-lhr}"
+REQUEST="$CONTROL_DIR/update-request.json"
+STATUS="$CONTROL_DIR/update-status.json"
+LOG="$CONTROL_DIR/update.log"
+SETUP_URL="https://raw.githubusercontent.com/Jahanzaib-Kaleem/Localized-Hierarchical-Retrieval/main/scripts/setup.sh"
+
+[ -f "$REQUEST" ] || exit 0
+
+write_status() {
+  STATE="$1"
+  MESSAGE="$2"
+  IMAGE_ID="${3:-}"
+  NOW="$(date +%s)"
+  TMP="$CONTROL_DIR/.update-status-$.tmp"
+  printf '{"state":"%s","message":"%s","image_id":"%s","updated_at_epoch":%s}\n' \
+    "$STATE" "$MESSAGE" "$IMAGE_ID" "$NOW" > "$TMP"
+  chmod 0600 "$TMP"
+  mv -f "$TMP" "$STATUS"
+}
+
+# Remove the trigger before changing the container so the path unit cannot recursively launch.
+rm -f "$REQUEST"
+write_status "updating" "Pulling and replacing LHR with the newest published image." ""
+: > "$LOG"
+chmod 0600 "$LOG"
+
+# Give the MCP HTTP response time to leave the old container before it is replaced.
+sleep 2
+
+if LHR_CONTAINER_NAME="$CONTAINER_NAME" sh -c "$(curl -fsSL "$SETUP_URL")" >>"$LOG" 2>&1; then
+  IMAGE_ID="$(docker inspect -f '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+  write_status "success" "LHR update completed successfully." "$IMAGE_ID"
+  exit 0
+fi
+
+write_status "failed" "LHR update failed. See update.log; persistent /data was not removed." ""
+exit 1
+EOF
+  chmod 0755 /usr/local/sbin/lhr-self-update-agent
+
+  cat > /etc/systemd/system/lhr-self-update.service <<EOF
+[Unit]
+Description=LHR host-side self updater
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lhr-self-update-agent $CONTROL_DIR $CONTAINER_NAME
+EOF
+
+  cat > /etc/systemd/system/lhr-self-update.path <<EOF
+[Unit]
+Description=Watch for LHR MCP software update requests
+
+[Path]
+PathExists=$CONTROL_DIR/update-request.json
+Unit=lhr-self-update.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  # The marker is read inside the unprivileged container and tells MCP that a host worker exists.
+  : > "$CONTROL_DIR/updater-enabled"
+  chown 10001:10001 "$CONTROL_DIR/updater-enabled"
+  chmod 0600 "$CONTROL_DIR/updater-enabled"
+
+  systemctl daemon-reload
+  systemctl enable --now lhr-self-update.path >/dev/null
+  echo "MCP self-update: enabled through host-side systemd watcher."
+}
+
+install_self_update_agent
+
 printf '\nLHR is %s.\n' "$([ "$EXISTING" -eq 1 ] && printf 'upgraded' || printf 'installed')"
 printf 'Studio: http://127.0.0.1:%s\n' "$STUDIO_PORT"
 printf 'MCP:    http://127.0.0.1:%s/mcp\n' "$MCP_PORT"
@@ -148,4 +253,5 @@ printf 'Data:   %s mounted at /data\n\n' "$DATA_MOUNT"
 printf '%s\n' "Run this same setup command again later to upgrade to the newest image."
 printf '%s\n' "Existing database files and the administrator access secret remain in the persistent /data mount."
 printf '%s\n' "Set LHR_ROTATE_SECRET=1 only when you intentionally want to replace the administrator access secret."
+printf '%s\n' "On systemd Linux hosts installed as root, admin MCP can request future safe in-place upgrades without SSH."
 printf '%s\n' "For a public deployment, keep the Docker ports bound to 127.0.0.1 and put HTTPS/private transport in front of them. Do not expose the cleartext listeners directly to the Internet."
