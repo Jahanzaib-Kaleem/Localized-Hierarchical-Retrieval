@@ -1,13 +1,15 @@
 use crate::{
-    add_index, apply_mutations_delta, compact_dataset, dataset_stats, dataset_status, drop_index,
-    execute_query, import_csv, leased_generation_ids, list_generations, planner_indexes_for_request,
-    rebuild_index, record_query, recover_catalog, resolve_dataset_root, vacuum_with_reader_leases,
-    workload_report, CompactionConfig, CsvImportConfig, DatasetSchema, Mutation, MutationConfig,
-    QueryRequest, VersionedDataset,
+    add_index, apply_mutations_delta, combine_buckets, compact_dataset, create_bucket,
+    dataset_stats, dataset_status, delete_bucket, drop_index, execute_query, import_csv,
+    leased_generation_ids, list_buckets, list_generations, planner_indexes_for_request,
+    rebuild_index, record_query, recover_catalog, rename_bucket, require_bucket_root,
+    resolve_dataset_root, transfer_rows, vacuum_with_reader_leases, workload_report,
+    CompactionConfig, CsvImportConfig, DatasetSchema, Mutation, MutationConfig, QueryRequest,
+    VersionedDataset, DEFAULT_BUCKET,
 };
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, OriginalUri, State},
+    extract::{DefaultBodyLimit, Multipart, OriginalUri, Query as AxumQuery, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -20,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     net::SocketAddr,
     path::{Component, Path, PathBuf},
@@ -167,6 +169,27 @@ struct ServiceState {
 fn hash_token(token: &str) -> [u8; 32] { Sha256::digest(token.as_bytes()).into() }
 fn now_ms() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() }
 
+fn default_bucket() -> String { DEFAULT_BUCKET.into() }
+
+#[derive(Debug, Clone, Deserialize)]
+struct BucketSelector {
+    #[serde(default = "default_bucket")]
+    bucket: String,
+}
+
+impl Default for BucketSelector {
+    fn default() -> Self { Self { bucket: default_bucket() } }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ServiceQueryRequest {
+    #[serde(default = "default_bucket")]
+    bucket: String,
+    #[serde(flatten)]
+    query: QueryRequest,
+}
+
+
 #[derive(Debug)]
 struct ApiError { status: StatusCode, message: String, request_id: u64 }
 impl ApiError {
@@ -246,7 +269,7 @@ fn io_status(error: &io::Error) -> StatusCode {
         io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
         io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
         io::ErrorKind::TimedOut => StatusCode::REQUEST_TIMEOUT,
-        io::ErrorKind::WouldBlock => StatusCode::CONFLICT,
+        io::ErrorKind::WouldBlock | io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
         io::ErrorKind::OutOfMemory => StatusCode::PAYLOAD_TOO_LARGE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -255,25 +278,35 @@ fn join_error(request_id: u64, error: tokio::task::JoinError) -> ApiError {
     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, request_id, format!("blocking task failed: {error}"))
 }
 
+fn selected_bucket_root(state: &ServiceState, bucket: &str, request_id: u64) -> Result<PathBuf, ApiError> {
+    require_bucket_root(&state.root, bucket)
+        .map_err(|error| ApiError::new(io_status(&error), request_id, error.to_string()))
+}
+
+
 async fn healthz() -> impl IntoResponse { Json(json!({"status":"ok"})) }
 async fn readyz(State(state): State<ServiceState>) -> Response {
     let root = state.root.clone();
-    match tokio::task::spawn_blocking(move || VersionedDataset::open(root).map(|_| ())).await {
-        Ok(Ok(())) => (StatusCode::OK, Json(json!({"status":"ready"}))).into_response(),
+    match tokio::task::spawn_blocking(move || list_buckets(root)).await {
+        Ok(Ok(buckets)) if buckets.iter().any(|bucket| bucket.ready) => {
+            (StatusCode::OK, Json(json!({"status":"ready"}))).into_response()
+        }
         _ => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"status":"not_ready"}))).into_response(),
     }
 }
 
-async fn query(State(state): State<ServiceState>, headers: HeaderMap, Json(mut request): Json<QueryRequest>) -> Result<Json<Value>, ApiError> {
+async fn query(State(state): State<ServiceState>, headers: HeaderMap, Json(payload): Json<ServiceQueryRequest>) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Read).await?;
+    let bucket = payload.bucket;
+    let mut request = payload.query;
     if request.limit > state.config.max_query_limit {
         state.metrics.errors.fetch_add(1, Ordering::Relaxed);
         return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "query limit exceeds server maximum"));
     }
     request.max_rows_examined = Some(request.max_rows_examined.unwrap_or(state.config.max_rows_examined).min(state.config.max_rows_examined));
     request.timeout_ms = Some(request.timeout_ms.unwrap_or(state.config.max_query_timeout_ms).min(state.config.max_query_timeout_ms));
-    let root = state.root.clone();
-    let telemetry_root = state.root.clone();
+    let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
+    let telemetry_root = root.clone();
     let request_copy = request.clone();
     state.metrics.queries.fetch_add(1, Ordering::Relaxed);
     let result = tokio::task::spawn_blocking(move || -> io::Result<_> {
@@ -286,7 +319,7 @@ async fn query(State(state): State<ServiceState>, headers: HeaderMap, Json(mut r
     match result {
         Ok(response) => {
             state.metrics.query_micros.fetch_add(response.stats.elapsed_micros.min(u64::MAX as u128) as u64, Ordering::Relaxed);
-            Ok(Json(json!({"request_id":guard.request_id,"result":response})))
+            Ok(Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":response})))
         }
         Err(error) => {
             state.metrics.query_failures.fetch_add(1, Ordering::Relaxed); state.metrics.errors.fetch_add(1, Ordering::Relaxed);
@@ -313,12 +346,16 @@ async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap
     let upload_path = upload_dir.join(format!("upload-{}.csv", guard.request_id));
     let _upload_cleanup = TempFileGuard::new(upload_path.clone());
     let mut schema: Option<DatasetSchema> = None;
+    let mut bucket = default_bucket();
     let mut uploaded = false;
     let mut uploaded_bytes = 0usize;
 
     while let Some(mut field) = multipart.next_field().await.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("invalid multipart upload: {e}")))? {
         let name = field.name().unwrap_or_default().to_owned();
         match name.as_str() {
+            "bucket" => {
+                bucket = field.text().await.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("invalid bucket field: {e}")))?;
+            }
             "schema" => {
                 let text = field.text().await.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("invalid schema field: {e}")))?;
                 let parsed: DatasetSchema = serde_json::from_str(&text).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, format!("invalid schema JSON: {e}")))?;
@@ -351,7 +388,7 @@ async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap
         return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "missing or empty CSV file"));
     }
 
-    let root = state.root.clone();
+    let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
     let import_path = upload_path.clone();
     let config = csv_import_config(&state.config);
     let result = tokio::task::spawn_blocking(move || import_csv(root, import_path, &schema, &config))
@@ -360,12 +397,12 @@ async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap
     match result {
         Ok(report) => {
             state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"import_csv", success:true, detail:json!({"bytes":uploaded_bytes,"report":report}) });
-            Ok(Json(json!({"request_id":guard.request_id,"result":report})))
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"import_csv", success:true, detail:json!({"bucket":bucket,"bytes":uploaded_bytes,"report":report}) });
+            Ok(Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":report})))
         }
         Err(error) => {
             state.metrics.errors.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"import_csv", success:false, detail:json!({"bytes":uploaded_bytes,"error":error.to_string()}) });
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"import_csv", success:false, detail:json!({"bucket":bucket,"bytes":uploaded_bytes,"error":error.to_string()}) });
             Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()))
         }
     }
@@ -395,7 +432,13 @@ fn compaction_config(options: &WriteOptions, config: &ServiceConfig) -> io::Resu
 }
 
 #[derive(Debug, Deserialize)]
-struct MutationRequest { mutations: Vec<Mutation>, #[serde(default)] options: WriteOptions }
+struct MutationRequest {
+    #[serde(default = "default_bucket")]
+    bucket: String,
+    mutations: Vec<Mutation>,
+    #[serde(default)]
+    options: WriteOptions,
+}
 async fn mutate(State(state): State<ServiceState>, headers: HeaderMap, Json(request): Json<MutationRequest>) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Write).await?;
     if request.mutations.is_empty() || request.mutations.len() > state.config.max_mutation_ops {
@@ -403,104 +446,129 @@ async fn mutate(State(state): State<ServiceState>, headers: HeaderMap, Json(requ
         return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "mutation operation count is outside server limits"));
     }
     let config = mutation_config(&request.options, &state.config).map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))?;
-    let root = state.root.clone();
+    let root = selected_bucket_root(&state, &request.bucket, guard.request_id)?;
+    let bucket = request.bucket.clone();
     let operations = request.mutations;
     let count = operations.len();
     let result = tokio::task::spawn_blocking(move || apply_mutations_delta(root, &operations, &config)).await.map_err(|e| join_error(guard.request_id, e))?;
     match result {
         Ok(report) => {
             state.metrics.mutations.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"mutate", success:true, detail:json!({"operations":count,"report":report}) });
-            Ok(Json(json!({"request_id":guard.request_id,"result":report})))
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"mutate", success:true, detail:json!({"bucket":bucket,"operations":count,"report":report}) });
+            Ok(Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":report})))
         }
         Err(error) => {
             state.metrics.errors.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"mutate", success:false, detail:json!({"operations":count,"error":error.to_string()}) });
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"mutate", success:false, detail:json!({"bucket":bucket,"operations":count,"error":error.to_string()}) });
             Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()))
         }
     }
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct CompactRequest { #[serde(default)] options: WriteOptions }
+struct CompactRequest {
+    #[serde(default = "default_bucket")]
+    bucket: String,
+    #[serde(default)]
+    options: WriteOptions,
+}
 async fn compact(State(state): State<ServiceState>, headers: HeaderMap, Json(request): Json<CompactRequest>) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
     let config = compaction_config(&request.options, &state.config).map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))?;
-    let root = state.root.clone();
+    let bucket = request.bucket.clone();
+    let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
     let result = tokio::task::spawn_blocking(move || compact_dataset(root, &config)).await.map_err(|e| join_error(guard.request_id, e))?;
     match result {
         Ok(report) => {
             state.metrics.compactions.fetch_add(1, Ordering::Relaxed); state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"compact", success:true, detail:json!({"report":report}) });
-            Ok(Json(json!({"request_id":guard.request_id,"result":report})))
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"compact", success:true, detail:json!({"bucket":bucket,"report":report}) });
+            Ok(Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":report})))
         }
         Err(error) => {
             state.metrics.errors.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"compact", success:false, detail:json!({"error":error.to_string()}) });
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"compact", success:false, detail:json!({"bucket":bucket,"error":error.to_string()}) });
             Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()))
         }
     }
 }
 
-async fn stats(State(state): State<ServiceState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn stats(State(state): State<ServiceState>, headers: HeaderMap, AxumQuery(selector): AxumQuery<BucketSelector>) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Read).await?;
-    let root = state.root.clone();
+    let bucket = selector.bucket;
+    let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
     tokio::task::spawn_blocking(move || dataset_stats(root)).await.map_err(|e| join_error(guard.request_id, e))?
-        .map(|value| Json(json!({"request_id":guard.request_id,"result":value}))).map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))
+        .map(|value| Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":value}))).map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))
 }
-async fn workload(State(state): State<ServiceState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn workload(State(state): State<ServiceState>, headers: HeaderMap, AxumQuery(selector): AxumQuery<BucketSelector>) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Read).await?;
-    let root = state.root.clone();
+    let bucket = selector.bucket;
+    let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
     tokio::task::spawn_blocking(move || workload_report(root)).await.map_err(|e| join_error(guard.request_id, e))?
-        .map(|value| Json(json!({"request_id":guard.request_id,"result":value}))).map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))
+        .map(|value| Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":value}))).map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))
 }
-async fn generations(State(state): State<ServiceState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn generations(State(state): State<ServiceState>, headers: HeaderMap, AxumQuery(selector): AxumQuery<BucketSelector>) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Read).await?;
-    let root = state.root.clone();
+    let bucket = selector.bucket;
+    let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
     tokio::task::spawn_blocking(move || list_generations(root)).await.map_err(|e| join_error(guard.request_id, e))?
-        .map(|value| Json(json!({"request_id":guard.request_id,"result":value}))).map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))
+        .map(|value| Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":value}))).map_err(|e| ApiError::new(io_status(&e), guard.request_id, e.to_string()))
 }
 
 #[derive(Debug, Deserialize)]
-struct VacuumRequest { #[serde(default = "default_retain_generations")] retain: usize, #[serde(default)] protect: Vec<u64> }
+struct VacuumRequest {
+    #[serde(default = "default_bucket")]
+    bucket: String,
+    #[serde(default = "default_retain_generations")]
+    retain: usize,
+    #[serde(default)]
+    protect: Vec<u64>,
+}
 fn default_retain_generations() -> usize { 2 }
 async fn vacuum(State(state): State<ServiceState>, headers: HeaderMap, Json(request): Json<VacuumRequest>) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
-    let root = state.root.clone();
+    let bucket = request.bucket.clone();
+    let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
     let result = tokio::task::spawn_blocking(move || vacuum_with_reader_leases(root, request.retain, &request.protect)).await.map_err(|e| join_error(guard.request_id, e))?;
     match result {
         Ok(report) => {
             state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"vacuum", success:true, detail:json!({"report":report}) });
-            Ok(Json(json!({"request_id":guard.request_id,"result":report})))
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"vacuum", success:true, detail:json!({"bucket":bucket,"report":report}) });
+            Ok(Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":report})))
         }
         Err(error) => {
             state.metrics.errors.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"vacuum", success:false, detail:json!({"error":error.to_string()}) });
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"vacuum", success:false, detail:json!({"bucket":bucket,"error":error.to_string()}) });
             Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()))
         }
     }
 }
-async fn recover(State(state): State<ServiceState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn recover(State(state): State<ServiceState>, headers: HeaderMap, AxumQuery(selector): AxumQuery<BucketSelector>) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
-    let root = state.root.clone();
+    let bucket = selector.bucket;
+    let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
     let result = tokio::task::spawn_blocking(move || recover_catalog(root)).await.map_err(|e| join_error(guard.request_id, e))?;
     match result {
         Ok(report) => {
             state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"recover", success:true, detail:json!({"report":report}) });
-            Ok(Json(json!({"request_id":guard.request_id,"result":report})))
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"recover", success:true, detail:json!({"bucket":bucket,"report":report}) });
+            Ok(Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":report})))
         }
         Err(error) => {
             state.metrics.errors.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"recover", success:false, detail:json!({"error":error.to_string()}) });
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action:"recover", success:false, detail:json!({"bucket":bucket,"error":error.to_string()}) });
             Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()))
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct IndexRequest { columns: Vec<String>, #[serde(default)] max_sort_records: Option<usize> }
+struct IndexRequest {
+    #[serde(default = "default_bucket")]
+    bucket: String,
+    columns: Vec<String>,
+    #[serde(default)]
+    max_sort_records: Option<usize>,
+}
 async fn index_add(State(state): State<ServiceState>, headers: HeaderMap, Json(request): Json<IndexRequest>) -> Result<Json<Value>, ApiError> { index_change(state, headers, request, "add").await }
 async fn index_drop(State(state): State<ServiceState>, headers: HeaderMap, Json(request): Json<IndexRequest>) -> Result<Json<Value>, ApiError> { index_change(state, headers, request, "drop").await }
 async fn index_rebuild(State(state): State<ServiceState>, headers: HeaderMap, Json(request): Json<IndexRequest>) -> Result<Json<Value>, ApiError> { index_change(state, headers, request, "rebuild").await }
@@ -509,20 +577,219 @@ async fn index_change(state: ServiceState, headers: HeaderMap, request: IndexReq
     if request.columns.len() < 2 { return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "accelerator indexes require at least two columns")); }
     let max_sort = request.max_sort_records.unwrap_or(250_000);
     if max_sort == 0 || max_sort > state.config.max_sort_records { return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "max_sort_records exceeds service ceiling")); }
-    let root = state.root.clone();
+    let bucket = request.bucket.clone();
+    let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
     let columns = request.columns.clone();
     let result = tokio::task::spawn_blocking(move || match action { "add" => add_index(root, &columns, max_sort), "drop" => drop_index(root, &columns), _ => rebuild_index(root, &columns, max_sort) }).await.map_err(|e| join_error(guard.request_id, e))?;
     match result {
         Ok(report) => {
             state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action, success:true, detail:json!({"columns":request.columns,"report":report}) });
-            Ok(Json(json!({"request_id":guard.request_id,"result":report})))
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action, success:true, detail:json!({"bucket":bucket,"columns":request.columns,"report":report}) });
+            Ok(Json(json!({"request_id":guard.request_id,"bucket":bucket,"result":report})))
         }
         Err(error) => {
             state.metrics.errors.fetch_add(1, Ordering::Relaxed);
-            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action, success:false, detail:json!({"columns":request.columns,"error":error.to_string()}) });
+            let _ = append_audit(&state, &AuditEvent { timestamp_ms:now_ms(), request_id:guard.request_id, actor:&guard.actor, action, success:false, detail:json!({"bucket":bucket,"columns":request.columns,"error":error.to_string()}) });
             Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()))
         }
+    }
+}
+
+
+async fn buckets(State(state): State<ServiceState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let guard = begin_request(&state, &headers, ServiceRole::Read).await?;
+    let root = state.root.clone();
+    tokio::task::spawn_blocking(move || list_buckets(root))
+        .await
+        .map_err(|error| join_error(guard.request_id, error))?
+        .map(|value| Json(json!({"request_id":guard.request_id,"result":value})))
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+struct BucketCreateRequest { id: String, name: String }
+
+async fn bucket_create(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    Json(request): Json<BucketCreateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
+    let root = state.root.clone();
+    let id = request.id.clone();
+    let name = request.name.clone();
+    let result = tokio::task::spawn_blocking(move || create_bucket(root, &id, &name))
+        .await
+        .map_err(|error| join_error(guard.request_id, error))?;
+    match result {
+        Ok(bucket) => {
+            state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
+            let _ = append_audit(&state, &AuditEvent {
+                timestamp_ms: now_ms(), request_id: guard.request_id, actor: &guard.actor,
+                action: "bucket_create", success: true,
+                detail: json!({"id":request.id,"name":request.name}),
+            });
+            Ok(Json(json!({"request_id":guard.request_id,"result":bucket})))
+        }
+        Err(error) => Err(ApiError::new(io_status(&error), guard.request_id, error.to_string())),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BucketRenameRequest { id: String, name: String }
+
+async fn bucket_rename(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    Json(request): Json<BucketRenameRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
+    let root = state.root.clone();
+    let id = request.id.clone();
+    let name = request.name.clone();
+    let result = tokio::task::spawn_blocking(move || rename_bucket(root, &id, &name))
+        .await
+        .map_err(|error| join_error(guard.request_id, error))?;
+    match result {
+        Ok(bucket) => {
+            state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
+            let _ = append_audit(&state, &AuditEvent {
+                timestamp_ms: now_ms(), request_id: guard.request_id, actor: &guard.actor,
+                action: "bucket_rename", success: true,
+                detail: json!({"id":request.id,"name":request.name}),
+            });
+            Ok(Json(json!({"request_id":guard.request_id,"result":bucket})))
+        }
+        Err(error) => Err(ApiError::new(io_status(&error), guard.request_id, error.to_string())),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BucketDeleteRequest { id: String, confirm: String }
+
+async fn bucket_delete(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    Json(request): Json<BucketDeleteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
+    if request.confirm != request.id {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            guard.request_id,
+            "confirm must exactly match the bucket id",
+        ));
+    }
+    let root = state.root.clone();
+    let id = request.id.clone();
+    let result = tokio::task::spawn_blocking(move || delete_bucket(root, &id))
+        .await
+        .map_err(|error| join_error(guard.request_id, error))?;
+    match result {
+        Ok(()) => {
+            state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
+            let _ = append_audit(&state, &AuditEvent {
+                timestamp_ms: now_ms(), request_id: guard.request_id, actor: &guard.actor,
+                action: "bucket_delete", success: true, detail: json!({"id":request.id}),
+            });
+            Ok(Json(json!({"request_id":guard.request_id,"result":{"deleted":request.id}})))
+        }
+        Err(error) => Err(ApiError::new(io_status(&error), guard.request_id, error.to_string())),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BucketCombineRequest {
+    sources: Vec<String>,
+    target_id: String,
+    target_name: String,
+}
+
+async fn bucket_combine(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    Json(request): Json<BucketCombineRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
+    if request.sources.len() > 64 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "at most 64 source buckets may be combined at once"));
+    }
+    let root = state.root.clone();
+    let sources = request.sources.clone();
+    let target_id = request.target_id.clone();
+    let target_name = request.target_name.clone();
+    let config = csv_import_config(&state.config);
+    let result = tokio::task::spawn_blocking(move || {
+        combine_buckets(root, &sources, &target_id, &target_name, &config)
+    })
+    .await
+    .map_err(|error| join_error(guard.request_id, error))?;
+    match result {
+        Ok(report) => {
+            state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
+            let _ = append_audit(&state, &AuditEvent {
+                timestamp_ms: now_ms(), request_id: guard.request_id, actor: &guard.actor,
+                action: "bucket_combine", success: true,
+                detail: json!({"sources":request.sources,"target_id":request.target_id,"report":report}),
+            });
+            Ok(Json(json!({"request_id":guard.request_id,"result":report})))
+        }
+        Err(error) => {
+            let _ = append_audit(&state, &AuditEvent {
+                timestamp_ms: now_ms(), request_id: guard.request_id, actor: &guard.actor,
+                action: "bucket_combine", success: false,
+                detail: json!({"sources":request.sources,"target_id":request.target_id,"error":error.to_string()}),
+            });
+            Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BucketTransferRequest {
+    source: String,
+    destination: String,
+    row_ids: Vec<u64>,
+    #[serde(default)]
+    move_rows: bool,
+}
+
+async fn bucket_transfer(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    Json(request): Json<BucketTransferRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let guard = begin_request(&state, &headers, ServiceRole::Write).await?;
+    if request.row_ids.is_empty() || request.row_ids.len() > state.config.max_mutation_ops {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            guard.request_id,
+            format!("row transfer count must be 1..={}", state.config.max_mutation_ops),
+        ));
+    }
+    let root = state.root.clone();
+    let source = request.source.clone();
+    let destination = request.destination.clone();
+    let row_ids = request.row_ids.clone();
+    let move_rows = request.move_rows;
+    let config = mutation_config(&WriteOptions::default(), &state.config)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let result = tokio::task::spawn_blocking(move || {
+        transfer_rows(root, &source, &destination, &row_ids, move_rows, &config)
+    })
+    .await
+    .map_err(|error| join_error(guard.request_id, error))?;
+    match result {
+        Ok(report) => {
+            state.metrics.mutations.fetch_add(1, Ordering::Relaxed);
+            let _ = append_audit(&state, &AuditEvent {
+                timestamp_ms: now_ms(), request_id: guard.request_id, actor: &guard.actor,
+                action: "bucket_transfer", success: true,
+                detail: json!({"source":request.source,"destination":request.destination,"rows":request.row_ids.len(),"move":request.move_rows,"report":report}),
+            });
+            Ok(Json(json!({"request_id":guard.request_id,"result":report})))
+        }
+        Err(error) => Err(ApiError::new(io_status(&error), guard.request_id, error.to_string())),
     }
 }
 
@@ -567,7 +834,17 @@ async fn metrics(State(state): State<ServiceState>, headers: HeaderMap) -> Resul
         format!("lhr_auth_failures_total {}", state.metrics.auth_failures.load(Ordering::Relaxed)),
     ];
     for (name, value) in process_metrics() { lines.push(format!("{name} {value}")); }
+    if let Ok(buckets) = list_buckets(&state.root) {
+        let ready = buckets.iter().filter(|bucket| bucket.ready).count();
+        let rows = buckets.iter().map(|bucket| bucket.rows).sum::<u64>();
+        let bytes = buckets.iter().map(|bucket| bucket.total_bytes).sum::<u64>();
+        lines.push(format!("lhr_buckets {}", buckets.len()));
+        lines.push(format!("lhr_ready_buckets {}", ready));
+        lines.push(format!("lhr_bucket_rows_total {}", rows));
+        lines.push(format!("lhr_bucket_storage_bytes_total {}", bytes));
+    }
     if let Ok(ids) = leased_generation_ids(&state.root) { lines.push(format!("lhr_active_snapshot_generations {}", ids.len())); }
+    // Legacy unlabeled dataset gauges remain the reserved default bucket for compatibility.
     if let Ok(resolved) = resolve_dataset_root(&state.root) {
         if let Ok(status) = dataset_status(resolved) {
             lines.push(format!("lhr_dataset_rows {}", status.rows));
@@ -632,6 +909,12 @@ pub async fn serve(root: impl AsRef<Path>, config: ServiceConfig) -> io::Result<
     let import_limit = config.max_import_bytes.saturating_add(1024 * 1024);
     let app = Router::new()
         .route("/healthz", get(healthz)).route("/readyz", get(readyz)).route("/metrics", get(metrics))
+        .route("/v1/buckets", get(buckets))
+        .route("/v1/admin/buckets/create", post(bucket_create))
+        .route("/v1/admin/buckets/rename", post(bucket_rename))
+        .route("/v1/admin/buckets/delete", post(bucket_delete))
+        .route("/v1/admin/buckets/combine", post(bucket_combine))
+        .route("/v1/buckets/transfer", post(bucket_transfer))
         .route("/v1/query", post(query)).route("/v1/stats", get(stats)).route("/v1/workload", get(workload))
         .route("/v1/generations", get(generations)).route("/v1/mutate", post(mutate))
         .route("/v1/admin/import/csv", post(import_csv_upload).layer(DefaultBodyLimit::max(import_limit)))

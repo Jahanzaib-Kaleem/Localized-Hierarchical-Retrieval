@@ -131,7 +131,6 @@ enum PreparedFilter {
 }
 
 fn prepare_filters(schema: &DatasetSchema, filters: &[QueryFilter]) -> io::Result<Vec<PreparedFilter>> {
-    if filters.is_empty() { return Err(invalid("at least one query filter is required")); }
     let mut out = Vec::with_capacity(filters.len());
     for filter in filters {
         match filter {
@@ -256,6 +255,58 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
     let deadline = deadline(request, start);
     let prepared = prepare_filters(dataset.schema(), &request.filters)?;
     let projection = projection(dataset.schema(), &request.select)?;
+
+    // A zero-filter request is the exact table-browse path used by Studio and API clients.
+    // It walks stable logical IDs forward from the cursor and materializes only the requested
+    // page, so deep pagination does not replay every prior row.
+    if prepared.is_empty() {
+        let mut rows_examined = 0u64;
+        let mut rows = Vec::with_capacity(request.limit);
+        let mut row_id = request
+            .after_row_id
+            .map(|value| value.saturating_add(1))
+            .unwrap_or(0);
+        if let Some(max_row_id) = dataset.max_row_id() {
+            while row_id <= max_row_id && rows.len() < request.limit {
+                rows_examined = rows_examined.saturating_add(1);
+                enforce_rows_examined(request.max_rows_examined, rows_examined)?;
+                if rows_examined % 1024 == 0 {
+                    enforce_deadline(deadline)?;
+                }
+                if let Some(values) = dataset.row_values(row_id)? {
+                    let selected = projection
+                        .iter()
+                        .map(|&column| NamedValue {
+                            column: dataset.schema().columns[column].name.clone(),
+                            value: values[column].clone(),
+                        })
+                        .collect();
+                    rows.push(QueryApiRow { row_id, values: selected });
+                }
+                if row_id == u64::MAX {
+                    break;
+                }
+                row_id += 1;
+            }
+        }
+        enforce_deadline(deadline)?;
+        let next_cursor = (rows.len() == request.limit)
+            .then(|| rows.last().unwrap().row_id)
+            .filter(|cursor| dataset.max_row_id().is_some_and(|max| *cursor < max));
+        return Ok(QueryResponse {
+            returned: rows.len(),
+            rows,
+            next_cursor,
+            stats: QueryApiStats {
+                hits: dataset.visible_rows(),
+                rows_examined,
+                pages_touched: 0,
+                hierarchy_lookups: 0,
+                elapsed_micros: start.elapsed().as_micros(),
+                optimized_equality_route: false,
+            },
+        });
+    }
 
     if let Some(eq) = equality_predicates(&prepared, dataset.schema()) {
         // Equality predicates retain the optimized exact-index route. The stable logical-row cursor

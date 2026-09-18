@@ -1,6 +1,7 @@
 use crate::{
     abandon_generation, add_exact_hierarchies, begin_generation, dataset_status, publish_generation,
-    read_schema, resolve_dataset_root, DatasetSchema, GenerationInfo, HierarchySpec, Manifest,
+    read_overlay, read_schema, resolve_dataset_root, DatasetSchema, GenerationInfo, HierarchySpec,
+    Manifest,
 };
 use serde::Serialize;
 use std::{
@@ -101,6 +102,7 @@ pub fn dataset_stats(root: impl AsRef<Path>) -> io::Result<DatasetStatsReport> {
     let schema = read_schema(&root)?;
     let manifest = read_manifest(&root)?;
     let status = dataset_status(&root)?;
+    let visible_rows = read_overlay(&root, manifest.rows, None)?.visible_rows;
     let column_stats = schema
         .columns
         .iter()
@@ -120,7 +122,7 @@ pub fn dataset_stats(root: impl AsRef<Path>) -> io::Result<DatasetStatsReport> {
         })
         .collect();
     Ok(DatasetStatsReport {
-        rows: manifest.rows,
+        rows: visible_rows,
         columns: manifest.columns,
         pages: manifest.pages,
         canonical_bytes: status.canonical_bytes,

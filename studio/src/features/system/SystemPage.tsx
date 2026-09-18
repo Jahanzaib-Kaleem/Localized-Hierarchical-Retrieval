@@ -16,7 +16,9 @@ const tools = [
 export function SystemPage() {
   const health = useQuery({ queryKey: ['health'], queryFn: ({ signal }) => api.health(signal), staleTime: 10_000, refetchInterval: 30_000 })
   const ready = useQuery({ queryKey: ['ready'], queryFn: ({ signal }) => api.ready(signal), staleTime: 10_000, refetchInterval: 30_000 })
-  const stats = useQuery({ queryKey: ['stats'], queryFn: ({ signal }) => api.stats(signal), staleTime: 30_000, retry: false })
+  const buckets = useQuery({ queryKey: ['buckets'], queryFn: ({ signal }) => api.buckets(signal), staleTime: 15_000, retry: false })
+  const totalRows = (buckets.data ?? []).reduce((sum, bucket) => sum + bucket.rows, 0)
+  const totalBytes = (buckets.data ?? []).reduce((sum, bucket) => sum + bucket.total_bytes, 0)
   const isHealthy = health.data?.status === 'ok'
   const isReady = ready.data?.status === 'ready'
 
@@ -26,8 +28,8 @@ export function SystemPage() {
     <div className="system-health">
       <div><StatusMark active={isHealthy} /><span>Service</span><strong>{isHealthy ? 'Healthy' : 'Unavailable'}</strong></div>
       <div><StatusMark active={isReady} /><span>Dataset</span><strong>{isReady ? 'Ready' : 'Not ready'}</strong></div>
-      <div><span>Rows</span><strong>{stats.data ? numberFormat.format(stats.data.rows) : '—'}</strong></div>
-      <div><span>Storage</span><strong>{stats.data ? formatBytes(stats.data.total_bytes) : '—'}</strong></div>
+      <div><span>Rows</span><strong>{buckets.data ? numberFormat.format(totalRows) : '—'}</strong></div>
+      <div><span>Storage</span><strong>{buckets.data ? formatBytes(totalBytes) : '—'}</strong></div>
     </div>
 
     <div className="tool-grid">

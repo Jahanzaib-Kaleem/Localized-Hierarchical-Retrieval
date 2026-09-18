@@ -110,6 +110,9 @@ pub fn planner_indexes_for_request(
     dataset: &VersionedDataset,
     request: &QueryRequest,
 ) -> io::Result<Vec<String>> {
+    if request.filters.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut predicates = Vec::with_capacity(request.filters.len());
     for filter in &request.filters {
         let QueryFilter::Eq { column, value } = filter else { return Ok(Vec::new()); };

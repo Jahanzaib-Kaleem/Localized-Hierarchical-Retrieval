@@ -127,3 +127,48 @@ fn equality_cursor_preserves_visibility_across_delta_layers() {
         vec![3, 5, 6]
     );
 }
+
+
+#[test]
+fn zero_filter_browse_pages_by_logical_cursor_and_skips_tombstones() {
+    let catalog = tempfile::tempdir().unwrap();
+    let source = catalog.path().join("seed.csv");
+    fs::write(
+        &source,
+        "email,country\nrow0@example.com,pk\nrow1@example.com,pk\nrow2@example.com,pk\nrow3@example.com,pk\nrow4@example.com,pk\nrow5@example.com,pk\n",
+    )
+    .unwrap();
+    import_csv(catalog.path(), &source, &schema(), &import_config()).unwrap();
+    apply_mutations_delta(
+        catalog.path(),
+        &[Mutation::Delete { row_id: 2 }],
+        &mutation_config(),
+    )
+    .unwrap();
+
+    let view = VersionedDataset::open(catalog.path()).unwrap();
+    let request = |after_row_id, limit| QueryRequest {
+        filters: vec![],
+        select: vec!["email".into()],
+        limit,
+        after_row_id,
+        max_rows_examined: Some(100),
+        timeout_ms: Some(5_000),
+    };
+
+    let first = execute_query(&view, &request(None, 3)).unwrap();
+    assert_eq!(first.stats.hits, 5);
+    assert_eq!(
+        first.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+        vec![0, 1, 3]
+    );
+    assert_eq!(first.next_cursor, Some(3));
+
+    let second = execute_query(&view, &request(first.next_cursor, 3)).unwrap();
+    assert_eq!(
+        second.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+    assert_eq!(second.next_cursor, None);
+    assert!(second.stats.rows_examined <= 2);
+}

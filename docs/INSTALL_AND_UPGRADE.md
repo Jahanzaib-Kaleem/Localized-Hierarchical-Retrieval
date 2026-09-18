@@ -28,6 +28,39 @@ To intentionally rotate the administrator credential during a setup/upgrade:
 LHR_ROTATE_SECRET=1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/Jahanzaib-Kaleem/Localized-Hierarchical-Retrieval/main/scripts/setup.sh)"
 ```
 
+## MCP-initiated upgrades on Linux
+
+When the Linux setup command is run as root on a systemd host, it also installs a small host-side update watcher.
+
+The privilege boundary is deliberate:
+
+```text
+admin MCP
+   |
+   | writes /data/control/update-request.json
+   v
+persistent /data
+   |
+   | systemd PathExists watcher
+   v
+root-owned lhr-self-update-agent
+   |
+   | runs the same setup.sh workflow
+   v
+pull new image -> replace container -> preserve /data
+```
+
+The LHR container is **not** given the Docker socket and cannot execute arbitrary host commands. The MCP tool can only request this specific update workflow.
+
+The setup script creates `/data/control/updater-enabled` when the watcher is installed. Admin MCP then exposes:
+
+- `lhr_update_status` — inspect watcher availability, pending state, and the last result;
+- `lhr_update` — queue an upgrade to the newest published `:latest` image.
+
+The host worker removes the request trigger before replacing the container, records status in `/data/control/update-status.json`, and writes detailed host output to `/data/control/update.log`.
+
+Because the host watcher is installed by the setup script, the first release that adds this feature requires one ordinary manual setup/upgrade. Future releases can then be requested through MCP without another SSH login.
+
 ## Windows / PowerShell
 
 From a repository checkout:
@@ -72,7 +105,7 @@ With the normal installation this is:
 Docker volume lhr-data -> /data
 ```
 
-Removing or recreating the `lhr` container therefore does not remove the catalog, generations, deltas, dictionaries, row-ID maps, telemetry, or `.lhr-admin-token` stored in that volume.
+Removing or recreating the `lhr` container therefore does not remove the default catalog, named bucket catalogs, generations, deltas, dictionaries, row-ID maps, telemetry, updater control state, or `.lhr-admin-token` stored in that volume.
 
 Do **not** use destructive volume commands unless you intentionally want to erase the installation. In particular:
 

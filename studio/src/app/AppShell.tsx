@@ -30,8 +30,10 @@ function currentLabel(pathname: string) {
 export function AppShell() {
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const ready = useQuery({ queryKey: ['ready'], queryFn: ({ signal }) => api.ready(signal), staleTime: 10_000, refetchInterval: 30_000 })
-  const stats = useQuery({ queryKey: ['stats'], queryFn: ({ signal }) => api.stats(signal), staleTime: 30_000, retry: false })
+  const buckets = useQuery({ queryKey: ['buckets'], queryFn: ({ signal }) => api.buckets(signal), staleTime: 15_000, retry: false })
   const isReady = ready.data?.status === 'ready'
+  const totalRows = (buckets.data ?? []).reduce((sum, bucket) => sum + bucket.rows, 0)
+  const totalBytes = (buckets.data ?? []).reduce((sum, bucket) => sum + bucket.total_bytes, 0)
   const systemActive = systemPaths.some((path) => pathname.startsWith(path))
 
   return (
@@ -74,7 +76,7 @@ export function AppShell() {
           <strong className="topbar__page">{currentLabel(pathname)}</strong>
           <div className="topbar__diagnostics" aria-label="Dataset status">
             <span className="topbar__state"><StatusMark active={isReady} />{isReady ? 'Ready' : 'Not ready'}</span>
-            {stats.data ? <><span className="topbar__separator" /><span><strong>{numberFormat.format(stats.data.rows)}</strong> rows</span><span className="topbar__separator" /><span><strong>{formatBytes(stats.data.total_bytes)}</strong></span></> : null}
+            {buckets.data ? <><span className="topbar__separator" /><span><strong>{numberFormat.format(totalRows)}</strong> rows</span><span className="topbar__separator" /><span><strong>{buckets.data.length}</strong> buckets</span><span className="topbar__separator" /><span><strong>{formatBytes(totalBytes)}</strong></span></> : null}
           </div>
         </div>
         <div className="main-scroll"><Outlet /></div>
