@@ -135,3 +135,26 @@ When diagnosing transport failures, isolate layers in order:
 4. Cloudflare or another external tunnel/proxy.
 
 Do not attribute an ingestion failure to the outer proxy until the same request path is known to work at the inner layer.
+
+## On-demand large-file benchmark
+
+Large upload tests are intentionally **not** part of ordinary pull-request CI because generating and importing 50 MB through 1+ GB fixtures on every change would consume substantial runner minutes and storage.
+
+After starting the release candidate service, run the end-to-end Studio import-job protocol locally on the target host:
+
+```bash
+export LHR_BASE_URL=http://127.0.0.1:8787
+export LHR_API_TOKEN='...'
+
+python3 scripts/benchmark_import_jobs.py --sizes-mb 50 250 700 1024
+```
+
+This creates a separate temporary bucket for each size, generates the CSV incrementally under `/data/temp/import-benchmarks`, uploads it in the same 4 MiB chunks as Studio, polls real server stages, samples RSS/page faults/process I/O and free disk, verifies final row count plus exact lookups, prints JSON reports, and deletes the benchmark buckets/files by default. It never touches the default/Apollo bucket.
+
+To exercise repeated append instead of independent creates:
+
+```bash
+python3 scripts/benchmark_import_jobs.py --append-parts-mb 250 250 250 250
+```
+
+The first part creates the temporary dataset and every later part uses append. IDs remain unique across parts and every published row count is verified. Add `--keep-buckets` or `--keep-files` only when artifacts are deliberately needed for debugging.
