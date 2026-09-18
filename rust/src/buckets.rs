@@ -1,7 +1,7 @@
 use crate::{
     abandon_generation, apply_mutations_delta, begin_generation, dataset_stats, import_csv,
-    leased_generation_ids, publish_generation, write_schema, CsvImportConfig, CsvImportReport,
-    DatasetSchema, GenerationInfo, Mutation, MutationConfig, MutationReport, VersionedDataset,
+    leased_generation_ids, publish_generation, write_schema, CsvImportConfig, DatasetSchema,
+    GenerationInfo, Mutation, MutationConfig, MutationReport, VersionedDataset,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -287,24 +287,45 @@ fn publish_csv_generation(
     public_schema: &DatasetSchema,
     import_schema: &DatasetSchema,
     config: &CsvImportConfig,
-) -> io::Result<(GenerationInfo, CsvImportReport)> {
-    let stage = begin_generation(catalog_root)?;
+) -> io::Result<GenerationInfo> {
     let build_catalog = catalog_root.join(format!(
         ".bucket-build-{}-{}",
-        stage.id,
+        now_ms(),
         std::process::id()
     ));
-    let result = (|| -> io::Result<(GenerationInfo, CsvImportReport)> {
-        let built = import_csv(&build_catalog, csv_path, import_schema, config)?;
+    let built = match import_csv(&build_catalog, csv_path, import_schema, config) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&build_catalog);
+            return Err(error);
+        }
+    };
+
+    let stage = match begin_generation(catalog_root) {
+        Ok(stage) => stage,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&build_catalog);
+            return Err(error);
+        }
+    };
+
+    let prepare = (|| -> io::Result<()> {
         fs::remove_dir_all(&stage.path)?;
         fs::rename(&built.generation.path, &stage.path)?;
         let _ = fs::remove_file(stage.path.join("integrity.json"));
         write_schema(&stage.path, public_schema)?;
-        let generation = publish_generation(stage)?;
-        Ok((generation, built))
+        Ok(())
     })();
+
+    if let Err(error) = prepare {
+        let _ = abandon_generation(stage);
+        let _ = fs::remove_dir_all(&build_catalog);
+        return Err(error);
+    }
+
+    let generation = publish_generation(stage);
     let _ = fs::remove_dir_all(&build_catalog);
-    result
+    generation
 }
 
 pub fn combine_buckets(
@@ -391,7 +412,7 @@ pub fn combine_buckets(
         if rows == 0 {
             return Err(invalid("cannot combine empty buckets into an LHR/1 dataset"));
         }
-        let (_generation, _report) =
+        let _generation =
             publish_csv_generation(&target_root, &temp_csv, &schema, &import_schema, config)?;
         let target = info(&target_root, target_id, created.name.clone());
         Ok(BucketCombineReport {
