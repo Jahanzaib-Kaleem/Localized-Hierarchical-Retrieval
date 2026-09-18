@@ -834,7 +834,17 @@ async fn metrics(State(state): State<ServiceState>, headers: HeaderMap) -> Resul
         format!("lhr_auth_failures_total {}", state.metrics.auth_failures.load(Ordering::Relaxed)),
     ];
     for (name, value) in process_metrics() { lines.push(format!("{name} {value}")); }
+    if let Ok(buckets) = list_buckets(&state.root) {
+        let ready = buckets.iter().filter(|bucket| bucket.ready).count();
+        let rows = buckets.iter().map(|bucket| bucket.rows).sum::<u64>();
+        let bytes = buckets.iter().map(|bucket| bucket.total_bytes).sum::<u64>();
+        lines.push(format!("lhr_buckets {}", buckets.len()));
+        lines.push(format!("lhr_ready_buckets {}", ready));
+        lines.push(format!("lhr_bucket_rows_total {}", rows));
+        lines.push(format!("lhr_bucket_storage_bytes_total {}", bytes));
+    }
     if let Ok(ids) = leased_generation_ids(&state.root) { lines.push(format!("lhr_active_snapshot_generations {}", ids.len())); }
+    // Legacy unlabeled dataset gauges remain the reserved default bucket for compatibility.
     if let Ok(resolved) = resolve_dataset_root(&state.root) {
         if let Ok(status) = dataset_status(resolved) {
             lines.push(format!("lhr_dataset_rows {}", status.rows));
