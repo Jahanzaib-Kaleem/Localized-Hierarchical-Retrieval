@@ -189,6 +189,7 @@ write_status() {
     "$STATE" "$MESSAGE" "$IMAGE_ID" "$NOW" > "$TMP"
   chmod 0600 "$TMP"
   mv -f "$TMP" "$STATUS"
+  chown 10001:10001 "$STATUS"
 }
 
 # Remove the trigger before changing the container so the path unit cannot recursively launch.
