@@ -8,9 +8,9 @@ The container runs one `lhr-appliance` process:
 
 - `8787` — LHR Studio + authenticated HTTP API
 - `8788` — MCP over HTTP (`POST /mcp`)
-- `/data` — the single persistent LHR catalog/volume
+- `/data` — the persistent LHR volume containing the reserved default catalog plus named bucket catalogs
 
-The MCP listener and the ordinary API operate on the same immutable generations, writer lock, snapshot leases, schemas, indexes and telemetry files.
+The MCP listener and the ordinary API operate on the same bucket catalogs, immutable generations, writer locks, snapshot leases, schemas, indexes and telemetry files. Existing pre-bucket installations remain the reserved `default` bucket without a data rewrite.
 
 The default Docker/Compose mappings bind both listeners to `127.0.0.1`. Do not expose either listener directly to the public Internet. For remote MCP clients, terminate HTTPS at a trusted reverse proxy/private tunnel and forward only the MCP route/listener that you intend to expose.
 
@@ -66,6 +66,7 @@ Typical lead query arguments:
 
 ```json
 {
+  "bucket": "default",
   "filters": [
     {"op": "eq", "column": "country", "value": "US"},
     {"op": "in", "column": "industry", "values": ["Biotech", "Pharmaceuticals"]}
@@ -76,7 +77,9 @@ Typical lead query arguments:
 }
 ```
 
-Use `next_cursor`/`after_row_id` rather than requesting huge result sets. Equality-only requests retain LHR's optimized exact-index route; other supported predicate families use deterministic bounded fallback when no dedicated exact accelerator exists.
+Use `next_cursor`/`after_row_id` rather than requesting huge result sets. An empty `filters` array is the database-browse operation and returns the next bounded page in stable logical-row order. Equality-only requests retain LHR's optimized exact-index route; other supported predicate families use deterministic bounded fallback when no dedicated exact accelerator exists.
+
+All dataset-specific MCP tools accept an optional `bucket` argument. Omitting it selects the compatibility bucket `default`.
 
 ### `lhr_row`
 
@@ -135,6 +138,14 @@ Runs full structural/versioned verification. It is read-only but can be disk-int
 
 Applies insert/update/delete operations as one crash-safe immutable delta transaction using the same service resource ceilings.
 
+### Bucket tools
+
+- `lhr_buckets` (`read`) lists the default and named buckets with readiness, rows, columns and storage.
+- `lhr_bucket_transfer_rows` (`write`) copies or moves selected logical rows between ready same-schema buckets.
+- `lhr_bucket_create`, `lhr_bucket_rename`, `lhr_bucket_delete`, and `lhr_bucket_combine` (`admin`) manage bucket workspaces.
+
+The reserved `default` bucket cannot be deleted. Its display name can be changed without rewriting its data.
+
 ### Administrative tools (`admin`)
 
 - `lhr_compact`
@@ -143,6 +154,12 @@ Applies insert/update/delete operations as one crash-safe immutable delta transa
 - `lhr_index_add`
 - `lhr_index_drop`
 - `lhr_index_rebuild`
+- `lhr_update_status`
+- `lhr_update`
+
+`lhr_update` does not receive Docker or host-root access. It writes a narrowly-scoped request under `/data/control`. On supported Linux/systemd installations, the setup script installs a root-owned host path watcher that consumes that request and runs the same persistent-data-safe installer used for manual upgrades. The MCP connection can briefly disconnect while the container is replaced.
+
+The first release containing this feature must still be installed manually once so the host watcher exists. After that bootstrap, later published releases can be requested through admin MCP.
 
 MCP write/admin operations are appended to `audit/mcp-audit.jsonl` in the LHR volume. Database writer locking and immutable publication semantics remain authoritative, so the MCP layer cannot bypass normal LHR consistency rules.
 
@@ -159,7 +176,7 @@ lhr backup
 lhr restore
 ```
 
-Once data is inside LHR, MCP covers normal querying, row mutations, diagnostics, query benchmarking, index administration and generation maintenance.
+Once data is inside LHR, MCP covers bucket selection/management, normal querying, row mutations, diagnostics, query benchmarking, index administration, generation maintenance, and a constrained software-update request on hosts where the updater was installed.
 
 ## Docker quick start
 
