@@ -33,6 +33,19 @@ A writer acquires the catalog writer lock, constructs unpublished files, verifie
 
 Failed imports, mutations, rebuilds, or compactions do not replace `CURRENT`.
 
+## Buckets
+
+The appliance can host multiple independent LHR catalogs as **buckets**.
+
+- the reserved `default` bucket is the original catalog root and preserves existing installations without a rewrite;
+- named buckets live under `buckets/<id>`;
+- each ready bucket has its own `CURRENT`, generations, indexes, deltas, visibility map, compaction/recovery history, and workload telemetry;
+- omitted bucket selectors continue to mean `default` for backward compatibility.
+
+Buckets can be created, renamed, deleted (except `default`), combined, and used as copy/move destinations for selected logical rows. Populated transfer destinations must have an identical schema; an empty destination can be initialized from the transferred source schema.
+
+See [`BUCKETS.md`](BUCKETS.md) for the workspace and transfer/combine contract.
+
 ## Schema and dictionaries
 
 `schema.json` defines named columns, logical types, nullability, normalization, and explicit null literals. Per-column mmap dictionaries map canonical external values to deterministic integer tokens and back.
@@ -185,7 +198,13 @@ The higher-level query API supports:
 - timeouts;
 - original-value materialization.
 
-Pure equality queries retain the optimized exact LHR index path. Set/range shapes currently use a deterministic exact versioned-row fallback until dedicated exact accelerator semantics are implemented for those operators.
+Pure equality queries retain the optimized exact LHR index path. Cursor pagination seeks from the stable logical-row lower bound rather than replaying all earlier hits.
+
+A single bounded signed/unsigned integer range can also reuse exact singleton indexes when the range is closed, spans at most 256 integer values, and the base plus every delta layer has exact singleton coverage for that column. The interval is decomposed into disjoint equality streams and merged in stable logical-row order with bounded per-stream state.
+
+Wider/open-ended/mixed range shapes and set-membership paths without a dedicated exact accelerator continue to use the deterministic versioned-row fallback under explicit row/time ceilings.
+
+An empty filter list is the table-browse path: it walks stable logical IDs forward and materializes only the requested page.
 
 `lhr query-json` accepts this protocol from a JSON file.
 
@@ -208,7 +227,7 @@ Recommendations are optimization hints. Applying or ignoring them cannot alter r
 
 ## HTTP service
 
-`lhr serve` exposes the query and operational API. See [`SERVICE.md`](SERVICE.md) for the full contract.
+`lhr serve` exposes the bucket-aware query and operational API. Dataset-specific endpoints accept a bucket selector and default to the compatibility bucket `default`. See [`SERVICE.md`](SERVICE.md) for the full contract.
 
 Implemented service protections include:
 
@@ -227,9 +246,11 @@ Implemented service protections include:
 
 ## Metrics
 
-The service exports counters/gauges for HTTP requests/errors/active requests, query activity, mutation/compaction/admin operations, auth failures, rate limiting, RSS, page faults, process disk bytes, active snapshots, row count, and database storage categories.
+The service exports counters/gauges for HTTP requests/errors/active requests, query activity, mutation/compaction/admin operations, auth failures, rate limiting, RSS, page faults, and process disk bytes.
 
-Persistent workload telemetry complements these process metrics with per-query-shape latency and planner information.
+Bucket-aware gauges include total bucket count, ready bucket count, aggregate visible rows, and aggregate bucket storage. Legacy unlabeled dataset row/storage gauges remain scoped to the reserved `default` bucket for compatibility.
+
+Persistent workload telemetry is stored per bucket and complements these process metrics with per-query-shape latency and planner information.
 
 ## Main CLI surface
 
@@ -260,12 +281,15 @@ lhr serve
 
 The operational architecture is implemented, but that does not mean every possible database feature or workload has been exhausted. Remaining future work is primarily validation and optional expansion rather than a missing transactional foundation:
 
-- larger 25M/50M/70M+ end-to-end datasets;
-- real lead-data distributions and long-running mixed read/write workloads;
+- larger 25M/50M/70M+ end-to-end datasets and cold-cache/block-device characterization;
+- post-fix real-data reruns for the accepted equality cursor, narrow-range, and bounded single-exact pagination changes;
+- real lead-data distributions and long-running mixed read/write/compaction workloads;
+- general bounded/streaming result production for exact representations and multi-index plans that can still materialize a large final candidate vector;
 - dedicated exact accelerators for additional predicate families if measurements justify them;
+- a durable scale-out design beyond the current LHR/1 local `u32` physical-row addressing limit; current shard composition remains research-only;
 - optional Parquet/pre-tokenized import surfaces;
 - backup retention/incremental-copy policies;
-- packaging/deployment conveniences such as systemd/container examples;
+- packaging/deployment conveniences;
 - future storage-format migrations when LHR/1 eventually needs an incompatible successor.
 
 The existing CI continues to run correctness tests, a release test suite under a 1 GiB virtual-memory ceiling, and 1M/5M/10M scale benchmarks after operational changes so product work cannot quietly regress the retrieval engine.
