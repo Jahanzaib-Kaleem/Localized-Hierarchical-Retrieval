@@ -440,7 +440,12 @@ pub fn combine_buckets(
     })();
 
     let _ = fs::remove_file(&temp_csv);
-    if result.is_err() {
+    if result.is_err()
+        && matches!(
+            resolve_dataset_root(&target_root),
+            Err(ref error) if error.kind() == io::ErrorKind::NotFound
+        )
+    {
         let _ = fs::remove_dir_all(&target_root);
     }
     result
