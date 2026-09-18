@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { CopyIcon } from '../../components/icons'
@@ -18,6 +18,12 @@ export function ApiPage() {
   const buckets = useQuery({ queryKey: ['buckets'], queryFn: ({ signal }) => api.buckets(signal), staleTime: 15_000 })
   const [bucket, setBucket] = useState('default')
   const activeBucket = buckets.data?.find((item) => item.id === bucket)
+  useEffect(() => {
+    if (buckets.data?.length && !buckets.data.some((item) => item.id === bucket && item.ready)) {
+      const firstReady = buckets.data.find((item) => item.ready)
+      if (firstReady) setBucket(firstReady.id)
+    }
+  }, [buckets.data, bucket])
   const stats = useQuery({ queryKey: ['stats', bucket], queryFn: ({ signal }) => api.stats(signal, bucket), staleTime: 30_000, retry: false, enabled: Boolean(activeBucket?.ready) })
   const firstColumn = stats.data?.column_stats[0]?.name ?? 'domain'
   const origin = window.location.origin
