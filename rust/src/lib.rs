@@ -65,8 +65,8 @@ pub use exact::add_exact_hierarchies;
 pub use flat_postings::FlatPostingHierarchy;
 pub use hierarchy::{Hierarchy, Record};
 pub use import::{
-    import_csv, import_csv_with_progress, CsvImportConfig, CsvImportProgress, CsvImportReport,
-    CsvImportStage,
+    import_csv, import_csv_initial_with_progress, import_csv_with_progress, CsvImportConfig,
+    CsvImportProgress, CsvImportReport, CsvImportStage,
 };
 pub use ingest::{import_external, ExternalFormat, ExternalImportConfig, ExternalImportReport};
 pub use intersect::intersect_sorted;

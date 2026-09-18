@@ -1,7 +1,7 @@
 use crate::{
     abandon_generation, add_exact_hierarchies, begin_generation, build_u32_batches,
-    dictionary_filename, publish_generation, write_dictionary_record, write_schema, BuildConfig,
-    DatasetSchema, Dictionary, GenerationInfo, HierarchySpec,
+    dictionary_filename, publish_generation, resolve_dataset_root, write_dictionary_record,
+    write_schema, BuildConfig, DatasetSchema, Dictionary, GenerationInfo, HierarchySpec,
 };
 use csv::{Reader, ReaderBuilder, StringRecord};
 use serde::Serialize;
@@ -549,11 +549,12 @@ where
 /// Two-pass CSV import into a new immutable catalog generation. The old CURRENT generation is not
 /// modified unless dictionary construction, encoding, exact-index construction, verification, and
 /// integrity sealing all succeed.
-pub fn import_csv_with_progress<F>(
+fn import_csv_with_progress_mode<F>(
     catalog_root: impl AsRef<Path>,
     csv_path: impl AsRef<Path>,
     schema: &DatasetSchema,
     config: &CsvImportConfig,
+    require_empty: bool,
     mut progress: F,
 ) -> io::Result<CsvImportReport>
 where
@@ -562,6 +563,22 @@ where
     let catalog_root = catalog_root.as_ref();
     let csv_path = csv_path.as_ref();
     let stage = begin_generation(catalog_root)?;
+    if require_empty {
+        match resolve_dataset_root(catalog_root) {
+            Ok(_) => {
+                let _ = abandon_generation(stage);
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "initial CSV import requires an empty catalog",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let _ = abandon_generation(stage);
+                return Err(error);
+            }
+        }
+    }
     let built = build_stage(&stage.path, csv_path, schema, config, &mut progress);
     let (rows, cardinalities, exact_hierarchies) = match built {
         Ok(value) => value,
@@ -578,6 +595,32 @@ where
         cardinalities,
         exact_hierarchies,
     })
+}
+
+pub fn import_csv_with_progress<F>(
+    catalog_root: impl AsRef<Path>,
+    csv_path: impl AsRef<Path>,
+    schema: &DatasetSchema,
+    config: &CsvImportConfig,
+    progress: F,
+) -> io::Result<CsvImportReport>
+where
+    F: FnMut(CsvImportProgress),
+{
+    import_csv_with_progress_mode(catalog_root, csv_path, schema, config, false, progress)
+}
+
+pub fn import_csv_initial_with_progress<F>(
+    catalog_root: impl AsRef<Path>,
+    csv_path: impl AsRef<Path>,
+    schema: &DatasetSchema,
+    config: &CsvImportConfig,
+    progress: F,
+) -> io::Result<CsvImportReport>
+where
+    F: FnMut(CsvImportProgress),
+{
+    import_csv_with_progress_mode(catalog_root, csv_path, schema, config, true, progress)
 }
 
 pub fn import_csv(

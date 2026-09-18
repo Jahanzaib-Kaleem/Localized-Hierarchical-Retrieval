@@ -1,7 +1,7 @@
 use crate::{
     add_index, append_csv_delta_with_progress, apply_mutations_delta, combine_buckets,
     compact_dataset, create_bucket, dataset_stats, dataset_status, delete_bucket, drop_index,
-    execute_query, import_csv, import_csv_with_progress, leased_generation_ids, list_buckets,
+    execute_query, import_csv, import_csv_initial_with_progress, leased_generation_ids, list_buckets,
     list_generations, planner_indexes_for_request, read_schema, rebuild_index, record_query,
     recover_catalog, rename_bucket, require_bucket_root, resolve_dataset_root, transfer_rows,
     vacuum_with_reader_leases, workload_report, CompactionConfig, CsvImportConfig,
@@ -419,31 +419,23 @@ fn run_import_job(root: PathBuf, config: CsvImportConfig, id: String) {
         }
     };
 
+    let schema = job.schema.clone();
     let result: io::Result<Value> = match job.mode {
-        ImportMode::Create => match resolve_dataset_root(&bucket_root) {
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "create import requires an empty bucket; use append for an initialized bucket",
-            )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                import_csv_with_progress(
-                    &bucket_root,
-                    &upload,
-                    &job.schema,
-                    &config,
-                    |progress| update_import_progress(&root, &mut job, progress),
-                )
-                .and_then(|report| {
-                    serde_json::to_value(report)
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-                })
-            }
-            Err(error) => Err(error),
-        },
+        ImportMode::Create => import_csv_initial_with_progress(
+            &bucket_root,
+            &upload,
+            &schema,
+            &config,
+            |progress| update_import_progress(&root, &mut job, progress),
+        )
+        .and_then(|report| {
+            serde_json::to_value(report)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }),
         ImportMode::Append => append_csv_delta_with_progress(
             &bucket_root,
             &upload,
-            &job.schema,
+            &schema,
             &config,
             |progress| update_import_progress(&root, &mut job, progress),
         )
