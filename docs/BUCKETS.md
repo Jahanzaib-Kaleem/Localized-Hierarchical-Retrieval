@@ -42,11 +42,11 @@ The Data workspace provides:
 - a database-style row browser with 50 rows per page;
 - stable cursor pagination rather than offset/prefix replay;
 - CSV import into the active bucket;
-- selected-row copy or move between ready buckets with identical schemas;
+- selected-row copy or move between buckets; an empty destination is initialized from the source schema, while populated destinations must have an identical schema;
 - whole-bucket combine into a new bucket using a streaming bounded-memory build;
 - schema and storage information for the active bucket.
 
-A row move is copy-first: the destination commit happens before source deletion. If source deletion fails, LHR reports the warning and leaves the destination copy intact rather than risking data loss.
+A row transfer can initialize a newly created empty bucket from the selected source rows. A row move is copy-first: the destination commit happens before source deletion. If source deletion fails, LHR reports the warning and leaves the destination copy intact rather than risking data loss.
 
 ## API selection
 
