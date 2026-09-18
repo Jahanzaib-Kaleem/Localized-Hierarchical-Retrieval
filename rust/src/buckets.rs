@@ -159,7 +159,13 @@ fn info(root: &Path, id: &str, name: String) -> BucketInfo {
 
 pub fn list_buckets(root: impl AsRef<Path>) -> io::Result<Vec<BucketInfo>> {
     let root = root.as_ref();
-    let mut buckets = vec![info(root, DEFAULT_BUCKET, "Default".into())];
+    let default_meta = read_meta(root, DEFAULT_BUCKET);
+    let default_name = if default_meta.created_at_ms == 0 && default_meta.name == DEFAULT_BUCKET {
+        "Default".into()
+    } else {
+        default_meta.name
+    };
+    let mut buckets = vec![info(root, DEFAULT_BUCKET, default_name)];
     let named_root = root.join(BUCKETS_DIR);
     if named_root.is_dir() {
         for entry in fs::read_dir(named_root)? {
@@ -214,9 +220,6 @@ pub fn create_bucket(root: impl AsRef<Path>, id: &str, name: &str) -> io::Result
 }
 
 pub fn rename_bucket(root: impl AsRef<Path>, id: &str, name: &str) -> io::Result<BucketInfo> {
-    if id == DEFAULT_BUCKET {
-        return Err(invalid("the reserved default bucket cannot be renamed"));
-    }
     let path = require_bucket_root(root, id)?;
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed.len() > 120 {
