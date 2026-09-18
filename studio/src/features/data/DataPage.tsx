@@ -100,7 +100,7 @@ export function DataPage() {
   }, [selected?.name])
 
   const destinationBuckets = useMemo(
-    () => (buckets.data ?? []).filter((bucket) => bucket.id !== selectedBucket && bucket.ready),
+    () => (buckets.data ?? []).filter((bucket) => bucket.id !== selectedBucket),
     [buckets.data, selectedBucket],
   )
 
