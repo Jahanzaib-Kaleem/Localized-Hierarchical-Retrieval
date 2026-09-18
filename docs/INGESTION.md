@@ -86,13 +86,13 @@ complete
 failed
 ```
 
-During upload, Studio can show exact bytes and percentage because the total file size is known. During server-side stages, it reports the stage and parsed-row count when known. It does not invent an ETA or a percentage for work whose denominator is unknown.
+During upload, Studio can show exact bytes and percentage because the total file size is known. During the first CSV pass, LHR persists real parsed-row progress every 65,536 rows; later server-side stages report their stage without inventing a denominator. It does not invent an ETA or a percentage for work whose denominator is unknown.
 
 A normal failure records the backend error and whether the previous dataset was preserved. The upload file is removed after a completed or failed build.
 
 If the service restarts while a job is already building, immutable publication still guarantees that the bucket is either on the old complete generation or the new complete generation. Because the process may have crashed just after publication but before final job-status persistence, the recovered job deliberately says to inspect `CURRENT` before retrying rather than claiming that retry is automatically safe.
 
-Incomplete uploads can survive an ordinary service restart and remain resumable. Abandoned uploading jobs expire after 24 hours and their staged file is removed.
+Incomplete uploads can survive an ordinary service restart and remain resumable. Abandoned uploading jobs expire after 24 hours; an hourly cleanup task marks them failed and removes their staged file. Chunk writes for one job are serialized, and if the server cannot persist the new byte offset after writing a chunk it truncates the upload back to the previously durable offset before returning an error.
 
 ## Duplicate behavior
 
@@ -121,7 +121,7 @@ CSV size grows
 
 The strict importer still performs disk-backed dictionary sorting and bounded row batches. Studio chunks are fixed-size. Append builds only the incoming delta rather than materializing the existing bucket in RAM.
 
-Peak disk usage during create includes the staged upload plus the generation being built. During append it includes the upload plus the incoming delta build and staging metadata. Existing generation files are normally hard-linked within the same data filesystem; on a filesystem where hard-linking is unavailable the existing clone helper can fall back to copying, which increases peak disk requirements.
+Peak disk usage during create includes the staged upload plus the generation being built. During append it includes the upload plus the incoming delta build and staging metadata. Before accepting a job, the service requires a conservative free-space floor of four times the declared CSV size plus 64 MiB. This is a safety floor, not a promise that every data distribution will fit: dictionary/index amplification can still require more. Existing generation files are normally hard-linked within the same data filesystem; on a filesystem where hard-linking is unavailable the existing clone helper can fall back to copying, which increases peak disk requirements.
 
 ## Reverse proxies
 

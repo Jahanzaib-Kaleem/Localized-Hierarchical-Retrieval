@@ -31,7 +31,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{fs as tokio_fs, io::AsyncWriteExt, sync::{OwnedSemaphorePermit, Semaphore}};
 
@@ -165,6 +165,7 @@ struct ServiceState {
     semaphore: Arc<Semaphore>,
     metrics: Arc<RuntimeMetrics>,
     next_request_id: Arc<AtomicU64>,
+    import_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
 }
 
 fn hash_token(token: &str) -> [u8; 32] { Sha256::digest(token.as_bytes()).into() }
@@ -470,6 +471,66 @@ fn run_import_job(root: PathBuf, config: CsvImportConfig, id: String) {
     let _ = save_import_job(&root, &job);
 }
 
+
+fn import_job_semaphore(state: &ServiceState, id: &str) -> io::Result<Arc<Semaphore>> {
+    let mut locks = state
+        .import_locks
+        .lock()
+        .map_err(|_| io::Error::other("import job lock map poisoned"))?;
+    Ok(locks
+        .entry(id.to_owned())
+        .or_insert_with(|| Arc::new(Semaphore::new(1)))
+        .clone())
+}
+
+async fn cleanup_expired_import_jobs(state: &ServiceState) {
+    let dir = import_jobs_dir(&state.root);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    let now = now_ms();
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(id) = entry
+            .path()
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Ok(semaphore) = import_job_semaphore(state, &id) else {
+            continue;
+        };
+        let Ok(_permit) = semaphore.acquire_owned().await else {
+            continue;
+        };
+        let Ok(mut job) = load_import_job(&state.root, &id) else {
+            continue;
+        };
+        if job.status == "uploading"
+            && now.saturating_sub(job.updated_at_ms) > IMPORT_JOB_MAX_AGE_MS
+        {
+            job.status = "failed".into();
+            job.stage = "failed".into();
+            job.error = Some("incomplete upload expired before it was resumed".into());
+            job.existing_dataset_preserved = true;
+            job.retry_safe = true;
+            job.updated_at_ms = now;
+            if let Ok(upload) = import_upload_path(&state.root, &id) {
+                let _ = fs::remove_file(upload);
+            }
+            let _ = save_import_job(&state.root, &job);
+        } else if matches!(job.status.as_str(), "complete" | "failed") {
+            if let Ok(upload) = import_upload_path(&state.root, &id) {
+                let _ = fs::remove_file(upload);
+            }
+        }
+    }
+}
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
 }
@@ -637,6 +698,21 @@ async fn import_job_create(
         .schema
         .validate()
         .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let available = fs2::available_space(&state.root)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let disk_floor = request
+        .bytes_total
+        .saturating_mul(4)
+        .saturating_add(64 * 1024 * 1024);
+    if disk_floor > available {
+        return Err(ApiError::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            guard.request_id,
+            format!(
+                "insufficient free space for a safe import build: need at least {disk_floor} bytes available for upload/build staging, found {available}"
+            ),
+        ));
+    }
     let bucket_root = selected_bucket_root(&state, &request.bucket, guard.request_id)?;
     match (request.mode, resolve_dataset_root(&bucket_root)) {
         (ImportMode::Create, Ok(_)) => {
@@ -717,6 +793,12 @@ async fn import_job_chunk(
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
+    let job_semaphore = import_job_semaphore(&state, &id)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let _job_permit = job_semaphore
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, guard.request_id, "import job lock closed"))?;
     if body.is_empty() || body.len() > IMPORT_CHUNK_BYTES {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -804,8 +886,15 @@ async fn import_job_chunk(
 
     job.bytes_received = next;
     job.updated_at_ms = now_ms();
-    save_import_job(&state.root, &job)
-        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    if let Err(error) = save_import_job(&state.root, &job) {
+        let _ = output.set_len(query.offset).await;
+        let _ = output.sync_data().await;
+        return Err(ApiError::new(
+            io_status(&error),
+            guard.request_id,
+            format!("failed to persist upload progress; chunk was rolled back: {error}"),
+        ));
+    }
     Ok(Json(json!({"request_id":guard.request_id,"result":job})))
 }
 
@@ -815,6 +904,12 @@ async fn import_job_complete(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
+    let job_semaphore = import_job_semaphore(&state, &id)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let _job_permit = job_semaphore
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, guard.request_id, "import job lock closed"))?;
     let mut job = load_import_job(&state.root, &id)
         .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
     if job.status != "uploading" {
@@ -1441,6 +1536,7 @@ pub async fn serve(root: impl AsRef<Path>, config: ServiceConfig) -> io::Result<
         root: root.as_ref().to_path_buf(), semaphore: Arc::new(Semaphore::new(config.max_concurrent_requests)),
         config: Arc::new(config.clone()), principals: Arc::new(principals), rates: Arc::new(Mutex::new(HashMap::new())),
         metrics: Arc::new(RuntimeMetrics::default()), next_request_id: Arc::new(AtomicU64::new(0)),
+        import_locks: Arc::new(Mutex::new(HashMap::new())),
     };
     // The control plane is allowed to start before a dataset exists. /readyz remains false and
     // data endpoints return ordinary errors until an initial generation is imported/published.
@@ -1463,9 +1559,21 @@ pub async fn serve(root: impl AsRef<Path>, config: ServiceConfig) -> io::Result<
         .route("/v1/admin/compact", post(compact)).route("/v1/admin/vacuum", post(vacuum)).route("/v1/admin/recover", post(recover))
         .route("/v1/admin/index/add", post(index_add)).route("/v1/admin/index/drop", post(index_drop)).route("/v1/admin/index/rebuild", post(index_rebuild))
         .fallback(studio)
-        .layer(DefaultBodyLimit::max(config.max_body_bytes)).with_state(state);
+        .layer(DefaultBodyLimit::max(config.max_body_bytes)).with_state(state.clone());
+    let cleanup_state = state.clone();
+    let cleanup_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            cleanup_expired_import_jobs(&cleanup_state).await;
+        }
+    });
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app).with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; }).await.map_err(io::Error::other)
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })
+        .await
+        .map_err(io::Error::other);
+    cleanup_task.abort();
+    result
 }
 
 #[cfg(test)]

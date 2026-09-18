@@ -278,12 +278,16 @@ fn external_sort_dictionary(
     Ok(())
 }
 
-fn first_pass(
+fn first_pass<F>(
     csv_path: &Path,
     schema: &DatasetSchema,
     stage: &Path,
     max_run_bytes: usize,
-) -> io::Result<(u64, Vec<u64>)> {
+    progress: &mut F,
+) -> io::Result<(u64, Vec<u64>)>
+where
+    F: FnMut(CsvImportProgress),
+{
     let temp = stage.join("temp").join("dictionaries");
     let dictionaries_dir = stage.join("dictionaries");
     fs::create_dir_all(&temp)?;
@@ -305,6 +309,12 @@ fn first_pass(
     let mut rows = 0u64;
     while reader.read_record(&mut record).map_err(csv_error)? {
         rows += 1;
+        if rows % 65_536 == 0 {
+            progress(CsvImportProgress {
+                stage: CsvImportStage::Parsing,
+                rows_parsed: Some(rows),
+            });
+        }
         for (column_index, column) in schema.columns.iter().enumerate() {
             let raw = record.get(map[column_index]).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "CSV record missing mapped field")
@@ -507,7 +517,7 @@ where
     schema.validate()?;
     progress(CsvImportProgress { stage: CsvImportStage::Parsing, rows_parsed: None });
     let (expected_rows, cardinalities) =
-        first_pass(csv_path, schema, stage, config.dictionary_run_bytes)?;
+        first_pass(csv_path, schema, stage, config.dictionary_run_bytes, progress)?;
 
     progress(CsvImportProgress { stage: CsvImportStage::Building, rows_parsed: Some(expected_rows) });
     let error = Rc::new(RefCell::new(None));
