@@ -1,7 +1,7 @@
 use crate::{
     abandon_generation, apply_mutations_delta, begin_generation, dataset_stats, import_csv,
-    leased_generation_ids, publish_generation, write_schema, CsvImportConfig, DatasetSchema,
-    GenerationInfo, Mutation, MutationConfig, MutationReport, VersionedDataset,
+    leased_generation_ids, publish_generation, resolve_dataset_root, write_schema, CsvImportConfig,
+    DatasetSchema, GenerationInfo, Mutation, MutationConfig, MutationReport, VersionedDataset,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -447,9 +447,16 @@ pub fn transfer_rows(
     let source_root = require_bucket_root(root, source)?;
     let destination_root = require_bucket_root(root, destination)?;
     let source_dataset = VersionedDataset::open(&source_root)?;
-    let destination_dataset = VersionedDataset::open(&destination_root)?;
-    if source_dataset.schema() != destination_dataset.schema() {
-        return Err(invalid("source and destination bucket schemas differ"));
+
+    let destination_dataset = match resolve_dataset_root(&destination_root) {
+        Ok(_) => Some(VersionedDataset::open(&destination_root)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(destination_dataset) = destination_dataset.as_ref() {
+        if source_dataset.schema() != destination_dataset.schema() {
+            return Err(invalid("source and destination bucket schemas differ"));
+        }
     }
 
     let unique: BTreeSet<u64> = row_ids.iter().copied().collect();
@@ -458,26 +465,104 @@ pub fn transfer_rows(
     }
     if move_rows && unique.len() as u64 >= source_dataset.visible_rows() {
         return Err(invalid(
-            "moving every row would create an empty LHR/1 bucket; combine/copy into a new bucket instead",
+            "moving every row would create an empty LHR/1 source bucket; rename the source bucket or copy/combine it instead",
         ));
     }
 
+    let mut selected = Vec::with_capacity(unique.len());
     let mut inserts = Vec::with_capacity(unique.len());
     for row_id in &unique {
         let values = source_dataset
             .row_values(*row_id)?
             .ok_or_else(|| invalid(format!("row_id {row_id} does not exist in source bucket")))?;
-        let values = source_dataset
+        let mutation_values = source_dataset
             .schema()
             .columns
             .iter()
-            .zip(values.into_iter())
+            .zip(values.iter().cloned())
             .map(|(column, value)| (column.name.clone(), value))
             .collect::<BTreeMap<_, _>>();
-        inserts.push(Mutation::Insert { values });
+        selected.push(values);
+        inserts.push(Mutation::Insert {
+            values: mutation_values,
+        });
     }
-    drop(destination_dataset);
-    let destination_report = apply_mutations_delta(&destination_root, &inserts, config)?;
+
+    let destination_report = if destination_dataset.is_some() {
+        drop(destination_dataset);
+        apply_mutations_delta(&destination_root, &inserts, config)?
+    } else {
+        let schema = source_dataset.schema().clone();
+        let sentinels = choose_null_sentinels(&schema, std::slice::from_ref(&source_dataset));
+        let mut import_schema = schema.clone();
+        for (column, sentinel) in sentinels.iter().enumerate() {
+            if let Some(sentinel) = sentinel {
+                import_schema.columns[column].null_values = vec![sentinel.clone()];
+            }
+        }
+
+        let temp_dir = root.join("temp");
+        fs::create_dir_all(&temp_dir)?;
+        let temp_csv = temp_dir.join(format!(
+            "bucket-transfer-{}-{}.csv",
+            std::process::id(),
+            now_ms()
+        ));
+        let write_result = (|| -> io::Result<()> {
+            let mut writer = csv::WriterBuilder::new()
+                .from_path(&temp_csv)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            writer
+                .write_record(schema.columns.iter().map(|column| column.name.as_str()))
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            for values in &selected {
+                let record: Vec<&str> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(column, value)| match value {
+                        Some(value) => value.as_str(),
+                        None => sentinels[column].as_deref().unwrap(),
+                    })
+                    .collect();
+                writer
+                    .write_record(record)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            }
+            writer
+                .flush()
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp_csv);
+            return Err(error);
+        }
+
+        let import_config = CsvImportConfig {
+            page_rows: CsvImportConfig::default().page_rows,
+            batch_rows: config.batch_rows,
+            max_sort_records: config.max_sort_records,
+            dictionary_run_bytes: config.dictionary_run_bytes,
+            accelerators: Vec::new(),
+        };
+        let generation = publish_csv_generation(
+            &destination_root,
+            &temp_csv,
+            &schema,
+            &import_schema,
+            &import_config,
+        );
+        let _ = fs::remove_file(&temp_csv);
+        let generation = generation?;
+        MutationReport {
+            generation,
+            rows_before: 0,
+            rows_after: selected.len() as u64,
+            inserted: selected.len() as u64,
+            updated: 0,
+            deleted: 0,
+            max_row_id: selected.len().checked_sub(1).map(|value| value as u64),
+        }
+    };
 
     let mut source_report = None;
     let mut warning = None;
