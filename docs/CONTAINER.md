@@ -5,10 +5,16 @@ LHR ships as one container image containing the Rust database/service and the pr
 ## One-command local start
 
 ```bash
-docker run -d --name lhr --restart unless-stopped -p 127.0.0.1:8787:8787 -v lhr-data:/data ghcr.io/jahanzaib-kaleem/lhr:latest
+docker run -d \
+  --name lhr \
+  --restart unless-stopped \
+  -p 127.0.0.1:8787:8787 \
+  -p 127.0.0.1:8788:8788 \
+  -v lhr-data:/data \
+  ghcr.io/jahanzaib-kaleem/lhr:latest
 ```
 
-Open `http://127.0.0.1:8787`.
+Open Studio at `http://127.0.0.1:8787`. MCP is available at `http://127.0.0.1:8788/mcp`.
 
 The container creates one administrator API token the first time a new data volume is used. Retrieve it with:
 
@@ -18,7 +24,9 @@ docker exec lhr cat /data/.lhr-admin-token
 
 Paste that token into **Studio → Settings → API credential**. The credential is kept in browser `sessionStorage`, not persistent browser storage.
 
-A fresh volume intentionally starts with `readyz = not_ready` until an initial dataset is imported. The control plane and Studio still start, so initialization failures do not make the container itself unreachable. Bulk imports remain local operations; mount/import the source and run the LHR CLI against `/data` rather than granting the HTTP API arbitrary filesystem-path access.
+A fresh volume intentionally starts with `readyz = not_ready` until at least one bucket has a published dataset. The control plane and Studio still start, so an empty installation remains administrable.
+
+Studio provides a bounded, authenticated streamed-CSV convenience import. Very large/offline imports and arbitrary filesystem-path ingestion remain local CLI operations; LHR does not turn the HTTP API into a general filesystem interface.
 
 ## Docker Compose
 
@@ -26,7 +34,7 @@ A fresh volume intentionally starts with `readyz = not_ready` until an initial d
 docker compose up -d
 ```
 
-The supplied Compose file binds Studio/API to host loopback and persists the catalog in the `lhr-data` volume.
+The supplied Compose file binds Studio/API and MCP to host loopback and persists the reserved default catalog, named buckets, credentials, telemetry, and updater control state in the `lhr-data` volume.
 
 ## Remote deployment
 
@@ -40,4 +48,12 @@ The runtime image sets `LHR_STUDIO_DIR=/opt/lhr/studio`. Axum serves those compi
 
 ## Image publishing
 
-The `LHR Container` workflow publishes `ghcr.io/jahanzaib-kaleem/lhr:studio` from the `lhr-studio` branch and `:latest` from `main`. Development-branch image builds are amd64 only to avoid wasting QEMU minutes; `main` and version tags publish amd64 + arm64.
+The `LHR Container` workflow currently publishes:
+
+- `ghcr.io/jahanzaib-kaleem/lhr:latest` from `main`;
+- `ghcr.io/jahanzaib-kaleem/lhr:mcp` from `mcp-control-plane`;
+- semantic version tags from `v*` refs.
+
+The `mcp-control-plane` build is amd64-only; `main` and version tags publish amd64 + arm64.
+
+The image workflow is path-filtered to runtime/image inputs (`rust/**`, `studio/**`, Docker files, and the workflow itself). Changes confined to `README.md` and `docs/**` do not request a GHCR rebuild.

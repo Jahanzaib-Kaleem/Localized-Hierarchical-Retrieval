@@ -77,7 +77,7 @@ Typical lead query arguments:
 }
 ```
 
-Use `next_cursor`/`after_row_id` rather than requesting huge result sets. An empty `filters` array is the database-browse operation and returns the next bounded page in stable logical-row order. Equality-only requests retain LHR's optimized exact-index route; other supported predicate families use deterministic bounded fallback when no dedicated exact accelerator exists.
+Use `next_cursor`/`after_row_id` rather than requesting huge result sets. An empty `filters` array is the database-browse operation and returns the next bounded page in stable logical-row order. Equality-only requests retain LHR's optimized exact-index route. A single bounded signed/unsigned integer range spanning at most 256 values can reuse exact singleton indexes when every visible layer has the required coverage; wider/open-ended/mixed ranges and other unsupported shapes retain the deterministic bounded versioned fallback.
 
 All dataset-specific MCP tools accept an optional `bucket` argument. Omitting it selects the compatibility bucket `default`.
 
@@ -165,7 +165,7 @@ MCP write/admin operations are appended to `audit/mcp-audit.jsonl` in the LHR vo
 
 ## Intentionally not exposed over MCP
 
-Bulk file ingestion and filesystem backup/restore paths remain local CLI/operator operations. Exposing arbitrary server paths to a remotely connected model would turn an MCP credential into a general filesystem capability and would make very large uploads a poor fit for the protocol.
+MCP intentionally does not expose bulk file ingestion or filesystem backup/restore paths. Studio has a separate authenticated HTTP convenience path for streamed CSV import, while very large/offline imports and all arbitrary server-path operations remain local CLI/operator capabilities. Exposing arbitrary server paths to a remotely connected model would turn an MCP credential into a general filesystem capability.
 
 Use the existing local CLI for those operations:
 

@@ -1,190 +1,279 @@
 # LHR Architecture
 
-This document describes the current architecture. For the experiments that led here, including rejected designs and benchmark-driven changes, see [`RESEARCH.md`](RESEARCH.md). For measurements, see [`BENCHMARKS.md`](BENCHMARKS.md).
+This document describes the architecture currently merged to `main`. Historical experiments, rejected designs, and benchmark-driven pivots live in [`RESEARCH.md`](RESEARCH.md); the first real-data investigation and later pagination/range experiments live in [`REAL_DATA_RESEARCH.md`](REAL_DATA_RESEARCH.md). Operational evolution is recorded in [`OPERATIONS_RESEARCH.md`](OPERATIONS_RESEARCH.md).
 
 ## Objective
 
-Localized Hierarchical Retrieval (LHR) is a deterministic exact-retrieval architecture for very large structured datasets under severe RAM constraints.
+Localized Hierarchical Retrieval (LHR) is a deterministic exact structured-data engine and operational database designed for unusually constrained hardware.
 
 The central trade is deliberate:
 
-> spend more work during ingestion, and some additional disk on carefully selected exact/routing structures, so queries touch as little data and allocate as little memory as practical.
+> spend more work during ingestion and carefully chosen extra disk on exact access structures so repeated queries touch as little data and allocate as little memory as practical.
 
-The target environment is a small Linux VPS with roughly 1 GB of physical RAM and disk-backed storage.
+The original target was a small Linux VPS with roughly 1 GiB of physical RAM and disk-backed storage. The architecture therefore optimizes bytes/work touched, bounded construction memory, stable exactness, and storage amplification together rather than optimizing only asymptotic operation counts.
+
+## System layers
+
+The current product has three distinct layers.
+
+1. **Retrieval/storage engine.** Tokenized immutable segments, mixed-radix keys, adaptive exact row indexes, conservative page routing, and the equality planner.
+2. **Versioned database layer.** Schemas/dictionaries, stable logical row IDs, immutable generation publication, delta layers, visibility/tombstones, compaction, integrity seals, recovery, backup/restore, and reader leases.
+3. **Product/control plane.** Bucket workspaces, typed query API, HTTP service, Studio, workload telemetry, metrics, and MCP.
+
+The project name reflects the page-localized/hierarchical research that produced the engine, but the modern fast path is usually adaptive exact row indexing and intersection. Hierarchical page routing remains an important conservative fallback rather than the only retrieval mechanism.
 
 ## Correctness model
 
-Canonical data is authoritative. Every optimization must preserve exactness.
+Exactness is the non-negotiable invariant.
 
-LHR has two classes of acceleration:
+LHR has three relevant query outcomes:
 
-1. **Exact row indexes.** If selected exact indexes fully cover all predicates, their intersection proves the result set and canonical verification is unnecessary.
-2. **Conservative page routing.** If exact indexes do not fully cover a query, page-level structures may return a superset of candidate pages. Canonical rows in those pages are then checked exactly.
+1. **Exact row proof.** Selected exact row indexes cover every predicate. Their intersection is the exact result set, so canonical row verification is unnecessary.
+2. **Candidate-row/page routing.** Indexes reduce the search space but do not prove every predicate. Surviving rows/pages are checked against canonical data.
+3. **Deterministic fallback.** Predicate shapes without a suitable accelerator are evaluated against the visible versioned database under explicit resource ceilings.
 
-An accelerator may be absent or inefficient. It may never be required for correctness.
+Accelerators may be absent, dropped, rebuilt, or changed in representation. None of those operations may change the correct logical result.
 
-## Dataset model
+## Buckets, catalogs, and generations
 
-Each dataset is independent.
+The appliance can host multiple independent database workspaces called **buckets**.
 
-External values are represented by deterministic integer tokens. The engine itself assigns no semantic importance to a token or column. Rows receive stable row addresses and are stored in canonical segments.
+The reserved `default` bucket is the original catalog root, preserving pre-bucket installations without a rewrite. Named buckets live under `buckets/<id>`. Each ready bucket is an independent LHR catalog with its own generations, indexes, deltas, visibility state, workload telemetry, and recovery history.
 
-Conceptually:
+A catalog contains immutable published generations and one atomic publication pointer:
 
 ```text
-Dataset
-├── manifest.json
-├── canonical/
-│   └── immutable/mmap-friendly row segments
-├── routing/
-│   ├── exact row indexes
-│   └── conservative page hierarchies
-└── temp/
-    └── bounded-memory build/sort intermediates
+<bucket-catalog>/
+  CURRENT
+  WRITER.lock
+  READERS/
+  generations/
+    00000000000000000001/
+    00000000000000000002/
 ```
 
-## Exact backbone
+Writers build unpublished state while holding the catalog writer lock. Publication verifies and seals the staged generation, renames it to its immutable generation ID, then atomically replaces `CURRENT`. Failed work never becomes visible merely because files were written.
 
-The production direction is an **exact singleton backbone plus selective multi-column accelerators**.
+Readers resolve `CURRENT` once and hold a snapshot lease on that generation. Publishing a newer generation does not change an in-flight reader's view.
 
-For each indexed column, a singleton exact hierarchy guarantees that a predicate on that column can participate in deterministic exact composition. Selected pair or wider hierarchies can then accelerate frequent or expensive combinations without becoming a completeness requirement.
+## Physical LHR/1 dataset
 
-This is why sparse graph topology is safe: connectivity affects speed, not whether a true row can be found.
+A physical generation is an `LHR/1` dataset. The exact file set varies depending on indexes and whether the generation contains an overlay, but conceptually it contains:
+
+```text
+generation/
+  manifest.json
+  schema.json
+  integrity.json
+  dictionaries/
+  canonical/
+  routing/
+  rowids.bin          # only when logical IDs are not identity-mapped
+  overlay.json        # when immutable delta layers exist
+  visibility.bin      # newest-layer/tombstone overrides
+  deltas/
+```
+
+Canonical segments store deterministic integer tokens. Per-column dictionaries translate between canonical external values and tokens. The engine does not assign hidden meaning to a field: logical type, nullability, normalization, and null literals are explicit schema configuration.
+
+## Keys and exact backbone
+
+Single-column indexes use the token directly as their key.
+
+For a compound index over columns with cardinalities `r0, r1, ...`, LHR deterministically packs the selected token tuple into one mixed-radix integer key. The operation is exact and reversible with respect to the configured cardinalities; it is not a hash and introduces no collision semantics.
+
+Every imported physical layer receives exact singleton coverage for every column. Optional pair/wider indexes are accelerators.
+
+This gives LHR an **exact singleton backbone plus selective multi-column accelerators**. Sparse accelerator topology can therefore affect speed without becoming a correctness requirement.
 
 ## Adaptive exact representations
 
-No one posting layout is optimal for every cardinality/density regime. LHR currently supports several exact row-index representations.
+No single posting layout is best for every density/cardinality regime. The exact builder chooses among several representations.
 
 ### `bitslice`
 
-Best for dense low/moderate-cardinality equality predicates.
+For dense low/moderate-cardinality singleton equality predicates.
 
-For a keyspace with `b` bits, the index stores `b` bit-planes across all rows. Equality is produced word-at-a-time. Two bit-sliced predicates can be intersected directly as machine-word masks before row IDs are materialized.
-
-This avoids decoding million-row singleton postings for low-cardinality values.
+A keyspace is represented by row-wide bit planes. Equality masks are reconstructed word-at-a-time, and two bit-sliced predicates can be intersected directly as machine-word masks before row IDs are materialized.
 
 ### `deltapost`
 
-Sorted row IDs are divided into fixed-size blocks. Each block stores its first row plus bit-packed **consecutive gaps**.
+For compressible sorted postings.
 
-The current format is the v3 layout (`LHRDPB3`). Intersections stream through compressed gaps directly against the current sorted seed rather than decoding the whole posting into a temporary vector.
+The current `LHRDPB3` layout stores fixed-size blocks as one absolute first row plus bit-packed consecutive gaps. When intersecting against an existing sorted candidate seed, gaps are decoded progressively instead of first materializing the entire posting list.
 
 ### `densepost`
 
-Uses dense keyspace addressing when the keyspace is compact enough that direct offsets are cheaper than sparse directory metadata.
+For keyspaces compact enough that dense offset addressing is efficient.
+
+The posting body is sorted by key/row and direct offsets identify each key's contiguous row interval. This representation also supports bounded seeking from a physical lower bound for the single-predicate pagination path.
 
 ### `flatpost`
 
-Stores sorted `(key,row)` records with minimal structural overhead. It is useful when theoretical keyspace cardinality is enormous but observed keys are sparse, especially high-cardinality pair accelerators.
+For sparse/high-cardinality keyspaces where a dense directory would be wasteful.
+
+It stores sorted `(key,row)` records and binary-searches key bounds.
 
 ### `postings`
 
-General sparse posting representation retained as a fallback candidate.
+A general sparse posting representation retained as another exact candidate.
 
-## Adaptive builder
+## Adaptive construction
 
 Exact-index construction is bounded-memory:
 
-1. scan canonical segments;
-2. emit `(key,row)` records to temporary spools;
-3. external-sort and deduplicate with bounded runs;
-4. measure/estimate candidate representation sizes;
-5. choose an appropriate exact layout;
-6. publish hierarchy metadata into the manifest.
+1. scan immutable canonical segments;
+2. emit `(key,row)` records into temporary spools;
+3. external-sort using bounded runs;
+4. measure the observed key distribution;
+5. estimate candidate layouts;
+6. measure real `deltapost` bytes because row locality affects compression;
+7. allow a limited storage premium for low/moderate-cardinality bit-slices when their expected query work is substantially better;
+8. write the chosen representation and publish its metadata.
 
-For delta compression, actual encoded size is measured because locality materially affects compression ratio.
+Representation selection is deterministic and data-driven. It does not depend on a field being called `country`, `industry`, or anything else.
 
-For low/moderate-cardinality singleton fields, representation choice also includes a query-work budget: a slightly larger bit-slice may be selected when it is expected to avoid far more posting decode/intersection work.
+## Equality planner
 
-## Query planner
+For encoded equality predicates, the engine:
 
-Given predicates `(column,value)`:
+1. validates columns/tokens and collapses impossible/conflicting predicates;
+2. finds every exact row hierarchy whose indexed columns are contained in the query;
+3. computes each candidate hierarchy's exact row count for its query key;
+4. repeatedly chooses the candidate with the best candidate-count/coverage-gain tradeoff for still-uncovered predicates;
+5. sorts the selected covering set by candidate count;
+6. if the first two selected indexes are bit-sliced, intersects their equality masks directly;
+7. otherwise materializes the smallest selected seed;
+8. progressively intersects the remaining selected indexes against the shrinking sorted seed;
+9. returns immediately when the selected exact indexes cover all predicates;
+10. verifies surviving candidates against canonical rows when exact coverage is incomplete.
 
-1. Reject an invalid column/value immediately.
-2. Deduplicate repeated predicates; conflicting values for the same column yield an empty result.
-3. Find every exact row hierarchy whose columns are contained in the query.
-4. Compute each hierarchy's exact row count for the query key.
-5. Greedily choose hierarchies by coverage gained relative to candidate count until no more query columns can be covered.
-6. Sort selected hierarchies by row count so composition starts from a small candidate set.
-7. If the first two are bit-sliced, intersect their equality masks directly.
-8. Intersect remaining selected indexes against the shrinking sorted row seed.
-9. If the selected exact indexes cover every query predicate, the surviving row set is exact and the engine returns it without canonical I/O.
-10. Otherwise, verify the exact predicates against those candidate rows.
+The planner can therefore combine overlapping indexes rather than requiring one monolithic compound index for every possible query shape.
 
-If there is no useful exact row plan, the engine falls back to page routing.
+## Typed query layer
 
-## Page-routing fallback
+The product query API sits above the encoded equality engine and preserves stable logical-row semantics across base + delta layers.
 
-Page hierarchies store conservative page membership rather than exact row membership. Multiple applicable page sets can be intersected before canonical data is touched.
+### Equality
 
-The invariant is one-sided:
+Equality-only queries retain the exact-index route. Cursor pagination translates `after_row_id` into a lower bound inside each immutable layer instead of replaying an ever-growing prefix.
 
-- false-positive candidate pages are allowed;
-- false-negative candidate pages are not.
+For one exact predicate backed by `bitslice` or `densepost`, the engine can additionally seek from the lower bound and produce at most the requested page while reading the total hit count directly from the index. Other representations and general multi-index plans still use the established candidate-materialization path.
 
-After routing, canonical rows are checked exactly.
+### Empty-filter browsing
 
-## Why overlapping hierarchies are allowed
+An empty filter list is the exact table-browse path used by Studio/API clients. It advances in stable logical-row order and materializes only the requested page.
 
-A single physical row order cannot make all useful query combinations contiguous. LHR therefore treats hierarchies as independent overlapping access paths.
+### Narrow bounded integer ranges
 
-The optimization problem is not "find the one correct tree." It is:
+A request containing exactly one bounded signed/unsigned integer range can avoid the general scan fallback when:
 
-> choose a small portfolio of exact/routing structures whose storage cost is justified by the query work they eliminate.
+- both bounds exist;
+- the interval spans at most 256 integer values;
+- the relevant column has exact singleton coverage in the base and every delta layer.
 
-Workload-aware pair selection can improve this further, but the storage format and correctness rules do not depend on learned or probabilistic behavior.
+The API expands the interval into disjoint exact equality streams, keeps only one head row per stream, and merges them by stable logical row ID. This adds no new on-disk range format.
 
-## Storage model
+### General set/range fallback
 
-Canonical records are stored once.
+Wider ranges, open-ended ranges, mixed set/range predicate shapes, and other unsupported cases use the deterministic visible-row fallback under explicit row-examination and timeout ceilings.
 
-Indexes store compact integer metadata, compressed row addresses, bit-planes, or page addresses depending on the representation.
+## Stable logical row IDs and deltas
 
-The principal storage metric is:
+Physical row position is separate from client-visible logical identity.
 
-```text
-index amplification = index bytes / canonical bytes
-```
+Routine mutations create immutable delta layers:
 
-Total dataset size relative to canonical is therefore:
+- an insert allocates a new monotonically increasing logical row ID;
+- an update writes a newer physical version under the same logical row ID;
+- a delete writes a tombstone;
+- `overlay.json` records immutable delta layers;
+- `visibility.bin` maps overridden logical IDs to their newest layer or deletion.
 
-```text
-total ratio = 1 + index amplification
-```
+The versioned reader combines the base and deltas and exposes exactly one visible version per logical row.
 
-The project optimizes both storage amplification and query work; minimizing one while ignoring the other has repeatedly produced bad designs.
+`lhr compact` streams visible rows in logical-row order into a clean physical base, rebuilds dictionaries/indexes, preserves logical IDs, and publishes the result as another immutable generation.
 
-## Memory model
+## Conservative page-routing fallback
 
-Canonical segments and indexes are mmap-friendly. Query-time resident memory should depend mainly on touched pages, candidate sets, and OS page-cache behavior rather than total database size.
+Page hierarchies store exact key-to-page membership rather than exact key-to-row membership. Routing is intentionally one-sided:
 
-Large posting materialization is specifically avoided where possible:
+- a page containing a true match must never be omitted;
+- extra candidate pages are allowed.
 
-- compressed postings intersect directly against an existing seed;
-- low-cardinality bit-slices intersect word-at-a-time;
-- sorted candidate lists are progressively reduced.
+Applicable page sets are intersected before canonical access. Rows inside surviving pages are then checked exactly.
+
+This preserves the original hierarchical/localized idea while allowing the modern exact-row layer to bypass page reads entirely for fully covered equality queries.
+
+## Memory and I/O model
+
+Large structures are mmap-friendly and builders use bounded batches/external sorting.
+
+The desired query-time behavior is that resident memory depends primarily on touched index/canonical pages and bounded candidate state rather than total database size. Important mechanisms include:
+
+- direct bit-slice mask composition;
+- compressed-posting intersection against an existing seed;
+- progressive candidate reduction;
+- cursor lower-bound seeking;
+- bounded page production for single `bitslice`/`densepost` predicates;
+- streaming visible-row iteration for compaction and fallback operations.
+
+Mmap virtual-address size is not itself a physical-RAM measurement. Production characterization therefore considers RSS/HWM, page faults, process reads, cache state, and whole-system behavior in addition to latency.
+
+## Durability and recovery
+
+The durable contract is now explicit rather than research-only.
+
+- Dataset format: `LHR/1`; unknown manifest versions are rejected.
+- Schema format: `LHR-SCHEMA/1`.
+- Published generations are immutable.
+- Stable files can be sealed with SHA-256 + byte length in `integrity.json`.
+- Recovery verifies published generations and can repoint `CURRENT` to the newest fully valid generation.
+- Backup/restore verify the copied/restored physical generation.
+- Reader leases prevent vacuum from unlinking an active snapshot.
+- Writers are serialized per catalog by `WRITER.lock`.
+
+See [`FORMAT.md`](FORMAT.md) and [`OPERATIONS.md`](OPERATIONS.md) for the durable/operational contract.
 
 ## Current measured state
 
-The current merged implementation has demonstrated, in CI synthetic tests:
+Synthetic CI currently validates exact retrieval at up to 10M rows across low-cardinality, mixed-cardinality, and lead-like distributions. Representative merged results include:
 
-- exact Hybrid7 retrieval at 10M rows around 1.65-1.68 ms median with ~1.445x index amplification;
-- adaptive mixed-cardinality retrieval at 10M rows around 0.027 ms median with ~0.500x index amplification;
-- lead-like 12-column retrieval at 10M rows around 0.06 ms median, with broad low-cardinality cases around ~1.9 ms and ~1.54x index amplification.
+- Hybrid-7 10M: ~1.65-1.68 ms median, ~1.445x index amplification;
+- mixed-cardinality adaptive 10M: ~0.027 ms median, ~0.500x index amplification;
+- lead-like 12-column 10M: ~0.06 ms median, ~1.54x index amplification.
 
-These are architecture-validation measurements, not production guarantees. See `BENCHMARKS.md` for methodology and caveats.
+The first non-synthetic Shopify run used 1,902,012 rows / 16 columns on the ~1 GiB VPS. It confirmed very fast warm exact equality paths but also exposed the narrow-range scan and deep-pagination problems that motivated PRs #20-#22. The preserved baseline predates those fixes and must not be rewritten as post-fix evidence.
 
-## Still intentionally unfrozen
+See [`BENCHMARKS.md`](BENCHMARKS.md), [`REAL_DATA_RESEARCH.md`](REAL_DATA_RESEARCH.md), and [`../benchmarks/REAL_DATA_SHOPIFY_1_9M_BASELINE.md`](../benchmarks/REAL_DATA_SHOPIFY_1_9M_BASELINE.md).
 
-The following remain research/production-hardening areas:
+## Frozen contract vs tunable internals
 
-- final dictionary format and external-value storage;
-- update/compaction policy;
-- checksums and crash recovery;
-- format compatibility guarantees;
-- workload-driven accelerator selection;
-- concurrency;
-- cold-cache I/O behavior;
-- exact production behavior at 25M/50M/70M+ rows on the target VPS.
+The project is no longer "unfrozen" in the broad sense used by early research notes.
 
-The exactness invariant is frozen. Representation and topology remain tunable.
+Frozen/current contracts include:
+
+- deterministic exactness;
+- explicit `LHR/1` compatibility checking;
+- stable logical row-ID semantics;
+- immutable generation publication/recovery rules;
+- explicit schema/dictionary canonicalization behavior.
+
+Still tunable without changing correctness include:
+
+- which optional multi-column accelerators exist;
+- which compatible exact representation a rebuilt index chooses;
+- workload-driven accelerator recommendations;
+- page size/build resource settings within the supported format.
+
+## Current limits and research frontier
+
+Important limits should be stated explicitly:
+
+- Current LHR/1 exact row-posting families use local `u32` physical row IDs. One physical layer therefore cannot address more than `u32::MAX` rows. Widening those structures silently would violate the format contract.
+- The D0 multi-shard composition prototype described in `REAL_DATA_RESEARCH.md` is **research only and not merged architecture**. A durable design still needs cross-shard snapshot/publication, mutation routing, global-ID allocation, integrity, compaction, and telemetry semantics.
+- Bounded single-exact pagination currently specializes `bitslice` and `densepost`. `deltapost`, `flatpost`, generic `postings`, and general multi-index plans can still materialize a full final candidate vector before a small result page is taken.
+- Only the narrow single bounded integer-range shape has the zero-new-storage equality-decomposition optimization. Broad/open-ended/mixed ranges still use the deterministic scan fallback.
+- 25M/50M/70M+ builds, cold-cache/block-device behavior, long-running mixed write/read/compaction workloads, and post-fix real Shopify reruns remain validation work.
+
+These are engineering/scale frontiers, not missing correctness semantics.

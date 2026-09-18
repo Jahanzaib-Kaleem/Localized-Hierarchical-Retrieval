@@ -8,9 +8,9 @@ The safe default is loopback-only HTTP (`127.0.0.1:8787`). A non-loopback bind i
 
 Remote listeners also require at least one API key. Keys have one of three roles:
 
-- `read`: query, stats, workload, generations, metrics;
-- `write`: all read operations plus mutations;
-- `admin`: all operations including imports, compaction, vacuum, recovery, and index changes.
+- `read`: bucket discovery, query, stats, workload, generations, metrics;
+- `write`: all read operations plus row mutations and selected-row bucket transfers;
+- `admin`: all operations including imports, bucket management/combine, compaction, vacuum, recovery, and index changes.
 
 Bearer tokens are hashed before lookup and are never written to telemetry or audit logs.
 
@@ -52,31 +52,45 @@ For a reverse-proxy deployment, bind LHR to a private/loopback listener whenever
 ### Liveness / readiness
 
 - `GET /healthz` — process liveness; intentionally unauthenticated for local orchestrators.
-- `GET /readyz` — opens the logical dataset and reports whether the service is ready to answer queries.
+- `GET /readyz` — reports ready when at least one bucket contains a readable published dataset; an empty fresh appliance remains `not_ready` while Studio/control-plane routes stay available.
 
 ### Read API
 
-- `POST /v1/query` — typed exact query protocol.
-- `GET /v1/stats` — schema/index/storage statistics.
-- `GET /v1/workload` — persistent workload telemetry, latency percentiles, and index recommendations.
-- `GET /v1/generations` — immutable generation catalog.
-- `GET /metrics` — Prometheus text exposition.
+- `GET /v1/buckets` — list the reserved default bucket and named bucket workspaces.
+- `POST /v1/query` — bucket-aware typed exact query protocol.
+- `GET /v1/stats?bucket=<id>` — schema/index/storage statistics.
+- `GET /v1/workload?bucket=<id>` — persistent workload telemetry, latency percentiles, and index recommendations.
+- `GET /v1/generations?bucket=<id>` — immutable generation catalog.
+- `GET /metrics` — Prometheus text exposition including aggregate bucket gauges.
 
 ### Write API
 
-- `POST /v1/mutate` — atomic insert/update/delete transaction implemented as an immutable delta layer plus visibility/tombstone changes.
+- `POST /v1/mutate` — bucket-aware atomic insert/update/delete transaction implemented as an immutable delta layer plus visibility/tombstone changes.
+- `POST /v1/buckets/transfer` — copy or move selected stable logical row IDs between buckets.
 
 ### Administrative API
 
-- `POST /v1/admin/import/csv` — streamed multipart CSV import used by Studio; publishes a new immutable generation after the normal exact import/verification pipeline succeeds.
+- `POST /v1/admin/import/csv` — streamed multipart CSV import used by Studio; publishes a new immutable generation inside the selected bucket after the normal exact import/verification pipeline succeeds.
 - `POST /v1/admin/compact`
 - `POST /v1/admin/vacuum`
 - `POST /v1/admin/recover`
 - `POST /v1/admin/index/add`
 - `POST /v1/admin/index/drop`
 - `POST /v1/admin/index/rebuild`
+- `POST /v1/admin/buckets/create`
+- `POST /v1/admin/buckets/rename`
+- `POST /v1/admin/buckets/delete`
+- `POST /v1/admin/buckets/combine`
 
 Filesystem-path operations such as arbitrary backup/restore destinations are intentionally kept out of the network API. They remain local administrative CLI operations so a compromised HTTP credential cannot be turned directly into arbitrary filesystem reads/writes.
+
+### Bucket selection
+
+Dataset-specific operations default to the reserved `default` bucket when no bucket is supplied.
+
+JSON request bodies such as `/v1/query`, `/v1/mutate`, compaction, vacuum, and index administration carry a `bucket` field. Read metadata endpoints use the `?bucket=<id>` query parameter. Studio CSV multipart import carries a `bucket` form field.
+
+Named buckets are independent catalogs rather than table namespaces inside one physical generation. See [`BUCKETS.md`](BUCKETS.md) for create/delete/combine/transfer semantics.
 
 ### Studio CSV import
 
@@ -84,7 +98,7 @@ Filesystem-path operations such as arbitrary backup/restore destinations are int
 
 The upload path is deliberately disk-first:
 
-1. the multipart file is consumed in chunks and written to `<catalog>/temp/studio-uploads/`;
+1. the multipart file is consumed in chunks and written to `<service-root>/temp/studio-uploads/`;
 2. bytes are counted against `max_import_bytes` while streaming;
 3. the uploaded schema is parsed and validated as `LHR-SCHEMA/1`;
 4. the temporary file is passed to the existing two-pass `import_csv` engine;
@@ -101,6 +115,7 @@ Example equality request:
 
 ```json
 {
+  "bucket": "default",
   "filters": [
     {"op": "eq", "column": "country", "value": "pk"},
     {"op": "eq", "column": "industry", "value": "biotech"}
@@ -163,7 +178,9 @@ Entries include timestamp, request ID, API-key ID, action, success/failure, and 
 - minor/major page faults (Linux);
 - process bytes read/written (Linux);
 - active snapshot generations;
-- dataset row count and canonical/routing/total bytes.
+- bucket count and ready-bucket count;
+- aggregate visible rows and aggregate bucket storage;
+- legacy default-bucket row count and canonical/routing/total bytes.
 
 Persistent per-query telemetry is separate from process counters. It records query shape, latency, rows examined, pages touched, hierarchy lookups, optimized-route use, and planner-selected exact indexes. `lhr workload` and `/v1/workload` aggregate this into P50/P95/P99 and candidate accelerator recommendations.
 
@@ -171,7 +188,7 @@ Persistent per-query telemetry is separate from process counters. It records que
 
 The database is generation-based. Readers pin a generation with a snapshot lease; publication of a new generation does not change an in-flight reader's view. Lease-aware vacuum will not remove a generation still held by an active reader.
 
-Writers still obey the catalog's single-writer publication lock. Expensive imports, mutations, compaction, recovery, and index administration run outside the async HTTP executor on blocking worker threads after any network upload has been streamed to disk.
+Writers still obey each selected bucket catalog's single-writer publication lock. Named buckets have independent catalogs/locks, while multi-bucket transfer/combine operations preserve their own validation/publication rules. Expensive imports, mutations, compaction, recovery, and index administration run outside the async HTTP executor on blocking worker threads after any network upload has been streamed to disk.
 
 ## Graceful shutdown
 

@@ -2,7 +2,7 @@
 
 This document explains how Localized Hierarchical Retrieval (LHR) evolved, what was tried, what failed, which measurements changed direction, and why the current architecture looks the way it does.
 
-It is intentionally chronological. `README.md` is the project entry point, `ARCHITECTURE.md` describes the current design, and `BENCHMARKS.md` is the compact benchmark ledger.
+It is intentionally chronological and primarily records the original retrieval/index phase. `README.md` is the project entry point, `ARCHITECTURE.md` describes the current design, and `BENCHMARKS.md` is the compact benchmark ledger. Later database/product evolution is recorded in [`OPERATIONS_RESEARCH.md`](OPERATIONS_RESEARCH.md), while the first real-data phase and the PR #20-#22 pagination/range work are recorded in [`REAL_DATA_RESEARCH.md`](REAL_DATA_RESEARCH.md).
 
 ## 1. Original problem
 
@@ -368,23 +368,33 @@ The largest lessons so far are:
 - Small representation-specific storage increases are worthwhile when they remove a dominant CPU path.
 - The engine should adapt representation by cardinality/density rather than assigning semantic meaning to fields.
 
-## 18. Important caveats
+## 18. Status of the original caveats
 
-The strongest numbers are still CI/synthetic benchmarks. They are evidence that the architecture works, not proof of final production behavior.
+At the end of this retrieval/index phase, several production questions were still open. They should be read as **historical remaining work at that point**, not as the current repository status.
 
-Remaining validation:
+Subsequent merged work has since implemented:
 
-- actual 1 GB Oracle VPS behavior;
-- cold-cache and block-device I/O;
-- sustained RSS/page-fault behavior under repeated queries;
-- realistic lead dictionaries and token widths;
-- 25M, 50M, and 70M+ row builds;
-- update/compaction strategy;
-- crash recovery/checksums/format freeze;
-- concurrent readers/writers;
-- real query-frequency-driven accelerator selection.
+- explicit schema + mmap dictionary handling;
+- immutable generation publication and stable logical row IDs;
+- append-only delta mutations plus explicit streaming compaction;
+- SHA-256 integrity seals, verified backup/restore, rollback, and recovery;
+- snapshot reader leases and lease-aware vacuum;
+- serialized writer concurrency through per-catalog locks;
+- an explicit `LHR/1` format compatibility contract that rejects unknown dataset versions;
+- workload telemetry and accelerator recommendations;
+- the HTTP service, Studio, buckets, and MCP control plane.
 
-The 10M lead-like canonical row is 12 `u32` tokens (~48 bytes/row), which is far more realistic than the original 8-byte synthetic row, but it is still not a full real lead record with dictionaries and external fields.
+The important retrieval/scale validation that still remains includes:
+
+- larger 25M/50M/70M+ end-to-end builds;
+- cold-cache and block-device I/O on the target low-RAM host;
+- sustained RSS/HWM/page-fault behavior under repeated real workloads;
+- broader real lead-data distributions;
+- post-fix reruns of the Shopify range/pagination matrix;
+- general bounded/streaming result production for exact representations and multi-index plans that can still materialize large final candidate vectors;
+- a durable design beyond the current LHR/1 local `u32` physical-row addressing ceiling.
+
+The 10M lead-like canonical row is 12 `u32` tokens (~48 bytes/row), which is far more realistic than the original 8-byte synthetic row, but it is still not a full real lead record with dictionaries and external fields. The first non-synthetic Shopify generation and the scale-ceiling investigation are documented in [`REAL_DATA_RESEARCH.md`](REAL_DATA_RESEARCH.md).
 
 ## 19. Development milestones
 
@@ -396,4 +406,4 @@ Important experiment/implementation milestones include:
 - PR #3 — compressed/adaptive exact-posting work merged into `main`
 - PR #4 — scale hardening, sparse flat postings, lead-like benchmarks, and medium-cardinality bit-slice tuning merged into `main`
 
-The current merged code should be treated as the implementation reference; this document records the reasoning that produced it.
+The current merged code and [`ARCHITECTURE.md`](ARCHITECTURE.md) should be treated as the implementation reference. This document records the reasoning that produced the original retrieval architecture; later accepted research continues in [`REAL_DATA_RESEARCH.md`](REAL_DATA_RESEARCH.md).
