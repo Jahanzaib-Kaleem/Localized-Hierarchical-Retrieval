@@ -95,44 +95,44 @@ fn all_tools() -> Vec<(ServiceRole, Value)> {
         (ServiceRole::Read, json!({
             "name":"lhr_row","title":"Fetch row",
             "description":"Fetch one visible logical row by stable row ID.",
-            "inputSchema":{"type":"object","required":["row_id"],"properties":{"row_id":{"type":"integer","minimum":0}},"additionalProperties":false},
+            "inputSchema":{"type":"object","required":["row_id"],"properties":{"bucket":{"type":"string","default":"default"},"row_id":{"type":"integer","minimum":0}},"additionalProperties":false},
             "annotations":annotation(true,false,true)
         })),
         (ServiceRole::Read, json!({
             "name":"lhr_schema","title":"Schema",
             "description":"Return the current logical schema including types, nullability, normalization and null literals.",
-            "inputSchema":empty_schema(),"annotations":annotation(true,false,true)
+            "inputSchema":bucket_only_schema(),"annotations":annotation(true,false,true)
         })),
         (ServiceRole::Read, json!({
             "name":"lhr_stats","title":"Dataset statistics",
             "description":"Return row/page counts, canonical/routing/total bytes, column cardinalities and index metadata.",
-            "inputSchema":empty_schema(),"annotations":annotation(true,false,true)
+            "inputSchema":bucket_only_schema(),"annotations":annotation(true,false,true)
         })),
         (ServiceRole::Read, json!({
             "name":"lhr_explain","title":"Explain exact route",
             "description":"Explain equality routing across base and delta layers without changing data.",
-            "inputSchema":{"type":"object","required":["predicates"],"properties":{"predicates":{"type":"array","minItems":1,"items":{"type":"object","required":["column"],"properties":{"column":{"type":"string"},"value":{"type":["string","null"]}},"additionalProperties":false}}},"additionalProperties":false},
+            "inputSchema":{"type":"object","required":["predicates"],"properties":{"bucket":{"type":"string","default":"default"},"predicates":{"type":"array","minItems":1,"items":{"type":"object","required":["column"],"properties":{"column":{"type":"string"},"value":{"type":["string","null"]}},"additionalProperties":false}}},"additionalProperties":false},
             "annotations":annotation(true,false,true)
         })),
         (ServiceRole::Read, json!({
             "name":"lhr_workload","title":"Workload telemetry",
             "description":"Return observed query shapes, latency percentiles, index usage and workload-based accelerator recommendations.",
-            "inputSchema":empty_schema(),"annotations":annotation(true,false,true)
+            "inputSchema":bucket_only_schema(),"annotations":annotation(true,false,true)
         })),
         (ServiceRole::Read, json!({
             "name":"lhr_generations","title":"Generations",
             "description":"List immutable generations, CURRENT state and actively leased generations.",
-            "inputSchema":empty_schema(),"annotations":annotation(true,false,true)
+            "inputSchema":bucket_only_schema(),"annotations":annotation(true,false,true)
         })),
         (ServiceRole::Read, json!({
             "name":"lhr_indexes","title":"Indexes",
             "description":"List current exact/routing indexes and their representation/storage metadata.",
-            "inputSchema":empty_schema(),"annotations":annotation(true,false,true)
+            "inputSchema":bucket_only_schema(),"annotations":annotation(true,false,true)
         })),
         (ServiceRole::Read, json!({
             "name":"lhr_diagnostics","title":"Runtime diagnostics",
             "description":"Inspect process RSS, page faults, disk I/O, filesystem capacity, MCP counters and current dataset storage state.",
-            "inputSchema":empty_schema(),"annotations":annotation(true,false,true)
+            "inputSchema":bucket_only_schema(),"annotations":annotation(true,false,true)
         })),
         (ServiceRole::Read, json!({
             "name":"lhr_benchmark_query","title":"Benchmark query",
@@ -143,30 +143,83 @@ fn all_tools() -> Vec<(ServiceRole, Value)> {
         (ServiceRole::Read, json!({
             "name":"lhr_verify","title":"Verify dataset",
             "description":"Run structural and versioned integrity verification. This is read-only but can be disk-intensive on very large datasets.",
-            "inputSchema":empty_schema(),"annotations":annotation(true,false,true)
+            "inputSchema":bucket_only_schema(),"annotations":annotation(true,false,true)
         })),
         (ServiceRole::Write, json!({
             "name":"lhr_mutate","title":"Mutate rows",
             "description":"Apply insert/update/delete operations as one crash-safe immutable delta transaction.",
-            "inputSchema":{"type":"object","required":["mutations"],"properties":{"mutations":{"type":"array","minItems":1,"items":{"type":"object"}},"options":{"type":"object","properties":{"batch_rows":{"type":"integer","minimum":1},"max_sort_records":{"type":"integer","minimum":1},"dictionary_run_bytes":{"type":"integer","minimum":1}},"additionalProperties":false}},"additionalProperties":false},
+            "inputSchema":{"type":"object","required":["mutations"],"properties":{"bucket":{"type":"string","default":"default"},"mutations":{"type":"array","minItems":1,"items":{"type":"object"}},"options":{"type":"object","properties":{"batch_rows":{"type":"integer","minimum":1},"max_sort_records":{"type":"integer","minimum":1},"dictionary_run_bytes":{"type":"integer","minimum":1}},"additionalProperties":false}},"additionalProperties":false},
             "annotations":annotation(false,true,false)
         })),
         (ServiceRole::Admin, json!({
             "name":"lhr_compact","title":"Compact dataset",
             "description":"Merge immutable delta layers into a clean base generation using bounded-memory compaction.",
-            "inputSchema":{"type":"object","properties":{"options":{"type":"object","properties":{"batch_rows":{"type":"integer","minimum":1},"max_sort_records":{"type":"integer","minimum":1},"dictionary_run_bytes":{"type":"integer","minimum":1}},"additionalProperties":false}},"additionalProperties":false},
+            "inputSchema":{"type":"object","properties":{"bucket":{"type":"string","default":"default"},"options":{"type":"object","properties":{"batch_rows":{"type":"integer","minimum":1},"max_sort_records":{"type":"integer","minimum":1},"dictionary_run_bytes":{"type":"integer","minimum":1}},"additionalProperties":false}},"additionalProperties":false},
             "annotations":annotation(false,true,false)
         })),
         (ServiceRole::Admin, json!({
             "name":"lhr_vacuum","title":"Vacuum generations",
             "description":"Remove old unleased generations while preserving CURRENT, retained and explicitly protected generations.",
-            "inputSchema":{"type":"object","properties":{"retain":{"type":"integer","minimum":1,"default":2},"protect":{"type":"array","items":{"type":"integer","minimum":1}}},"additionalProperties":false},
+            "inputSchema":{"type":"object","properties":{"bucket":{"type":"string","default":"default"},"retain":{"type":"integer","minimum":1,"default":2},"protect":{"type":"array","items":{"type":"integer","minimum":1}}},"additionalProperties":false},
             "annotations":annotation(false,true,false)
         })),
         (ServiceRole::Admin, json!({
             "name":"lhr_recover","title":"Recover catalog",
             "description":"Verify published generations and repoint CURRENT to the newest fully valid generation when recovery is required.",
             "inputSchema":empty_schema(),"annotations":annotation(false,true,false)
+        })),
+
+        (ServiceRole::Read, json!({
+            "name":"lhr_buckets","title":"List buckets",
+            "description":"List the reserved default bucket and all named LHR data buckets with readiness, row count, column count and storage.",
+            "inputSchema":empty_schema(),"annotations":annotation(true,false,true)
+        })),
+        (ServiceRole::Write, json!({
+            "name":"lhr_bucket_transfer_rows","title":"Transfer rows between buckets",
+            "description":"Copy or move selected logical rows between two ready buckets with identical schemas. Cross-bucket moves are copy-first so a source-delete failure cannot lose data.",
+            "inputSchema":{"type":"object","required":["source","destination","row_ids"],"properties":{
+                "source":{"type":"string"},"destination":{"type":"string"},
+                "row_ids":{"type":"array","minItems":1,"items":{"type":"integer","minimum":0}},
+                "move_rows":{"type":"boolean","default":false}
+            },"additionalProperties":false},
+            "annotations":annotation(false,true,false)
+        })),
+        (ServiceRole::Admin, json!({
+            "name":"lhr_bucket_create","title":"Create bucket",
+            "description":"Create an empty named LHR bucket. Import data into it before querying it.",
+            "inputSchema":{"type":"object","required":["id","name"],"properties":{"id":{"type":"string"},"name":{"type":"string"}},"additionalProperties":false},
+            "annotations":annotation(false,false,false)
+        })),
+        (ServiceRole::Admin, json!({
+            "name":"lhr_bucket_rename","title":"Rename bucket",
+            "description":"Change a named bucket's display name without rewriting its data or changing its stable bucket id.",
+            "inputSchema":{"type":"object","required":["id","name"],"properties":{"id":{"type":"string"},"name":{"type":"string"}},"additionalProperties":false},
+            "annotations":annotation(false,false,true)
+        })),
+        (ServiceRole::Admin, json!({
+            "name":"lhr_bucket_delete","title":"Delete bucket",
+            "description":"Delete a named bucket and all of its generations. The reserved default bucket cannot be deleted. confirm must exactly equal id.",
+            "inputSchema":{"type":"object","required":["id","confirm"],"properties":{"id":{"type":"string"},"confirm":{"type":"string"}},"additionalProperties":false},
+            "annotations":annotation(false,true,false)
+        })),
+        (ServiceRole::Admin, json!({
+            "name":"lhr_bucket_combine","title":"Combine buckets",
+            "description":"Stream all visible rows from one or more same-schema source buckets into a new bucket using one bounded-memory import build.",
+            "inputSchema":{"type":"object","required":["sources","target_id","target_name"],"properties":{
+                "sources":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string"}},
+                "target_id":{"type":"string"},"target_name":{"type":"string"}
+            },"additionalProperties":false},
+            "annotations":annotation(false,false,false)
+        })),
+        (ServiceRole::Admin, json!({
+            "name":"lhr_update_status","title":"Software update status",
+            "description":"Return whether the host-side LHR updater is installed, whether an update request is pending, and the last updater status.",
+            "inputSchema":empty_schema(),"annotations":annotation(true,false,true)
+        })),
+        (ServiceRole::Admin, json!({
+            "name":"lhr_update","title":"Update LHR software",
+            "description":"Request a host-side in-place upgrade to the newest published LHR image. The host updater uses the same persistent-data-safe installer and may briefly restart this MCP connection.",
+            "inputSchema":empty_schema(),"annotations":annotation(false,false,true)
         })),
         (ServiceRole::Admin, index_tool("lhr_index_add","Add accelerator","Add an exact multi-column accelerator index.",false)),
         (ServiceRole::Admin, index_tool("lhr_index_drop","Drop accelerator","Drop an exact multi-column accelerator while retaining the singleton correctness backbone.",true)),
@@ -200,7 +253,23 @@ pub(super) fn tool_error(message: impl Into<String>) -> Value {
 
 #[derive(Debug, Deserialize)]
 struct RowArgs {
+    #[serde(default = "default_bucket")]
+    bucket: String,
     row_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BucketArgs {
+    #[serde(default = "default_bucket")]
+    bucket: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BucketQueryArgs {
+    #[serde(default = "default_bucket")]
+    bucket: String,
+    #[serde(flatten)]
+    request: QueryRequest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +281,8 @@ struct EqPredicateArg {
 
 #[derive(Debug, Deserialize)]
 struct ExplainArgs {
+    #[serde(default = "default_bucket")]
+    bucket: String,
     predicates: Vec<EqPredicateArg>,
 }
 
@@ -224,6 +295,8 @@ struct WriteOptions {
 
 #[derive(Debug, Deserialize)]
 struct MutationArgs {
+    #[serde(default = "default_bucket")]
+    bucket: String,
     mutations: Vec<Mutation>,
     #[serde(default)]
     options: WriteOptions,
@@ -231,12 +304,16 @@ struct MutationArgs {
 
 #[derive(Debug, Deserialize, Default)]
 struct CompactArgs {
+    #[serde(default = "default_bucket")]
+    bucket: String,
     #[serde(default)]
     options: WriteOptions,
 }
 
 #[derive(Debug, Deserialize)]
 struct VacuumArgs {
+    #[serde(default = "default_bucket")]
+    bucket: String,
     #[serde(default = "default_retain")]
     retain: usize,
     #[serde(default)]
@@ -249,6 +326,8 @@ fn default_retain() -> usize {
 
 #[derive(Debug, Deserialize)]
 struct IndexArgs {
+    #[serde(default = "default_bucket")]
+    bucket: String,
     columns: Vec<String>,
     #[serde(default)]
     max_sort_records: Option<usize>,
@@ -256,7 +335,7 @@ struct IndexArgs {
 
 #[derive(Debug, Deserialize)]
 struct BenchmarkArgs {
-    request: QueryRequest,
+    request: BucketQueryArgs,
     #[serde(default = "default_iterations")]
     iterations: usize,
     #[serde(default = "default_warmup")]
