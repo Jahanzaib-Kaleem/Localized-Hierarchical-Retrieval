@@ -77,6 +77,34 @@ export type CsvImportReport = {
   exact_hierarchies: number
 }
 
+export type CsvAppendReport = {
+  generation: GenerationInfo
+  rows_before: number
+  appended: number
+  rows_after: number
+  max_row_id: number | null
+}
+
+export type CsvImportResult = CsvImportReport | CsvAppendReport
+export type ImportMode = 'create' | 'append'
+export type ImportJobStatus = {
+  id: string
+  bucket: string
+  mode: ImportMode
+  status: 'uploading' | 'queued' | 'running' | 'complete' | 'failed'
+  stage: 'uploading' | 'queued' | 'validating' | 'parsing' | 'building' | 'indexing' | 'publishing' | 'complete' | 'failed'
+  file_name: string
+  bytes_received: number
+  bytes_total: number
+  rows_parsed: number | null
+  result: CsvImportResult | null
+  error: string | null
+  existing_dataset_preserved: boolean
+  retry_safe: boolean
+  updated_at_ms: number
+  schema: ImportDatasetSchema
+}
+
 export type NamedValue = { column: string; value: string | null }
 export type QueryFilter =
   | { op: 'eq'; column: string; value: string | null }
