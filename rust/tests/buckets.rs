@@ -66,9 +66,12 @@ fn legacy_default_and_named_bucket_workflows_are_compatible() {
 
     create_bucket(root.path(), "qualified", "Qualified").unwrap();
     let qualified_root = bucket_root(root.path(), "qualified").unwrap();
-    let qualified_seed = root.path().join("qualified.csv");
-    fs::write(&qualified_seed, "email,country\nseed@example.com,pk\n").unwrap();
-    import_csv(&qualified_root, &qualified_seed, &schema(), &import_config()).unwrap();
+    assert!(!list_buckets(root.path())
+        .unwrap()
+        .into_iter()
+        .find(|bucket| bucket.id == "qualified")
+        .unwrap()
+        .ready);
 
     let copy = transfer_rows(
         root.path(),
@@ -80,7 +83,9 @@ fn legacy_default_and_named_bucket_workflows_are_compatible() {
     )
     .unwrap();
     assert_eq!(copy.rows_requested, 1);
-    assert_eq!(dataset_stats(&qualified_root).unwrap().rows, 2);
+    assert_eq!(copy.destination_report.rows_before, 0);
+    assert_eq!(copy.destination_report.rows_after, 1);
+    assert_eq!(dataset_stats(&qualified_root).unwrap().rows, 1);
     assert_eq!(dataset_stats(root.path()).unwrap().rows, 2);
 
     let moved = transfer_rows(
@@ -94,7 +99,7 @@ fn legacy_default_and_named_bucket_workflows_are_compatible() {
     .unwrap();
     assert!(moved.warning.is_none());
     assert_eq!(dataset_stats(root.path()).unwrap().rows, 1);
-    assert_eq!(dataset_stats(&qualified_root).unwrap().rows, 3);
+    assert_eq!(dataset_stats(&qualified_root).unwrap().rows, 2);
 
     let combined = combine_buckets(
         root.path(),
@@ -104,6 +109,6 @@ fn legacy_default_and_named_bucket_workflows_are_compatible() {
         &import_config(),
     )
     .unwrap();
-    assert_eq!(combined.rows, 4);
-    assert_eq!(dataset_stats(bucket_root(root.path(), "combined").unwrap()).unwrap().rows, 4);
+    assert_eq!(combined.rows, 3);
+    assert_eq!(dataset_stats(bucket_root(root.path(), "combined").unwrap()).unwrap().rows, 3);
 }
