@@ -3,6 +3,32 @@ export type ApiFailure = { error: string; request_id?: number }
 export type HealthResponse = { status: 'ok' }
 export type ReadyResponse = { status: 'ready' | 'not_ready'; error?: string }
 
+export type BucketInfo = {
+  id: string
+  name: string
+  is_default: boolean
+  ready: boolean
+  rows: number
+  columns: number
+  total_bytes: number
+}
+
+export type BucketCombineReport = {
+  target: BucketInfo
+  sources: string[]
+  rows: number
+}
+
+export type BucketTransferReport = {
+  source: string
+  destination: string
+  mode: 'copy' | 'move'
+  rows_requested: number
+  destination_report: MutationReport
+  source_report: MutationReport | null
+  warning: string | null
+}
+
 export type ColumnStats = {
   id: number
   name: string
@@ -58,6 +84,7 @@ export type QueryFilter =
   | { op: 'range'; column: string; gte?: string | null; lte?: string | null }
 
 export type QueryRequest = {
+  bucket?: string
   filters: QueryFilter[]
   select?: string[]
   limit?: number
