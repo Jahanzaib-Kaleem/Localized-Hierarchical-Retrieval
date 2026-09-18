@@ -698,13 +698,13 @@ pub(super) fn call_tool(
         .map_err(|error| error.to_string()),
         "lhr_bucket_create" => {
             let args: BucketCreateArgs = parse(arguments)?;
-            mutating(state, actor, "bucket_create", json!({"id":args.id,"name":args.name}), || {
+            mutating(state, actor, "bucket_create", json!({"id":args.id.clone(),"name":args.name.clone()}), || {
                 create_bucket(&state.root, &args.id, &args.name)
             })
         }
         "lhr_bucket_rename" => {
             let args: BucketRenameArgs = parse(arguments)?;
-            mutating(state, actor, "bucket_rename", json!({"id":args.id,"name":args.name}), || {
+            mutating(state, actor, "bucket_rename", json!({"id":args.id.clone(),"name":args.name.clone()}), || {
                 rename_bucket(&state.root, &args.id, &args.name)
             })
         }
@@ -725,7 +725,7 @@ pub(super) fn call_tool(
                 return Err("combine source count must be 1..=64".into());
             }
             let config = csv_import_config(state);
-            let detail = json!({"sources":args.sources,"target_id":args.target_id,"target_name":args.target_name});
+            let detail = json!({"sources":args.sources.clone(),"target_id":args.target_id.clone(),"target_name":args.target_name.clone()});
             mutating(state, actor, "bucket_combine", detail, || {
                 combine_buckets(&state.root, &args.sources, &args.target_id, &args.target_name, &config)
             })
@@ -740,7 +740,7 @@ pub(super) fn call_tool(
             }
             let config = mutation_config(&WriteOptions::default(), state)?;
             let detail = json!({
-                "source":args.source,"destination":args.destination,
+                "source":args.source.clone(),"destination":args.destination.clone(),
                 "rows":args.row_ids.len(),"move_rows":args.move_rows
             });
             mutating(state, actor, "bucket_transfer_rows", detail, || {
@@ -785,7 +785,7 @@ pub(super) fn call_tool(
                 return Err("retain must be at least 1".into());
             }
             let root = selected_root(state, &args.bucket)?;
-            let detail = json!({"bucket":args.bucket,"retain":args.retain,"protect":args.protect});
+            let detail = json!({"bucket":args.bucket.clone(),"retain":args.retain,"protect":args.protect.clone()});
             mutating(state, actor, "vacuum", detail, || {
                 vacuum_with_reader_leases(root, args.retain, &args.protect)
             })
@@ -811,8 +811,8 @@ pub(super) fn call_tool(
                 ));
             }
             let detail = json!({
-                "bucket":args.bucket,
-                "columns":args.columns,
+                "bucket":args.bucket.clone(),
+                "columns":args.columns.clone(),
                 "max_sort_records":max_sort_records
             });
             match name {
@@ -831,18 +831,20 @@ pub(super) fn call_tool(
     }
 }
 
-fn diagnostics(state: &McpState) -> Result<Value, String> {
-    let dataset = resolve_dataset_root(&state.root)
+fn diagnostics(state: &McpState, bucket: &str) -> Result<Value, String> {
+    let selected = selected_root(state, bucket)?;
+    let dataset = resolve_dataset_root(&selected)
         .ok()
         .and_then(|root| dataset_status(root).ok())
         .and_then(|status| serde_json::to_value(status).ok());
-    let leased = leased_generation_ids(&state.root).unwrap_or_default();
+    let leased = leased_generation_ids(&selected).unwrap_or_default();
     Ok(json!({
         "process":process_metrics(),
         "filesystem":{
             "total_bytes":fs2::total_space(&state.root).ok(),
             "available_bytes":fs2::available_space(&state.root).ok()
         },
+        "bucket":bucket,
         "dataset":dataset,
         "leased_generation_ids":leased,
         "mcp":{
@@ -920,8 +922,9 @@ fn benchmark_query(state: &McpState, arguments: Value) -> Result<Value, String> 
     if args.iterations == 0 || args.iterations > 50 || args.warmup > 20 {
         return Err("benchmark iterations must be 1..=50 and warmup 0..=20".into());
     }
-    let request = bounded_query(args.request, state)?;
-    let dataset = VersionedDataset::open(&state.root).map_err(|error| error.to_string())?;
+    let root = selected_root(state, &args.request.bucket)?;
+    let request = bounded_query(args.request.request, state)?;
+    let dataset = VersionedDataset::open(root).map_err(|error| error.to_string())?;
     for _ in 0..args.warmup {
         execute_query(&dataset, &request).map_err(|error| error.to_string())?;
     }
