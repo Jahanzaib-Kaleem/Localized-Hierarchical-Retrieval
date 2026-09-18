@@ -42,7 +42,7 @@ Python v0 used `.npy` canonical segments for research convenience. Rust replaced
 - compact dictionary/token encoding
 - benchmark resident set size, page faults, bytes read, p50/p95 latency, build throughput, and index amplification
 
-Most of the core retrieval/build priorities above are now implemented. Production hardening still remains for dictionaries, checksums/crash recovery, updates/compaction, concurrency, and large-scale real-machine validation.
+At the time of this handoff, production hardening still remained for dictionaries, checksums/crash recovery, updates/compaction, concurrency, and large-scale real-machine validation. Those first four areas were subsequently implemented in the Rust database layer: current `main` has explicit schemas/mmap dictionaries, integrity seals and recovery, immutable delta mutations plus streaming compaction, and snapshot-reader/per-catalog-writer concurrency. Large-scale real-machine validation and later scale architecture remain active research; see [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`REAL_DATA_RESEARCH.md`](REAL_DATA_RESEARCH.md).
 
 ## Why this file remains in the repository
 
