@@ -1,17 +1,20 @@
 use super::McpState;
 use fs2::FileExt;
 use lhr::{
-    add_index, apply_mutations_delta, compact_dataset, dataset_stats, dataset_status, execute_query,
-    leased_generation_ids, list_generations, list_indexes, planner_indexes_for_request, read_schema,
-    rebuild_index, record_query, recover_catalog, resolve_dataset_root, verify_versioned_dataset,
-    vacuum_with_reader_leases, workload_report, CompactionConfig, LogicalPredicate, Mutation,
-    MutationConfig, QueryRequest, ServiceRole, VersionedDataset,
+    add_index, apply_mutations_delta, combine_buckets, compact_dataset, create_bucket, dataset_stats,
+    dataset_status, delete_bucket, execute_query, leased_generation_ids, list_buckets,
+    list_generations, list_indexes, planner_indexes_for_request, read_schema, rebuild_index,
+    record_query, recover_catalog, rename_bucket, require_bucket_root, resolve_dataset_root,
+    transfer_rows, verify_versioned_dataset, vacuum_with_reader_leases, workload_report,
+    CompactionConfig, CsvImportConfig, LogicalPredicate, Mutation, MutationConfig, QueryRequest,
+    ServiceRole, VersionedDataset, DEFAULT_BUCKET,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
+    path::PathBuf,
     sync::atomic::Ordering,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -25,6 +28,16 @@ fn annotation(read_only: bool, destructive: bool, idempotent: bool) -> Value {
     })
 }
 
+fn default_bucket() -> String { DEFAULT_BUCKET.into() }
+
+fn bucket_only_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{"bucket":{"type":"string","default":"default"}},
+        "additionalProperties":false
+    })
+}
+
 fn empty_schema() -> Value {
     json!({"type":"object","properties":{},"additionalProperties":false})
 }
@@ -34,7 +47,8 @@ fn query_schema() -> Value {
         "type":"object",
         "required":["filters"],
         "properties":{
-            "filters":{"type":"array","minItems":1,"items":{
+            "bucket":{"type":"string","default":"default"},
+            "filters":{"type":"array","items":{
                 "type":"object","required":["op","column"],
                 "properties":{
                     "op":{"type":"string","enum":["eq","in","range"]},
@@ -61,6 +75,7 @@ fn index_tool(name: &str, title: &str, description: &str, destructive: bool) -> 
         "inputSchema":{
             "type":"object","required":["columns"],
             "properties":{
+                "bucket":{"type":"string","default":"default"},
                 "columns":{"type":"array","minItems":2,"items":{"type":"string"}},
                 "max_sort_records":{"type":"integer","minimum":1}
             },
