@@ -14,7 +14,15 @@ function newFilter(column = ''): DraftFilter {
 }
 
 export function QueryPage() {
-  const stats = useQuery({ queryKey: ['stats'], queryFn: ({ signal }) => api.stats(signal), staleTime: 30_000 })
+  const buckets = useQuery({ queryKey: ['buckets'], queryFn: ({ signal }) => api.buckets(signal), staleTime: 10_000 })
+  const [bucket, setBucket] = useState('default')
+  const activeBucket = buckets.data?.find((item) => item.id === bucket)
+  const stats = useQuery({
+    queryKey: ['stats', bucket],
+    queryFn: ({ signal }) => api.stats(signal, bucket),
+    staleTime: 30_000,
+    enabled: Boolean(activeBucket?.ready),
+  })
   const firstColumn = stats.data?.column_stats[0]?.name ?? ''
   const [filters, setFilters] = useState<DraftFilter[]>([newFilter()])
   const [limit, setLimit] = useState(100)
@@ -24,10 +32,24 @@ export function QueryPage() {
   const [cursor, setCursor] = useState<number | null>(null)
 
   useEffect(() => {
+    if (buckets.data?.length && !buckets.data.some((item) => item.id === bucket && item.ready)) {
+      const firstReady = buckets.data.find((item) => item.ready)
+      if (firstReady) setBucket(firstReady.id)
+    }
+  }, [buckets.data, bucket])
+
+  useEffect(() => {
     if (firstColumn) setFilters((current) => current.map((item) => item.column ? item : { ...item, column: firstColumn }))
   }, [firstColumn])
 
+  useEffect(() => {
+    setResult(undefined)
+    setCursor(null)
+    setFilters([newFilter()])
+  }, [bucket])
+
   const request = useMemo<QueryRequest>(() => ({
+    bucket,
     filters: filters.map<QueryFilter>((filter) => {
       if (filter.op === 'eq') return { op: 'eq', column: filter.column, value: filter.isNull ? null : filter.value }
       if (filter.op === 'in') return { op: 'in', column: filter.column, values: filter.value.split(',').map((item) => item.trim()).filter(Boolean) }
@@ -37,7 +59,7 @@ export function QueryPage() {
     max_rows_examined: rowsExamined,
     timeout_ms: timeout,
     after_row_id: cursor,
-  }), [filters, limit, rowsExamined, timeout, cursor])
+  }), [bucket, filters, limit, rowsExamined, timeout, cursor])
 
   const run = useMutation({ mutationFn: (body: QueryRequest) => api.query(body), onSuccess: setResult })
   const execute = (nextCursor: number | null) => {
@@ -45,14 +67,14 @@ export function QueryPage() {
     setCursor(nextCursor)
     run.mutate(body)
   }
-  const canRun = filters.length > 0 && filters.every((filter) => filter.column && (
+  const canRun = Boolean(activeBucket?.ready) && filters.length > 0 && filters.every((filter) => filter.column && (
     filter.op === 'eq' ? filter.isNull || filter.value.length > 0
       : filter.op === 'in' ? filter.value.split(',').some((item) => item.trim())
         : Boolean(filter.value || filter.upper)
   ))
 
   return <div className="page stack stack--lg">
-    <PageHeader eyebrow="Exact query" title="Query" description="Add conditions, run the query, and page through exact results. LHR chooses the available exact indexes automatically." />
+    <PageHeader eyebrow="Exact query" title="Query" description="Choose a bucket, add conditions, and page through exact results. LHR chooses exact indexes inside that bucket automatically." action={buckets.data?.length ? <label className="bucket-select"><span>Bucket</span><select value={bucket} onChange={(event) => setBucket(event.target.value)}>{buckets.data.map((item) => <option key={item.id} value={item.id} disabled={!item.ready}>{item.name}{item.ready ? '' : ' · empty'}</option>)}</select></label> : undefined} />
 
     <Panel title="Conditions" action={<button className="button button--primary" type="button" disabled={!canRun || run.isPending} onClick={() => execute(null)}>{run.isPending ? 'Running…' : 'Run query'}</button>}>
       <div className="stack">
