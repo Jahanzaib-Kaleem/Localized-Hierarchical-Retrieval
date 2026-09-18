@@ -166,7 +166,7 @@ fn all_tools() -> Vec<(ServiceRole, Value)> {
         (ServiceRole::Admin, json!({
             "name":"lhr_recover","title":"Recover catalog",
             "description":"Verify published generations and repoint CURRENT to the newest fully valid generation when recovery is required.",
-            "inputSchema":empty_schema(),"annotations":annotation(false,true,false)
+            "inputSchema":bucket_only_schema(),"annotations":annotation(false,true,false)
         })),
 
         (ServiceRole::Read, json!({
@@ -977,7 +977,17 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect();
         assert!(names.contains(&"lhr_mutate".to_string()));
+        assert!(names.contains(&"lhr_bucket_transfer_rows".to_string()));
+        assert!(names.contains(&"lhr_buckets".to_string()));
         assert!(!names.contains(&"lhr_vacuum".to_string()));
+        assert!(!names.contains(&"lhr_update".to_string()));
+
+        let admin_names: Vec<_> = tool_catalog(ServiceRole::Admin)
+            .into_iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        assert!(admin_names.contains(&"lhr_update".to_string()));
+        assert!(admin_names.contains(&"lhr_bucket_combine".to_string()));
     }
 
     #[test]
