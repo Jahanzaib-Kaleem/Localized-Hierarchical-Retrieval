@@ -87,8 +87,9 @@ The production-oriented implementation lives under `rust/`. It now includes:
 - CSV, JSONL, and streaming JSON-array ingestion with rejects, progress, disk preflight, and resumable preparation;
 - persistent workload telemetry with P50/P95/P99 and workload-based accelerator recommendations;
 - an authenticated role-based HTTP service with rate/concurrency/body/resource limits, audit logging, health/readiness, and Prometheus-style metrics;
-- LHR Studio: an API-backed React/TypeScript/TanStack control plane compiled to static assets, served by Rust, and locked until a valid server credential is supplied;
-- a stateless MCP control plane for bounded lead queries, diagnostics, query benchmarking, mutations and role-gated administration;
+- LHR Studio: an API-backed React/TypeScript/TanStack control plane with bucket management, a 50-row database browser, CSV import, row transfer/combine workflows, and exact query tooling;
+- first-class data buckets: the legacy catalog remains the reserved `default` bucket while named buckets keep independent generations, schemas, indexes, deltas and telemetry;
+- a stateless MCP control plane for bucket-aware bounded queries, diagnostics, query benchmarking, mutations, bucket administration, and role-gated host update requests;
 - a single-process Docker appliance with amd64/arm64 image publication;
 - an explicit **LHR/1** dataset compatibility contract.
 
@@ -178,7 +179,8 @@ The Docker appliance additionally exposes MCP on port `8788`. It uses the same b
 
 The MCP tool surface covers:
 
-- typed lead queries + cursor pagination;
+- bucket discovery/management and explicit bucket selection;
+- table browsing plus typed lead queries + cursor pagination;
 - row/schema/statistics access;
 - EXPLAIN, workload and index inspection;
 - generations and active leases;
@@ -186,7 +188,8 @@ The MCP tool surface covers:
 - bounded repeated-query benchmarking;
 - structural/versioned verification;
 - row mutations for write-role clients;
-- compaction, vacuum, recovery and exact-index administration for admin-role clients.
+- compaction, vacuum, recovery and exact-index administration for admin-role clients;
+- a constrained admin software-update request that is consumed by a root-owned host watcher on supported Linux/systemd installs, without mounting the Docker socket into LHR.
 
 This is intended to let an AI client answer normal lead questions and also act as an operator when explicitly granted a stronger credential. Large file ingestion and filesystem backup/restore remain CLI/local by design.
 
@@ -208,6 +211,8 @@ See [`docs/FORMAT.md`](docs/FORMAT.md).
 - [`docs/SERVICE.md`](docs/SERVICE.md) — HTTP security, API, metrics, and deployment contract.
 - [`docs/SECURITY.md`](docs/SECURITY.md) — Studio lock screen, deployment secret bootstrap, credential rotation, and HTTPS requirements.
 - [`docs/MCP.md`](docs/MCP.md) — MCP connection, tool, security, diagnostic and AI-operator contract.
+- [`docs/BUCKETS.md`](docs/BUCKETS.md) — default/named bucket compatibility, row browsing, transfer, combine, and API semantics.
+- [`docs/INSTALL_AND_UPGRADE.md`](docs/INSTALL_AND_UPGRADE.md) — idempotent manual upgrades and the host-side MCP update watcher.
 - [`docs/FORMAT.md`](docs/FORMAT.md) — LHR/1 on-disk compatibility contract.
 - [`docs/STREAMING.md`](docs/STREAMING.md) — historical page-routing/streaming prototype.
 - [`docs/RUST_HANDOFF.md`](docs/RUST_HANDOFF.md) — historical Python-to-Rust transition contract.
