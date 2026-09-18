@@ -30,7 +30,16 @@ The baseline is a **before-state** and must not be rewritten after fixes. Subseq
 - PR #21 added zero-new-storage exact decomposition for one bounded signed/unsigned integer range spanning at most 256 values;
 - PR #22 added bounded result production for one broad exact predicate when the singleton representation is `bitslice` or `densepost`.
 
-Post-change real-VPS latency/RSS/I/O measurements remain separate validation work. See [`REAL_DATA_RESEARCH.md`](REAL_DATA_RESEARCH.md) for the accepted hypotheses, caveats, and the still-unmerged shard research.
+A fresh pre-fix control run on 2026-09-19 preserved the mixed-predicate failure before the candidate-first change:
+
+| query | median | hits | rows examined | hierarchy lookups |
+|---|---:|---:|---:|---:|
+| `tags = Dropshipper` | 89 µs | 68,935 | 0 | 1 |
+| `tags = Dropshipper AND estimated_monthly_visits BETWEEN 20,000 AND 20,100` | 4.79 s | 2 | 1,902,012 | 0 |
+
+The three mixed samples ranged from ~4.71 s to ~5.30 s. In that control run process RSS rose from ~55.5 MiB before the mixed benchmark to ~324.4 MiB after it, alongside 144 major faults and ~109.6 MB additional process reads. These are pre-fix measurements, not claims about the candidate-first implementation.
+
+Post-change real-VPS latency/RSS/I/O measurements remain separate validation work until the release image is deployed. See [`REAL_DATA_RESEARCH.md`](REAL_DATA_RESEARCH.md) for the accepted hypotheses, caveats, and the still-unmerged shard research.
 
 ## Current merged synthetic benchmarks
 

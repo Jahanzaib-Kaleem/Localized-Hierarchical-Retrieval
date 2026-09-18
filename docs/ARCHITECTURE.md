@@ -174,9 +174,15 @@ A request containing exactly one bounded signed/unsigned integer range can avoid
 
 The API expands the interval into disjoint exact equality streams, keeps only one head row per stream, and merges them by stable logical row ID. This adds no new on-disk range format.
 
+### Candidate-first mixed predicates
+
+When a mixed request contains one or more exact equality predicates plus residual predicates such as a range, the typed planner first checks whether those equality columns have exact singleton access paths. If so, it streams the equality intersection in bounded candidate pages and evaluates the remaining predicates only against those rows.
+
+This route deliberately does not collect the complete equality posting list in RAM. It preserves exact hit semantics and stable logical-row pagination while replacing an avoidable whole-dataset scan with work proportional to the candidate set.
+
 ### General set/range fallback
 
-Wider ranges, open-ended ranges, mixed set/range predicate shapes, and other unsupported cases use the deterministic visible-row fallback under explicit row-examination and timeout ceilings.
+Wider/open-ended/set/range shapes with no usable exact equality candidate path retain the deterministic visible-row fallback under explicit row-examination and timeout ceilings. The fallback remains a correctness path, not the preferred plan when an exact selective seed exists.
 
 ## Stable logical row IDs and deltas
 
