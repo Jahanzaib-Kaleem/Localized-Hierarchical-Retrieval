@@ -1,13 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client'
-import type { CsvImportReport, ImportDatasetSchema, LogicalType, Normalization } from '../../api/types'
+import type { CsvImportResult, ImportDatasetSchema, ImportJobStatus, LogicalType, Normalization } from '../../api/types'
 import { formatBytes, numberFormat } from '../../components/format'
 import { FileIcon, UploadIcon } from '../../components/icons'
 import { EmptyState, Notice, PageHeader, Panel, StatusMark } from '../../components/ui'
 import { previewCsv, type CsvPreview } from './csv'
 
 const PAGE_SIZE = 50
+
+const importStageLabels: Record<ImportJobStatus['stage'], string> = {
+  uploading: 'Uploading',
+  queued: 'Upload complete · queued',
+  validating: 'Validating',
+  parsing: 'Parsing',
+  building: 'Building dataset',
+  indexing: 'Building indexes',
+  publishing: 'Publishing atomically',
+  complete: 'Completed',
+  failed: 'Failed',
+}
 
 const logicalTypes: Array<{ value: LogicalType; label: string }> = [
   { value: 'text', label: 'Text' },
@@ -47,6 +59,13 @@ export function DataPage() {
     staleTime: 30_000,
     retry: false,
   })
+  const datasetSchema = useQuery({
+    queryKey: ['schema', selectedBucket],
+    queryFn: ({ signal }) => api.schema(signal, selectedBucket),
+    enabled: selectedReady,
+    staleTime: 30_000,
+    retry: false,
+  })
 
   const [pageCursors, setPageCursors] = useState<Array<number | null>>([null])
   const [pageIndex, setPageIndex] = useState(0)
@@ -70,7 +89,9 @@ export function DataPage() {
   const [preview, setPreview] = useState<CsvPreview | null>(null)
   const [fileError, setFileError] = useState('')
   const [dragging, setDragging] = useState(false)
-  const [lastImport, setLastImport] = useState<CsvImportReport | null>(null)
+  const [lastImport, setLastImport] = useState<CsvImportResult | null>(null)
+  const [importJob, setImportJob] = useState<ImportJobStatus | null>(null)
+  const [importJobError, setImportJobError] = useState('')
 
   const [newBucketName, setNewBucketName] = useState('')
   const [newBucketId, setNewBucketId] = useState('')
@@ -165,6 +186,7 @@ export function DataPage() {
 
   const selectFile = async (next: File) => {
     setFileError('')
+    setImportJobError('')
     setLastImport(null)
     if (!next.name.toLowerCase().endsWith('.csv')) {
       setFileError('Choose a .csv file.')
@@ -172,6 +194,21 @@ export function DataPage() {
     }
     try {
       const nextPreview = await previewCsv(next)
+      if (selectedReady) {
+        const existing = datasetSchema.data ?? await api.schema(undefined, selectedBucket)
+        const expected = new Set(existing.columns.map((column) => column.name))
+        const incoming = new Set(nextPreview.headers)
+        const missing = existing.columns.map((column) => column.name).filter((name) => !incoming.has(name))
+        const extra = nextPreview.headers.filter((name) => !expected.has(name))
+        if (missing.length || extra.length) {
+          const details = [
+            missing.length ? 'Missing: ' + missing.join(', ') : '',
+            extra.length ? 'Unexpected: ' + extra.join(', ') : '',
+          ].filter(Boolean).join(' · ')
+          throw new Error('CSV is not compatible with the existing bucket schema. ' + details)
+        }
+        nextPreview.schema = existing
+      }
       setFile(next)
       setPreview(nextPreview)
     } catch (error) {
@@ -185,24 +222,75 @@ export function DataPage() {
     setPreview((current) => current ? { ...current, schema: updater(current.schema) } : current)
   }
 
+  const finishImport = async (report: CsvImportResult) => {
+    setLastImport(report)
+    setFile(null)
+    setPreview(null)
+    setPageCursors([null])
+    setPageIndex(0)
+    setImportJobError('')
+    await invalidateData()
+  }
+
   const importData = useMutation({
     mutationFn: async () => {
       if (!file || !preview) throw new Error('Choose a CSV first.')
-      return api.importCsv(file, preview.schema, selectedBucket)
+      setImportJobError('')
+      return api.importCsv(
+        file,
+        preview.schema,
+        selectedBucket,
+        selectedReady ? 'append' : 'create',
+        setImportJob,
+      )
     },
-    onSuccess: async (report) => {
-      setLastImport(report)
-      setFile(null)
-      setPreview(null)
-      setPageCursors([null])
-      setPageIndex(0)
-      await invalidateData()
-    },
+    onSuccess: finishImport,
+    onError: (error) => setImportJobError(error.message),
   })
+
+  useEffect(() => {
+    const id = api.activeImportId()
+    if (!id) return
+    let cancelled = false
+    void api.importJob(id).then(async (job) => {
+      if (cancelled) return
+      setImportJob(job)
+      if (job.bucket !== selectedBucket && (buckets.data ?? []).some((bucket) => bucket.id === job.bucket)) {
+        setSelectedBucket(job.bucket)
+      }
+      if (job.status === 'complete' && job.result) {
+        api.clearActiveImport()
+        if (!cancelled) await finishImport(job.result)
+      } else if (job.status === 'failed') {
+        api.clearActiveImport()
+        if (!cancelled) setImportJobError(
+          (job.error ?? 'Import failed.') +
+          (job.existing_dataset_preserved
+            ? ' The previously published dataset was preserved.'
+            : ' Check the current generation before retrying.'),
+        )
+      } else if (job.status === 'queued' || job.status === 'running') {
+        try {
+          const report = await api.waitForImport(id, (next) => { if (!cancelled) setImportJob(next) })
+          if (!cancelled) await finishImport(report)
+        } catch (error) {
+          if (!cancelled) setImportJobError(error instanceof Error ? error.message : String(error))
+        }
+      }
+    }).catch((error) => {
+      api.clearActiveImport()
+      if (!cancelled) setImportJobError(error instanceof Error ? error.message : String(error))
+    })
+    return () => { cancelled = true }
+  // Resume is intentionally checked once on page mount; the active job itself carries its bucket.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const startImport = () => {
     if (!file || !preview) return
-    if (selectedReady && !window.confirm('Importing this CSV will publish it as the new current dataset inside "' + (selected?.name ?? selectedBucket) + '". Previous generations remain available for recovery. Continue?')) return
+    if (selectedReady && !window.confirm(
+      'Append this CSV to "' + (selected?.name ?? selectedBucket) + '"? Existing rows remain visible until the new immutable generation is fully built and published.',
+    )) return
     importData.mutate()
   }
 
@@ -245,7 +333,11 @@ export function DataPage() {
       </label> : undefined}
     />
 
-    {lastImport ? <Notice title="Dataset imported">Published generation {lastImport.generation.id} with {numberFormat.format(lastImport.rows)} rows in {selected?.name ?? selectedBucket}.</Notice> : null}
+    {lastImport ? <Notice title={'appended' in lastImport ? 'CSV appended' : 'Dataset created'}>
+      {'appended' in lastImport
+        ? <>Published generation {lastImport.generation.id}. Added {numberFormat.format(lastImport.appended)} rows; the bucket now contains {numberFormat.format(lastImport.rows_after)} rows.</>
+        : <>Published generation {lastImport.generation.id} with {numberFormat.format(lastImport.rows)} rows in {selected?.name ?? selectedBucket}.</>}
+    </Notice> : null}
 
     <Panel title="Buckets" eyebrow={(buckets.data?.length ?? 0) + ' workspaces'}>
       <div className="bucket-layout">
@@ -345,7 +437,7 @@ export function DataPage() {
       </>}
     </Panel>
 
-    <Panel title={selectedReady ? 'Import into ' + (selected?.name ?? selectedBucket) : 'Initialize ' + (selected?.name ?? selectedBucket)} eyebrow="CSV">
+    <Panel title={selectedReady ? 'Append data to ' + (selected?.name ?? selectedBucket) : 'Initialize ' + (selected?.name ?? selectedBucket)} eyebrow={selectedReady ? 'Append CSV' : 'Create from CSV'}>
       <div className="stack">
         <div
           className="drop-zone"
@@ -368,21 +460,48 @@ export function DataPage() {
           <span className="button button--quiet">Choose CSV</span>
         </div>
         {fileError ? <Notice title="Could not read CSV">{fileError}</Notice> : null}
-        <p className="field-hint">Studio previews only a small sample in the browser. The actual import is streamed into the active bucket and built on the server.</p>
+        <p className="field-hint">Studio previews only a small sample in the browser. The file is uploaded in bounded 4 MiB chunks, staged under the LHR data volume, then parsed and built on the server.</p>
+        {selectedReady ? <p className="field-hint">Append uses the bucket's existing types, nullability, normalization and null rules. Header order may differ; missing or extra columns are rejected.</p> : null}
       </div>
     </Panel>
 
+    {importJob && importJob.bucket === selectedBucket ? <Panel title="Import progress" eyebrow={importStageLabels[importJob.stage]}>
+      <div className="stack">
+        <div className="database-toolbar">
+          <strong>{importStageLabels[importJob.stage]}</strong>
+          <span className="mono">{importJob.file_name}</span>
+        </div>
+        {importJob.stage === 'uploading' ? <>
+          <progress max={Math.max(importJob.bytes_total, 1)} value={importJob.bytes_received} style={{ width: '100%' }} />
+          <p className="field-hint">
+            {formatBytes(importJob.bytes_received)} / {formatBytes(importJob.bytes_total)} · {Math.floor((importJob.bytes_received / Math.max(importJob.bytes_total, 1)) * 100)}%
+          </p>
+          {api.activeImportId() === importJob.id && !importData.isPending
+            ? <p className="field-hint">Upload is paused. Re-select the same file to continue from the recorded byte offset.</p>
+            : null}
+        </> : <p className="field-hint">Upload complete. Server-side work is running against temporary state; the currently published generation remains usable until publication succeeds.</p>}
+        {importJob.rows_parsed != null ? <p className="field-hint">Rows parsed: {numberFormat.format(importJob.rows_parsed)}</p> : null}
+        {importJob.status === 'failed' ? <Notice title="Import failed">
+          {importJob.error ?? 'The import failed.'} {importJob.existing_dataset_preserved
+            ? 'The previously published dataset was preserved.'
+            : 'Inspect the current generation before retrying.'}
+        </Notice> : null}
+      </div>
+    </Panel> : null}
+
+    {importJobError ? <Notice title="Import failed">{importJobError}</Notice> : null}
+
     {preview ? <>
-      <Panel title="Review columns" eyebrow={preview.schema.columns.length + ' detected'} action={<button className="button button--primary" disabled={importData.isPending} type="button" onClick={startImport}>{importData.isPending ? 'Importing…' : selectedReady ? 'Publish new dataset' : 'Create dataset'}</button>}>
+      <Panel title={selectedReady ? 'Verify append schema' : 'Review columns'} eyebrow={preview.schema.columns.length + ' detected'} action={<button className="button button--primary" disabled={importData.isPending} type="button" onClick={startImport}>{importData.isPending ? (importJob ? importStageLabels[importJob.stage] + '…' : 'Importing…') : selectedReady ? 'Append CSV' : 'Create dataset'}</button>}>
         <div className="table-wrap schema-editor-wrap"><table className="data-table schema-editor"><thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Normalization</th></tr></thead><tbody>
           {preview.schema.columns.map((column, index) => <tr key={column.name + '-' + index}>
             <td className="data-table__primary">{column.name}</td>
-            <td><select value={column.logical_type} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, logical_type: event.target.value as LogicalType } : item) }))}>{logicalTypes.map((type) => <option value={type.value} key={type.value}>{type.label}</option>)}</select></td>
-            <td><label className="toggle-field"><input type="checkbox" checked={column.nullable} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, nullable: event.target.checked, null_values: event.target.checked ? [''] : [] } : item) }))} /><span>{column.nullable ? 'Yes' : 'No'}</span></label></td>
-            <td><select value={column.normalization} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, normalization: event.target.value as Normalization } : item) }))}>{normalizations.map((normalization) => <option value={normalization.value} key={normalization.value}>{normalization.label}</option>)}</select></td>
+            <td><select disabled={selectedReady} value={column.logical_type} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, logical_type: event.target.value as LogicalType } : item) }))}>{logicalTypes.map((type) => <option value={type.value} key={type.value}>{type.label}</option>)}</select></td>
+            <td><label className="toggle-field"><input disabled={selectedReady} type="checkbox" checked={column.nullable} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, nullable: event.target.checked, null_values: event.target.checked ? [''] : [] } : item) }))} /><span>{column.nullable ? 'Yes' : 'No'}</span></label></td>
+            <td><select disabled={selectedReady} value={column.normalization} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, normalization: event.target.value as Normalization } : item) }))}>{normalizations.map((normalization) => <option value={normalization.value} key={normalization.value}>{normalization.label}</option>)}</select></td>
           </tr>)}
         </tbody></table></div>
-        {importData.error ? <Notice title="Import failed">{importData.error.message}</Notice> : null}
+        {importData.error && !importJobError ? <Notice title="Import failed">{importData.error.message}</Notice> : null}
       </Panel>
 
       <Panel title="Preview" eyebrow="First complete rows">
