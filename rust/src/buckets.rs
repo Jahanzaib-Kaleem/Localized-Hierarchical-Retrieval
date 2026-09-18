@@ -309,6 +309,23 @@ fn publish_csv_generation(
         }
     };
 
+    match resolve_dataset_root(catalog_root) {
+        Ok(_) => {
+            let _ = abandon_generation(stage);
+            let _ = fs::remove_dir_all(&build_catalog);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "bucket was initialized by another writer",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let _ = abandon_generation(stage);
+            let _ = fs::remove_dir_all(&build_catalog);
+            return Err(error);
+        }
+    }
+
     let prepare = (|| -> io::Result<()> {
         fs::remove_dir_all(&stage.path)?;
         fs::rename(&built.generation.path, &stage.path)?;
