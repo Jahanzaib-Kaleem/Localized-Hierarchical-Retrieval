@@ -531,6 +531,56 @@ where
     }
 }
 
+fn update_status(state: &McpState) -> Result<Value, String> {
+    let control = state.root.join("control");
+    let status_path = control.join("update-status.json");
+    let status = if status_path.is_file() {
+        let raw = fs::read(&status_path).map_err(|error| error.to_string())?;
+        serde_json::from_slice::<Value>(&raw).unwrap_or_else(|_| {
+            json!({"state":"unknown","error":"host updater status file is invalid"})
+        })
+    } else {
+        Value::Null
+    };
+    Ok(json!({
+        "enabled":control.join("updater-enabled").is_file(),
+        "pending":control.join("update-request.json").is_file(),
+        "status":status
+    }))
+}
+
+fn request_update(state: &McpState, actor: &str) -> Result<Value, String> {
+    let control = state.root.join("control");
+    if !control.join("updater-enabled").is_file() {
+        return Err("host-side self updater is not installed; run the current setup command once on the host to enable MCP software updates".into());
+    }
+    fs::create_dir_all(&control).map_err(|error| error.to_string())?;
+    let request_path = control.join("update-request.json");
+    if request_path.exists() {
+        return Ok(json!({"queued":true,"already_pending":true}));
+    }
+    let requested_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let value = json!({
+        "requested_at_ms":requested_at_ms,
+        "actor":actor,
+        "channel":"latest"
+    });
+    let temp = control.join(format!(".update-request-{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?;
+    fs::write(&temp, bytes).map_err(|error| error.to_string())?;
+    fs::rename(&temp, &request_path).map_err(|error| error.to_string())?;
+    audit(state, actor, "software_update_requested", true, value.clone());
+    Ok(json!({
+        "queued":true,
+        "already_pending":false,
+        "requested_at_ms":requested_at_ms,
+        "note":"The host updater will pull and replace the LHR container using the persistent-data-safe installer. This MCP connection may briefly disconnect."
+    }))
+}
+
 pub(super) fn call_tool(
     state: &McpState,
     actor: &str,
@@ -545,18 +595,21 @@ pub(super) fn call_tool(
 
     match name {
         "lhr_query" => {
-            let request = bounded_query(parse(arguments)?, state)?;
-            let dataset = VersionedDataset::open(&state.root).map_err(|error| error.to_string())?;
+            let args: BucketQueryArgs = parse(arguments)?;
+            let root = selected_root(state, &args.bucket)?;
+            let request = bounded_query(args.request, state)?;
+            let dataset = VersionedDataset::open(&root).map_err(|error| error.to_string())?;
             let indexes = planner_indexes_for_request(&dataset, &request)
                 .map_err(|error| error.to_string())?;
             let response = execute_query(&dataset, &request).map_err(|error| error.to_string())?;
-            record_query(&state.root, &request, &response, indexes)
+            record_query(&root, &request, &response, indexes)
                 .map_err(|error| error.to_string())?;
             serde_json::to_value(response).map_err(|error| error.to_string())
         }
         "lhr_row" => {
             let args: RowArgs = parse(arguments)?;
-            let dataset = VersionedDataset::open(&state.root).map_err(|error| error.to_string())?;
+            let root = selected_root(state, &args.bucket)?;
+            let dataset = VersionedDataset::open(root).map_err(|error| error.to_string())?;
             let values = dataset
                 .row_values(args.row_id)
                 .map_err(|error| error.to_string())?;
@@ -569,25 +622,30 @@ pub(super) fn call_tool(
                             value.map(Value::String).unwrap_or(Value::Null),
                         );
                     }
-                    json!({"row_id":args.row_id,"found":true,"values":row})
+                    json!({"bucket":args.bucket,"row_id":args.row_id,"found":true,"values":row})
                 }
-                None => json!({"row_id":args.row_id,"found":false}),
+                None => json!({"bucket":args.bucket,"row_id":args.row_id,"found":false}),
             })
         }
         "lhr_schema" => {
-            let root = resolve_dataset_root(&state.root).map_err(|error| error.to_string())?;
+            let args: BucketArgs = parse(arguments)?;
+            let root = selected_root(state, &args.bucket)?;
+            let root = resolve_dataset_root(root).map_err(|error| error.to_string())?;
             let schema = read_schema(root).map_err(|error| error.to_string())?;
             serde_json::to_value(schema).map_err(|error| error.to_string())
         }
-        "lhr_stats" => serde_json::to_value(
-            dataset_stats(&state.root).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string()),
+        "lhr_stats" => {
+            let args: BucketArgs = parse(arguments)?;
+            let root = selected_root(state, &args.bucket)?;
+            serde_json::to_value(dataset_stats(root).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())
+        }
         "lhr_explain" => {
             let args: ExplainArgs = parse(arguments)?;
             if args.predicates.is_empty() {
                 return Err("at least one equality predicate is required".into());
             }
+            let root = selected_root(state, &args.bucket)?;
             let predicates: Vec<_> = args
                 .predicates
                 .into_iter()
@@ -596,31 +654,108 @@ pub(super) fn call_tool(
                     value: predicate.value,
                 })
                 .collect();
-            let dataset = VersionedDataset::open(&state.root).map_err(|error| error.to_string())?;
+            let dataset = VersionedDataset::open(root).map_err(|error| error.to_string())?;
             let plan = dataset
                 .explain_values(&predicates)
                 .map_err(|error| error.to_string())?;
             serde_json::to_value(plan).map_err(|error| error.to_string())
         }
-        "lhr_workload" => serde_json::to_value(
-            workload_report(&state.root).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string()),
-        "lhr_generations" => {
-            let generations = list_generations(&state.root).map_err(|error| error.to_string())?;
-            let leased = leased_generation_ids(&state.root).map_err(|error| error.to_string())?;
-            Ok(json!({"generations":generations,"leased_generation_ids":leased}))
+        "lhr_workload" => {
+            let args: BucketArgs = parse(arguments)?;
+            let root = selected_root(state, &args.bucket)?;
+            serde_json::to_value(workload_report(root).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())
         }
-        "lhr_indexes" => serde_json::to_value(
-            list_indexes(&state.root).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string()),
-        "lhr_diagnostics" => diagnostics(state),
+        "lhr_generations" => {
+            let args: BucketArgs = parse(arguments)?;
+            let root = selected_root(state, &args.bucket)?;
+            let generations = list_generations(&root).map_err(|error| error.to_string())?;
+            let leased = leased_generation_ids(&root).map_err(|error| error.to_string())?;
+            Ok(json!({"bucket":args.bucket,"generations":generations,"leased_generation_ids":leased}))
+        }
+        "lhr_indexes" => {
+            let args: BucketArgs = parse(arguments)?;
+            let root = selected_root(state, &args.bucket)?;
+            serde_json::to_value(list_indexes(root).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())
+        }
+        "lhr_diagnostics" => {
+            let args: BucketArgs = parse(arguments)?;
+            diagnostics(state, &args.bucket)
+        }
         "lhr_benchmark_query" => benchmark_query(state, arguments),
-        "lhr_verify" => serde_json::to_value(
-            verify_versioned_dataset(&state.root).map_err(|error| error.to_string())?,
+        "lhr_verify" => {
+            let args: BucketArgs = parse(arguments)?;
+            let root = selected_root(state, &args.bucket)?;
+            serde_json::to_value(
+                verify_versioned_dataset(root).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())
+        }
+        "lhr_buckets" => serde_json::to_value(
+            list_buckets(&state.root).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string()),
+        "lhr_bucket_create" => {
+            let args: BucketCreateArgs = parse(arguments)?;
+            mutating(state, actor, "bucket_create", json!({"id":args.id,"name":args.name}), || {
+                create_bucket(&state.root, &args.id, &args.name)
+            })
+        }
+        "lhr_bucket_rename" => {
+            let args: BucketRenameArgs = parse(arguments)?;
+            mutating(state, actor, "bucket_rename", json!({"id":args.id,"name":args.name}), || {
+                rename_bucket(&state.root, &args.id, &args.name)
+            })
+        }
+        "lhr_bucket_delete" => {
+            let args: BucketDeleteArgs = parse(arguments)?;
+            if args.confirm != args.id {
+                return Err("confirm must exactly match the bucket id".into());
+            }
+            let id = args.id.clone();
+            mutating::<Value, _>(state, actor, "bucket_delete", json!({"id":id}), || {
+                delete_bucket(&state.root, &args.id)?;
+                Ok(json!({"deleted":args.id}))
+            })
+        }
+        "lhr_bucket_combine" => {
+            let args: BucketCombineArgs = parse(arguments)?;
+            if args.sources.is_empty() || args.sources.len() > 64 {
+                return Err("combine source count must be 1..=64".into());
+            }
+            let config = csv_import_config(state);
+            let detail = json!({"sources":args.sources,"target_id":args.target_id,"target_name":args.target_name});
+            mutating(state, actor, "bucket_combine", detail, || {
+                combine_buckets(&state.root, &args.sources, &args.target_id, &args.target_name, &config)
+            })
+        }
+        "lhr_bucket_transfer_rows" => {
+            let args: BucketTransferArgs = parse(arguments)?;
+            if args.row_ids.is_empty() || args.row_ids.len() > state.config.max_mutation_ops {
+                return Err(format!(
+                    "row transfer count must be 1..={}",
+                    state.config.max_mutation_ops
+                ));
+            }
+            let config = mutation_config(&WriteOptions::default(), state)?;
+            let detail = json!({
+                "source":args.source,"destination":args.destination,
+                "rows":args.row_ids.len(),"move_rows":args.move_rows
+            });
+            mutating(state, actor, "bucket_transfer_rows", detail, || {
+                transfer_rows(
+                    &state.root,
+                    &args.source,
+                    &args.destination,
+                    &args.row_ids,
+                    args.move_rows,
+                    &config,
+                )
+            })
+        }
+        "lhr_update_status" => update_status(state),
+        "lhr_update" => request_update(state, actor),
         "lhr_mutate" => {
             let args: MutationArgs = parse(arguments)?;
             if args.mutations.is_empty() || args.mutations.len() > state.config.max_mutation_ops {
@@ -629,17 +764,19 @@ pub(super) fn call_tool(
                     state.config.max_mutation_ops
                 ));
             }
+            let root = selected_root(state, &args.bucket)?;
             let config = mutation_config(&args.options, state)?;
-            let detail = json!({"operations":args.mutations.len()});
+            let detail = json!({"bucket":args.bucket,"operations":args.mutations.len()});
             mutating(state, actor, "mutate", detail, || {
-                apply_mutations_delta(&state.root, &args.mutations, &config)
+                apply_mutations_delta(root, &args.mutations, &config)
             })
         }
         "lhr_compact" => {
             let args: CompactArgs = parse(arguments)?;
+            let root = selected_root(state, &args.bucket)?;
             let config = compaction_config(&args.options, state)?;
-            mutating(state, actor, "compact", json!({}), || {
-                compact_dataset(&state.root, &config)
+            mutating(state, actor, "compact", json!({"bucket":args.bucket}), || {
+                compact_dataset(root, &config)
             })
         }
         "lhr_vacuum" => {
@@ -647,19 +784,25 @@ pub(super) fn call_tool(
             if args.retain == 0 {
                 return Err("retain must be at least 1".into());
             }
-            let detail = json!({"retain":args.retain,"protect":args.protect.clone()});
+            let root = selected_root(state, &args.bucket)?;
+            let detail = json!({"bucket":args.bucket,"retain":args.retain,"protect":args.protect});
             mutating(state, actor, "vacuum", detail, || {
-                vacuum_with_reader_leases(&state.root, args.retain, &args.protect)
+                vacuum_with_reader_leases(root, args.retain, &args.protect)
             })
         }
-        "lhr_recover" => mutating(state, actor, "recover", json!({}), || {
-            recover_catalog(&state.root)
-        }),
+        "lhr_recover" => {
+            let args: BucketArgs = parse(arguments)?;
+            let root = selected_root(state, &args.bucket)?;
+            mutating(state, actor, "recover", json!({"bucket":args.bucket}), || {
+                recover_catalog(root)
+            })
+        }
         "lhr_index_add" | "lhr_index_drop" | "lhr_index_rebuild" => {
             let args: IndexArgs = parse(arguments)?;
             if args.columns.len() < 2 {
                 return Err("accelerator indexes require at least two columns".into());
             }
+            let root = selected_root(state, &args.bucket)?;
             let max_sort_records = args.max_sort_records.unwrap_or(250_000);
             if max_sort_records == 0 || max_sort_records > state.config.max_sort_records {
                 return Err(format!(
@@ -668,18 +811,19 @@ pub(super) fn call_tool(
                 ));
             }
             let detail = json!({
-                "columns":args.columns.clone(),
+                "bucket":args.bucket,
+                "columns":args.columns,
                 "max_sort_records":max_sort_records
             });
             match name {
                 "lhr_index_add" => mutating(state, actor, "index_add", detail, || {
-                    add_index(&state.root, &args.columns, max_sort_records)
+                    add_index(root, &args.columns, max_sort_records)
                 }),
                 "lhr_index_drop" => mutating(state, actor, "index_drop", detail, || {
-                    lhr::drop_index(&state.root, &args.columns)
+                    lhr::drop_index(root, &args.columns)
                 }),
                 _ => mutating(state, actor, "index_rebuild", detail, || {
-                    rebuild_index(&state.root, &args.columns, max_sort_records)
+                    rebuild_index(root, &args.columns, max_sort_records)
                 }),
             }
         }
