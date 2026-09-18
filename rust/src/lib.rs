@@ -2,6 +2,7 @@ pub mod admin;
 pub mod bitmap;
 pub mod bitslice_postings;
 pub mod builder;
+pub mod buckets;
 pub mod catalog;
 pub mod compaction;
 pub mod delta_mutation;
@@ -42,6 +43,11 @@ pub use admin::{
 pub use bitmap::BitmapHierarchy;
 pub use bitslice_postings::BitSlicePostingHierarchy;
 pub use builder::{build_u32_batches, build_u8_batches, BuildConfig, HierarchySpec};
+pub use buckets::{
+    bucket_root, combine_buckets, create_bucket, delete_bucket, list_buckets, rename_bucket,
+    require_bucket_root, transfer_rows, validate_bucket_id, BucketCombineReport, BucketInfo,
+    BucketTransferReport, DEFAULT_BUCKET,
+};
 pub use catalog::{
     abandon_generation, begin_generation, list_generations, publish_generation,
     resolve_dataset_root, rollback_generation, vacuum_generations, GenerationInfo,
