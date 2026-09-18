@@ -342,6 +342,41 @@ struct BenchmarkArgs {
     warmup: usize,
 }
 
+
+#[derive(Debug, Deserialize)]
+struct BucketCreateArgs {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BucketRenameArgs {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BucketDeleteArgs {
+    id: String,
+    confirm: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BucketCombineArgs {
+    sources: Vec<String>,
+    target_id: String,
+    target_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BucketTransferArgs {
+    source: String,
+    destination: String,
+    row_ids: Vec<u64>,
+    #[serde(default)]
+    move_rows: bool,
+}
+
 fn default_iterations() -> usize {
     10
 }
@@ -352,6 +387,24 @@ fn default_warmup() -> usize {
 fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, String> {
     serde_json::from_value(value).map_err(|error| error.to_string())
 }
+
+fn selected_root(state: &McpState, bucket: &str) -> Result<PathBuf, String> {
+    require_bucket_root(&state.root, bucket).map_err(|error| error.to_string())
+}
+
+fn csv_import_config(state: &McpState) -> CsvImportConfig {
+    let defaults = CsvImportConfig::default();
+    CsvImportConfig {
+        page_rows: defaults.page_rows,
+        batch_rows: defaults.batch_rows.min(state.config.max_batch_rows),
+        max_sort_records: defaults.max_sort_records.min(state.config.max_sort_records),
+        dictionary_run_bytes: defaults
+            .dictionary_run_bytes
+            .min(state.config.max_dictionary_run_bytes),
+        accelerators: Vec::new(),
+    }
+}
+
 
 fn bounded_query(mut request: QueryRequest, state: &McpState) -> Result<QueryRequest, String> {
     if request.limit == 0 || request.limit > state.config.max_query_limit {
