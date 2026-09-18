@@ -1,0 +1,95 @@
+use lhr::{
+    execute_query, import_csv, ColumnSchema, CsvImportConfig, DatasetSchema, LogicalType,
+    Normalization, QueryFilter, QueryRequest, VersionedDataset,
+};
+use std::fs;
+
+fn schema() -> DatasetSchema {
+    DatasetSchema::new(vec![
+        ColumnSchema {
+            name: "id".into(),
+            logical_type: LogicalType::Unsigned,
+            nullable: false,
+            normalization: Normalization::Trim,
+            null_values: vec![],
+        },
+        ColumnSchema {
+            name: "group".into(),
+            logical_type: LogicalType::Text,
+            nullable: false,
+            normalization: Normalization::TrimLowercase,
+            null_values: vec![],
+        },
+        ColumnSchema {
+            name: "visits".into(),
+            logical_type: LogicalType::Unsigned,
+            nullable: false,
+            normalization: Normalization::Trim,
+            null_values: vec![],
+        },
+    ])
+    .unwrap()
+}
+
+#[test]
+fn mixed_equality_and_range_uses_bounded_equality_candidates() {
+    let catalog = tempfile::tempdir().unwrap();
+    let source = catalog.path().join("mixed.csv");
+    let mut csv = String::from("id,group,visits\n");
+    let mut expected = Vec::new();
+    for row in 0u64..2_000 {
+        let group = if row % 20 == 0 { "target" } else { "other" };
+        let visits = row % 1_000;
+        if group == "target" && (200..=400).contains(&visits) {
+            expected.push(row);
+        }
+        csv.push_str(&format!("{row},{group},{visits}\n"));
+    }
+    fs::write(&source, csv).unwrap();
+    import_csv(
+        catalog.path(),
+        &source,
+        &schema(),
+        &CsvImportConfig {
+            page_rows: 128,
+            batch_rows: 256,
+            max_sort_records: 4096,
+            dictionary_run_bytes: 16 * 1024,
+            accelerators: vec![],
+        },
+    )
+    .unwrap();
+
+    let dataset = VersionedDataset::open(catalog.path()).unwrap();
+    let response = execute_query(
+        &dataset,
+        &QueryRequest {
+            filters: vec![
+                QueryFilter::Eq {
+                    column: "group".into(),
+                    value: Some("TARGET".into()),
+                },
+                QueryFilter::Range {
+                    column: "visits".into(),
+                    gte: Some("200".into()),
+                    lte: Some("400".into()),
+                },
+            ],
+            select: vec!["id".into()],
+            limit: 100,
+            after_row_id: None,
+            max_rows_examined: Some(150),
+            timeout_ms: Some(5_000),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(response.stats.hits as usize, expected.len());
+    assert_eq!(response.returned, expected.len());
+    assert!(response.stats.optimized_equality_route);
+    assert!(response.stats.rows_examined <= 100);
+    assert_eq!(
+        response.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+        expected
+    );
+}

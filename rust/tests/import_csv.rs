@@ -126,3 +126,20 @@ fn failed_import_does_not_move_current_generation() {
     assert_eq!(generations.len(), 1);
     assert!(generations[0].current);
 }
+
+
+#[test]
+fn csv_import_rejects_unexpected_columns_instead_of_silently_ignoring_them() {
+    let catalog = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let csv = source_dir.path().join("extra.csv");
+    fs::write(
+        &csv,
+        "country,age,active,note,unexpected\npk,20,true,ok,value\n",
+    )
+    .unwrap();
+
+    let error = import_csv(catalog.path(), &csv, &schema(), &config()).unwrap_err();
+    assert!(error.to_string().contains("unexpected column"));
+    assert!(list_generations(catalog.path()).unwrap().is_empty());
+}
