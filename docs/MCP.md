@@ -141,7 +141,7 @@ Applies insert/update/delete operations as one crash-safe immutable delta transa
 ### Bucket tools
 
 - `lhr_buckets` (`read`) lists the default and named buckets with readiness, rows, columns and storage.
-- `lhr_bucket_transfer_rows` (`write`) copies or moves selected logical rows between ready same-schema buckets.
+- `lhr_bucket_transfer_rows` (`write`) copies or moves selected logical rows between buckets. Empty destinations are initialized from the source schema; populated destinations must match that schema exactly.
 - `lhr_bucket_create`, `lhr_bucket_rename`, `lhr_bucket_delete`, and `lhr_bucket_combine` (`admin`) manage bucket workspaces.
 
 The reserved `default` bucket cannot be deleted. Its display name can be changed without rewriting its data.
