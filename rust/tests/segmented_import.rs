@@ -1,7 +1,8 @@
 use lhr::{
     append_csv_segmented_with_progress, import_csv, import_csv_segmented_initial_with_progress,
     list_generations, verify_versioned_dataset, ColumnSchema, CsvImportConfig, DatasetSchema,
-    LogicalPredicate, LogicalType, Normalization, SegmentedCsvImportConfig, VersionedDataset,
+    segmented_import_disk_floor, LogicalPredicate, LogicalType, Normalization,
+    SegmentedCsvImportConfig, VersionedDataset,
 };
 use std::fs;
 
@@ -218,4 +219,17 @@ fn segmented_append_failure_preserves_previous_current_generation() {
     assert_eq!(after.len(), before.len());
     assert_eq!(after.iter().find(|x| x.current).unwrap().id, current_before);
     assert_eq!(VersionedDataset::open(catalog.path()).unwrap().visible_rows(), 2);
+}
+
+
+#[test]
+fn segmented_disk_floor_scales_with_source_and_configured_part_size() {
+    let gib = 1024u64 * 1024 * 1024;
+    let mib = 1024u64 * 1024;
+    let floor = segmented_import_disk_floor(60 * gib, 512 * mib);
+    assert_eq!(floor, 122 * gib + 64 * mib);
+    assert!(floor < 145 * gib);
+
+    let smaller_parts = segmented_import_disk_floor(60 * gib, 256 * mib);
+    assert!(smaller_parts < floor);
 }
