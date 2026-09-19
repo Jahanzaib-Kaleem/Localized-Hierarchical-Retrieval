@@ -1,5 +1,5 @@
 use crate::{
-    abandon_generation, begin_generation, import_csv, publish_generation, read_schema, write_schema,
+    abandon_generation, begin_generation, import_csv, publish_generation, write_schema,
     CsvImportConfig, GenerationInfo, Manifest, RowIdWriter, VersionedDataset, ROW_IDS_FILE,
 };
 use serde::Serialize;
