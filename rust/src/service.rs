@@ -683,8 +683,8 @@ async fn dataset_schema(
     let guard = begin_request(&state, &headers, ServiceRole::Read).await?;
     let root = selected_bucket_root(&state, &selector.bucket, guard.request_id)?;
     let result = tokio::task::spawn_blocking(move || {
-        let resolved = resolve_dataset_root(root)?;
-        read_schema(resolved)
+        let dataset = VersionedDataset::open(root)?;
+        Ok::<DatasetSchema, io::Error>(dataset.schema().clone())
     })
     .await
     .map_err(|error| join_error(guard.request_id, error))?
