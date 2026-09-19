@@ -390,6 +390,31 @@ impl LogicalDataset {
         })
     }
 
+    /// Stream logical row IDs for a fully covered exact equality conjunction without decoding
+    /// canonical column values.
+    pub(crate) fn scan_row_ids<F>(
+        &self,
+        predicates: &[LogicalPredicate],
+        batch_rows: usize,
+        mut visit: F,
+    ) -> io::Result<Option<QueryStats>>
+    where
+        F: FnMut(u64) -> io::Result<()>,
+    {
+        let Some(encoded) = self.encoded_predicates(predicates)? else {
+            return Ok(Some(QueryStats::default()));
+        };
+        self.engine.scan_row_ids(&encoded, batch_rows, 0, |physical_ids| {
+            for &physical in physical_ids {
+                let row_id = self.row_ids.logical(physical).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "query returned unmapped row ID")
+                })?;
+                visit(row_id)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Stream every row ID proven by a fully covered exact equality conjunction. The engine
     /// plans the conjunction once, keeps only a bounded posting batch in memory, and this layer
     /// decodes only the requested projection for each candidate.

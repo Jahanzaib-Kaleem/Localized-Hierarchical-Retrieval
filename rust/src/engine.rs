@@ -795,6 +795,24 @@ impl Engine {
         F: FnMut(&[u64]) -> io::Result<()>,
     {
         let first_row = first_row.min(self.rows);
+        if batch_rows == 0 {
+            return Ok(Some(QueryStats::default()));
+        }
+        if predicates.is_empty() {
+            let mut stats = QueryStats {
+                hits: self.rows.saturating_sub(first_row),
+                ..Default::default()
+            };
+            let mut cursor = first_row;
+            while cursor < self.rows {
+                let end = cursor.saturating_add(batch_rows as u64).min(self.rows);
+                let page = (cursor..end).collect::<Vec<_>>();
+                visit(&page)?;
+                cursor = end;
+            }
+            return Ok(Some(stats));
+        }
+
         let Some(plan) = self.row_selection_plan(predicates) else {
             return Ok(None);
         };
@@ -806,8 +824,7 @@ impl Engine {
             hierarchy_lookups: plan.lookups,
             ..Default::default()
         };
-        if batch_rows == 0
-            || plan.selected.is_empty()
+        if plan.selected.is_empty()
             || plan.selected[0].count == 0
             || first_row >= self.rows
             || first_row > u32::MAX as u64

@@ -259,4 +259,35 @@ fn mixed_candidate_stream_plans_each_layer_once() {
             .chain(2_990..2_995)
             .collect::<Vec<_>>()
     );
+
+    let exact = execute_query(
+        &dataset,
+        &QueryRequest {
+            filters: vec![
+                QueryFilter::Eq {
+                    column: "group".into(),
+                    value: Some("TARGET".into()),
+                },
+                QueryFilter::Eq {
+                    column: "region".into(),
+                    value: Some("EAST".into()),
+                },
+            ],
+            select: vec!["id".into()],
+            limit: 25,
+            after_row_id: None,
+            max_rows_examined: Some(1),
+            timeout_ms: Some(5_000),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(exact.stats.hits, 15_000);
+    assert_eq!(exact.returned, 25);
+    assert_eq!(exact.stats.rows_examined, 0);
+    assert_eq!(exact.stats.hierarchy_lookups, 6);
+    assert_eq!(
+        exact.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+        (0u64..25).collect::<Vec<_>>()
+    );
 }

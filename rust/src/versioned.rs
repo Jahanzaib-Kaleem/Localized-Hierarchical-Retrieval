@@ -616,6 +616,55 @@ impl VersionedDataset {
         })
     }
 
+    /// Stream visible logical row IDs proven by exact equality indexes while planning each
+    /// immutable layer once. A predicate that is logically true for every row in an older schema
+    /// layer (for example, an absent evolved column queried as NULL) is represented by an empty
+    /// physical predicate set and streams that layer without inventing an index lookup.
+    pub(crate) fn scan_row_ids<F>(
+        &self,
+        predicates: &[LogicalPredicate],
+        batch_rows: usize,
+        mut visit: F,
+    ) -> io::Result<(u64, u64, u64)>
+    where
+        F: FnMut(u64) -> io::Result<()>,
+    {
+        let mut rows_checked = 0u64;
+        let mut pages_touched = 0u64;
+        let mut hierarchy_lookups = 0u64;
+
+        let mut run_layer =
+            |layer_id: u32, dataset: &LogicalDataset, map: &[Option<usize>]| -> io::Result<()> {
+                let Some(layer_predicates) =
+                    self.predicates_for_layer(dataset, map, predicates)?
+                else {
+                    return Ok(());
+                };
+                let stats = dataset.scan_row_ids(&layer_predicates, batch_rows, |row_id| {
+                    if self.visible_in_layer(row_id, layer_id) {
+                        visit(row_id)?;
+                    }
+                    Ok(())
+                })?;
+                let Some(stats) = stats else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "exact singleton row-ID scan was not fully covered",
+                    ));
+                };
+                rows_checked = rows_checked.saturating_add(stats.rows_checked);
+                pages_touched = pages_touched.saturating_add(stats.pages_touched);
+                hierarchy_lookups = hierarchy_lookups.saturating_add(stats.hierarchy_lookups);
+                Ok(())
+            };
+
+        run_layer(0, &self.base, &self.base_logical_to_physical)?;
+        for layer in &self.deltas {
+            run_layer(layer.id, &layer.dataset, &layer.logical_to_physical)?;
+        }
+        Ok((rows_checked, pages_touched, hierarchy_lookups))
+    }
+
     /// Stream equality candidates layer-by-layer while planning each immutable layer exactly once.
     /// Visibility is applied before candidates reach the caller. Ordering across layers is not
     /// guaranteed; callers that need a bounded ordered result can retain only their best LIMIT IDs.

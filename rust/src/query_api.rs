@@ -324,30 +324,93 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
     }
 
     if let Some(eq) = equality_predicates(&prepared, dataset.schema()) {
-        // Equality predicates retain the optimized exact-index route. The stable logical-row cursor
-        // is translated to a lower bound inside each layer instead of replaying a growing prefix.
         enforce_deadline(deadline)?;
-        let result = dataset.query_values_after(
-            &eq,
-            if request.select.is_empty() { None } else { Some(&request.select) },
-            request.after_row_id,
-            request.limit,
-        )?;
-        enforce_rows_examined(request.max_rows_examined, result.rows_checked)?;
+
+        // Preserve the established single-exact path byte-for-byte at the execution boundary.
+        // It already has specialized bounded lookup behavior and is the latency baseline we must
+        // not regress while improving broader conjunctions.
+        if eq.len() == 1 {
+            let result = dataset.query_values_after(
+                &eq,
+                if request.select.is_empty() { None } else { Some(&request.select) },
+                request.after_row_id,
+                request.limit,
+            )?;
+            enforce_rows_examined(request.max_rows_examined, result.rows_checked)?;
+            enforce_deadline(deadline)?;
+            let mut rows: Vec<_> = result.rows.into_iter()
+                .map(|row| QueryApiRow { row_id: row.row_id, values: row.values })
+                .collect();
+            let next_cursor = (rows.len() == request.limit).then(|| rows.last().unwrap().row_id);
+            return Ok(QueryResponse {
+                returned: rows.len(),
+                rows: std::mem::take(&mut rows),
+                next_cursor,
+                stats: QueryApiStats {
+                    hits: result.hits,
+                    rows_examined: result.rows_checked,
+                    pages_touched: result.pages_touched,
+                    hierarchy_lookups: result.hierarchy_lookups,
+                    elapsed_micros: start.elapsed().as_micros(),
+                    optimized_equality_route: true,
+                },
+            });
+        }
+
+        // Multi-exact queries need the exact global hit count but not a giant final candidate Vec.
+        // Stream every exact match with one plan per layer, retain only the smallest LIMIT logical
+        // IDs after the cursor, then materialize output columns for those rows alone.
+        const EXACT_BATCH: usize = 4096;
+        let mut hits = 0u64;
+        let mut best_row_ids = BinaryHeap::<u64>::with_capacity(request.limit.saturating_add(1));
+        let (rows_examined, pages_touched, hierarchy_lookups) =
+            dataset.scan_row_ids(&eq, EXACT_BATCH, |row_id| {
+                hits = hits.saturating_add(1);
+                if request.after_row_id.is_some_and(|cursor| row_id <= cursor) {
+                    return Ok(());
+                }
+                if best_row_ids.len() < request.limit {
+                    best_row_ids.push(row_id);
+                } else if request.limit > 0
+                    && best_row_ids.peek().is_some_and(|&largest| row_id < largest)
+                {
+                    best_row_ids.pop();
+                    best_row_ids.push(row_id);
+                }
+                Ok(())
+            })?;
+        enforce_rows_examined(request.max_rows_examined, rows_examined)?;
         enforce_deadline(deadline)?;
-        let mut rows: Vec<_> = result.rows.into_iter()
-            .map(|row| QueryApiRow { row_id: row.row_id, values: row.values })
-            .collect();
+
+        let mut row_ids = best_row_ids.into_vec();
+        row_ids.sort_unstable();
+        let mut rows = Vec::with_capacity(row_ids.len());
+        for row_id in row_ids {
+            let values = dataset.row_values(row_id)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("exact row {row_id} disappeared during snapshot query"),
+                )
+            })?;
+            let selected = projection
+                .iter()
+                .map(|&column| NamedValue {
+                    column: dataset.schema().columns[column].name.clone(),
+                    value: values[column].clone(),
+                })
+                .collect();
+            rows.push(QueryApiRow { row_id, values: selected });
+        }
         let next_cursor = (rows.len() == request.limit).then(|| rows.last().unwrap().row_id);
         return Ok(QueryResponse {
             returned: rows.len(),
-            rows: std::mem::take(&mut rows),
+            rows,
             next_cursor,
             stats: QueryApiStats {
-                hits: result.hits,
-                rows_examined: result.rows_checked,
-                pages_touched: result.pages_touched,
-                hierarchy_lookups: result.hierarchy_lookups,
+                hits,
+                rows_examined,
+                pages_touched,
+                hierarchy_lookups,
                 elapsed_micros: start.elapsed().as_micros(),
                 optimized_equality_route: true,
             },
