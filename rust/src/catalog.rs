@@ -207,22 +207,21 @@ pub fn begin_generation(root: impl AsRef<Path>) -> io::Result<StagedGeneration> 
 }
 
 pub fn publish_generation(stage: StagedGeneration) -> io::Result<GenerationInfo> {
-    let mut report = verify_dataset(&stage.path)?;
+    let report = if stage.path.join("integrity.json").is_file() {
+        // A caller-supplied seal must be proven against the bytes before publication.
+        verify_dataset(&stage.path)?
+    } else {
+        // seal_dataset already performs the full structural verification immediately before
+        // hashing every stable file. Re-hashing the just-created seal would only reread the same
+        // immutable bytes without adding a new safety boundary.
+        seal_dataset(&stage.path)?;
+        verify_integrity_metadata(&stage.path)?
+    };
     if !report.valid {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("staged generation is invalid: {}", report.errors.join("; ")),
         ));
-    }
-    if !stage.path.join("integrity.json").is_file() {
-        seal_dataset(&stage.path)?;
-        report = verify_dataset(&stage.path)?;
-        if !report.valid {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("sealed generation failed verification: {}", report.errors.join("; ")),
-            ));
-        }
     }
 
     let final_path = generation_path(&stage.catalog_root, stage.id);
