@@ -158,6 +158,16 @@ impl FlatPostingHierarchy {
         (start, self.upper_bound(key))
     }
 
+    fn lower_bound_row(&self, start: usize, end: usize, target: u32) -> usize {
+        let mut lo = start;
+        let mut hi = end;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.row_at(mid) < target { lo = mid + 1; } else { hi = mid; }
+        }
+        lo
+    }
+
     pub fn row_count(&self, key: u64) -> usize {
         let (start, end) = self.bounds(key);
         end - start
@@ -168,24 +178,39 @@ impl FlatPostingHierarchy {
         (start..end).map(|i| self.row_at(i)).collect()
     }
 
-    pub fn intersect_rows(&self, key: u64, seed: &[u32]) -> Vec<u32> {
-        if seed.is_empty() {
-            return Vec::new();
-        }
+    pub fn rows_from(&self, key: u64, first_row: u32, limit: usize) -> Vec<u32> {
+        if limit == 0 { return Vec::new(); }
         let (start, end) = self.bounds(key);
-        let mut out = Vec::with_capacity(seed.len().min(end - start));
+        let lo = self.lower_bound_row(start, end, first_row);
+        (lo..end).take(limit).map(|i| self.row_at(i)).collect()
+    }
+
+    pub fn contains_row(&self, key: u64, row: u32) -> bool {
+        let (start, end) = self.bounds(key);
+        let pos = self.lower_bound_row(start, end, row);
+        pos < end && self.row_at(pos) == row
+    }
+
+    pub fn intersect_rows(&self, key: u64, seed: &[u32]) -> Vec<u32> {
+        if seed.is_empty() { return Vec::new(); }
+        let (start, end) = self.bounds(key);
+        let len = end - start;
+        let mut out = Vec::with_capacity(seed.len().min(len));
+        if len > seed.len().saturating_mul(16) {
+            for &row in seed {
+                let pos = self.lower_bound_row(start, end, row);
+                if pos < end && self.row_at(pos) == row { out.push(row); }
+            }
+            return out;
+        }
         let mut i = 0usize;
-        let mut j = start;
+        let mut j = self.lower_bound_row(start, end, seed[0]);
         while i < seed.len() && j < end {
             let row = self.row_at(j);
             match seed[i].cmp(&row) {
                 std::cmp::Ordering::Less => i += 1,
                 std::cmp::Ordering::Greater => j += 1,
-                std::cmp::Ordering::Equal => {
-                    out.push(row);
-                    i += 1;
-                    j += 1;
-                }
+                std::cmp::Ordering::Equal => { out.push(row); i += 1; j += 1; }
             }
         }
         out
@@ -225,6 +250,9 @@ mod tests {
         assert_eq!(x.rows(1), vec![2, 8]);
         assert_eq!(x.rows(4), vec![0, 7, 11]);
         assert_eq!(x.rows(10), vec![3]);
+        assert_eq!(x.rows_from(4, 7, 2), vec![7, 11]);
+        assert!(x.contains_row(4, 11));
+        assert!(!x.contains_row(4, 9));
         assert_eq!(x.intersect_rows(4, &[0, 2, 7, 9, 11, 13]), vec![0, 7, 11]);
         assert_eq!(x.total_rows(), 6);
         assert_eq!(FlatPostingHierarchy::estimated_bytes(6), Some((HEADER + 6 * RECORD) as u64));

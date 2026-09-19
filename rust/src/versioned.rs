@@ -294,13 +294,16 @@ impl VersionedDataset {
     fn logical_row(
         &self,
         row: LogicalRow,
-        map: &[Option<usize>],
+        _map: &[Option<usize>],
         projection: &[usize],
     ) -> LogicalRow {
         let mut values = Vec::with_capacity(projection.len());
         for &logical in projection {
-            let value = map[logical]
-                .and_then(|physical| row.values.get(physical))
+            let name = self.schema.columns[logical].name.as_str();
+            let value = row
+                .values
+                .iter()
+                .find(|value| value.column.as_str() == name)
                 .and_then(|value| value.value.clone());
             values.push(NamedValue {
                 column: self.schema.columns[logical].name.clone(),
@@ -403,6 +406,24 @@ impl VersionedDataset {
         Ok((hidden_hits, hidden_rows))
     }
 
+    fn hidden_row_count(
+        &self,
+        layer_id: u32,
+        dataset: &LogicalDataset,
+    ) -> usize {
+        let mut hidden_rows = 0usize;
+        for index in 0..self.visibility.len() {
+            let Some((row_id, target)) = self.visibility.entry(index) else { continue; };
+            if matches!(target, VisibilityTarget::Layer(target_layer) if target_layer == layer_id) {
+                continue;
+            }
+            if dataset.physical_row_id(row_id).is_some() {
+                hidden_rows = hidden_rows.saturating_add(1);
+            }
+        }
+        hidden_rows
+    }
+
     pub fn explain_values(
         &self,
         predicates: &[LogicalPredicate],
@@ -495,6 +516,77 @@ impl VersionedDataset {
         Ok(LogicalQueryResult {
             hits,
             returned: rows.len(),
+            rows_checked,
+            pages_touched,
+            hierarchy_lookups,
+            rows,
+        })
+    }
+
+    /// Internal page-only equality route used by residual-filter execution. It preserves
+    /// versioned visibility and logical row ordering, but deliberately avoids the global hit-count
+    /// work performed by query_values_after.
+    pub(crate) fn query_values_page_after(
+        &self,
+        predicates: &[LogicalPredicate],
+        select: Option<&[String]>,
+        after_row_id: Option<u64>,
+        limit: usize,
+    ) -> io::Result<LogicalQueryResult> {
+        let projection = self.projection_indices(select)?;
+        let mut rows_checked = 0u64;
+        let mut pages_touched = 0u64;
+        let mut hierarchy_lookups = 0u64;
+        let mut rows = Vec::<LogicalRow>::new();
+
+        let mut run_layer =
+            |layer_id: u32, dataset: &LogicalDataset, map: &[Option<usize>]| -> io::Result<()> {
+                let Some(layer_predicates) =
+                    self.predicates_for_layer(dataset, map, predicates)?
+                else {
+                    return Ok(());
+                };
+                let hidden_rows = self.hidden_row_count(layer_id, dataset);
+                let fetch_limit = limit.saturating_add(hidden_rows);
+                let layer_select = projection
+                    .iter()
+                    .filter_map(|&logical| {
+                        map[logical].map(|physical| dataset.schema().columns[physical].name.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let result = dataset.query_values_page_after(
+                    &layer_predicates,
+                    Some(&layer_select),
+                    after_row_id,
+                    fetch_limit,
+                )?;
+                rows_checked = rows_checked.saturating_add(result.rows_checked);
+                pages_touched = pages_touched.saturating_add(result.pages_touched);
+                hierarchy_lookups = hierarchy_lookups.saturating_add(result.hierarchy_lookups);
+                rows.extend(
+                    result
+                        .rows
+                        .into_iter()
+                        .filter(|row| self.visible_in_layer(row.row_id, layer_id))
+                        .map(|row| self.logical_row(row, map, &projection)),
+                );
+                Ok(())
+            };
+
+        run_layer(0, &self.base, &self.base_logical_to_physical)?;
+        for layer in &self.deltas {
+            run_layer(layer.id, &layer.dataset, &layer.logical_to_physical)?;
+        }
+        rows.sort_unstable_by_key(|row| row.row_id);
+        rows.dedup_by_key(|row| row.row_id);
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+        let returned = rows.len();
+
+        Ok(LogicalQueryResult {
+            hits: returned as u64,
+            returned,
             rows_checked,
             pages_touched,
             hierarchy_lookups,

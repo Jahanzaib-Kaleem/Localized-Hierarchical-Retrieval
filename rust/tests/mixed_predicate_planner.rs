@@ -93,3 +93,106 @@ fn mixed_equality_and_range_uses_bounded_equality_candidates() {
         expected
     );
 }
+
+
+fn multi_schema() -> DatasetSchema {
+    DatasetSchema::new(vec![
+        ColumnSchema {
+            name: "id".into(),
+            logical_type: LogicalType::Unsigned,
+            nullable: false,
+            normalization: Normalization::Trim,
+            null_values: vec![],
+        },
+        ColumnSchema {
+            name: "group".into(),
+            logical_type: LogicalType::Text,
+            nullable: false,
+            normalization: Normalization::TrimLowercase,
+            null_values: vec![],
+        },
+        ColumnSchema {
+            name: "region".into(),
+            logical_type: LogicalType::Text,
+            nullable: false,
+            normalization: Normalization::TrimLowercase,
+            null_values: vec![],
+        },
+        ColumnSchema {
+            name: "visits".into(),
+            logical_type: LogicalType::Unsigned,
+            nullable: false,
+            normalization: Normalization::Trim,
+            null_values: vec![],
+        },
+    ])
+    .unwrap()
+}
+
+#[test]
+fn mixed_multi_equality_and_range_preserves_exact_hits_and_projection() {
+    let catalog = tempfile::tempdir().unwrap();
+    let source = catalog.path().join("mixed-multi.csv");
+    let mut csv = String::from("id,group,region,visits\n");
+    let mut expected = Vec::new();
+    for row in 0u64..50_000 {
+        let group = if row % 2 == 0 { "target" } else { "other" };
+        let region = if row % 3 == 0 { "east" } else { "west" };
+        let visits = row % 1_000;
+        if group == "target" && region == "east" && (250..=260).contains(&visits) {
+            expected.push(row);
+        }
+        csv.push_str(&format!("{row},{group},{region},{visits}\n"));
+    }
+    fs::write(&source, csv).unwrap();
+    import_csv(
+        catalog.path(),
+        &source,
+        &multi_schema(),
+        &CsvImportConfig {
+            page_rows: 128,
+            batch_rows: 1_024,
+            max_sort_records: 50_000,
+            dictionary_run_bytes: 64 * 1024,
+            accelerators: vec![],
+        },
+    )
+    .unwrap();
+
+    let dataset = VersionedDataset::open(catalog.path()).unwrap();
+    let response = execute_query(
+        &dataset,
+        &QueryRequest {
+            filters: vec![
+                QueryFilter::Eq {
+                    column: "group".into(),
+                    value: Some("TARGET".into()),
+                },
+                QueryFilter::Eq {
+                    column: "region".into(),
+                    value: Some("EAST".into()),
+                },
+                QueryFilter::Range {
+                    column: "visits".into(),
+                    gte: Some("250".into()),
+                    lte: Some("260".into()),
+                },
+            ],
+            select: vec!["id".into()],
+            limit: 25,
+            after_row_id: None,
+            max_rows_examined: Some(9_000),
+            timeout_ms: Some(5_000),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(response.stats.hits as usize, expected.len());
+    assert_eq!(response.returned, expected.len().min(25));
+    assert!(response.stats.optimized_equality_route);
+    assert!(response.stats.rows_examined <= 8_334);
+    assert_eq!(
+        response.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+        expected.into_iter().take(25).collect::<Vec<_>>()
+    );
+}

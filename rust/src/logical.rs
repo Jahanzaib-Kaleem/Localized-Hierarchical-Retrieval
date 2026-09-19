@@ -169,6 +169,30 @@ impl LogicalDataset {
         Ok(values)
     }
 
+    fn decode_physical_projection(
+        &self,
+        physical: u64,
+        projection: &[usize],
+    ) -> io::Result<Vec<Option<String>>> {
+        let tokens = self.engine.row_projection(physical, projection).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "physical row ID does not exist")
+        })?;
+        let mut values = Vec::with_capacity(tokens.len());
+        for (&column, raw_token) in projection.iter().zip(tokens) {
+            let token = u32::try_from(raw_token).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "row token exceeds u32")
+            })?;
+            let decoded = self.dictionaries[column].decode(token).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "row token absent from dictionary")
+            })?;
+            values.push(match decoded {
+                DecodedValue::Null => None,
+                DecodedValue::Text(text) => Some(text.to_owned()),
+            });
+        }
+        Ok(values)
+    }
+
     fn encoded_predicates(
         &self,
         predicates: &[LogicalPredicate],
@@ -291,12 +315,62 @@ impl LogicalDataset {
             self.engine.query_row_ids_from(&encoded, limit, first_physical);
         let mut rows = Vec::with_capacity(physical_ids.len());
         for physical in physical_ids {
-            let decoded = self.decode_physical_values(physical)?;
+            let decoded = self.decode_physical_projection(physical, &projection)?;
             let mut values = Vec::with_capacity(projection.len());
-            for &column in &projection {
+            for (slot, &column) in projection.iter().enumerate() {
                 values.push(NamedValue {
                     column: self.schema.columns[column].name.clone(),
-                    value: decoded[column].clone(),
+                    value: decoded[slot].clone(),
+                });
+            }
+            let row_id = self.row_ids.logical(physical).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "query returned unmapped row ID")
+            })?;
+            rows.push(LogicalRow { row_id, values });
+        }
+        Ok(LogicalQueryResult {
+            hits: stats.hits,
+            returned: rows.len(),
+            rows_checked: stats.rows_checked,
+            pages_touched: stats.pages_touched,
+            hierarchy_lookups: stats.hierarchy_lookups,
+            rows,
+        })
+    }
+
+    /// Internal page-only exact route. Unlike query_values_after, this does not compute a
+    /// global hit count; it is used by higher-level residual-filter execution to consume the
+    /// equality candidate stream without rebuilding the complete conjunction for each page.
+    pub(crate) fn query_values_page_after(
+        &self,
+        predicates: &[LogicalPredicate],
+        select: Option<&[String]>,
+        after_row_id: Option<u64>,
+        limit: usize,
+    ) -> io::Result<LogicalQueryResult> {
+        let projection = self.projection(select)?;
+        let Some(encoded) = self.encoded_predicates(predicates)? else {
+            return Ok(LogicalQueryResult {
+                hits: 0,
+                returned: 0,
+                rows_checked: 0,
+                pages_touched: 0,
+                hierarchy_lookups: 0,
+                rows: Vec::new(),
+            });
+        };
+        let first_physical = self.first_physical_after(after_row_id);
+        let (physical_ids, stats) =
+            self.engine
+                .query_row_ids_page_from(&encoded, limit, first_physical);
+        let mut rows = Vec::with_capacity(physical_ids.len());
+        for physical in physical_ids {
+            let decoded = self.decode_physical_projection(physical, &projection)?;
+            let mut values = Vec::with_capacity(projection.len());
+            for (slot, &column) in projection.iter().enumerate() {
+                values.push(NamedValue {
+                    column: self.schema.columns[column].name.clone(),
+                    value: decoded[slot].clone(),
                 });
             }
             let row_id = self.row_ids.logical(physical).ok_or_else(|| {

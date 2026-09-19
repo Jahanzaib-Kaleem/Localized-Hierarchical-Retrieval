@@ -107,6 +107,15 @@ impl RowHierarchyData {
             _ => None,
         }
     }
+    fn page_rows_from(&self, key: u64, first_row: u32, limit: usize) -> Vec<u32> {
+        match self {
+            Self::Sparse(x) => x.rows_from(key, first_row, limit),
+            Self::Dense(x) => x.rows_from(key, first_row, limit),
+            Self::Delta(x) => x.rows_from(key, first_row, limit),
+            Self::Flat(x) => x.rows_from(key, first_row, limit),
+            Self::BitSlice(x) => x.rows_from(key, first_row, limit),
+        }
+    }
     fn intersect_rows(&self, key: u64, seed: &[u32]) -> Vec<u32> {
         match self {
             Self::Sparse(x) => x.intersect_rows(key, seed),
@@ -152,6 +161,12 @@ struct RowPlanSelection {
 
 struct RowPlan {
     rows: Vec<u32>,
+    lookups: u64,
+    fully_covered: bool,
+    selected: Vec<RowPlanSelection>,
+}
+
+struct RowSelectionPlan {
     lookups: u64,
     fully_covered: bool,
     selected: Vec<RowPlanSelection>,
@@ -317,12 +332,11 @@ impl Engine {
         None
     }
 
-    fn candidate_rows_with_lookups(&self, predicates: &[Predicate]) -> Option<RowPlan> {
+    fn row_selection_plan(&self, predicates: &[Predicate]) -> Option<RowSelectionPlan> {
         let query = match self.query_map(predicates) {
             Some(query) => query,
             None => {
-                return Some(RowPlan {
-                    rows: vec![],
+                return Some(RowSelectionPlan {
                     lookups: 0,
                     fully_covered: true,
                     selected: vec![],
@@ -342,8 +356,7 @@ impl Engine {
                     columns: hierarchy.columns.clone(),
                 };
                 if count == 0 {
-                    return Some(RowPlan {
-                        rows: vec![],
+                    return Some(RowSelectionPlan {
                         lookups: 1,
                         fully_covered: true,
                         selected: vec![candidate],
@@ -396,13 +409,30 @@ impl Engine {
         }
 
         selected.sort_unstable_by_key(|x| x.count);
-        let first = selected.first()?;
+        Some(RowSelectionPlan {
+            lookups: considered,
+            fully_covered: uncovered.is_empty(),
+            selected,
+        })
+    }
 
+    fn candidate_rows_with_lookups(&self, predicates: &[Predicate]) -> Option<RowPlan> {
+        let plan = self.row_selection_plan(predicates)?;
+        if plan.selected.is_empty() || plan.selected[0].count == 0 {
+            return Some(RowPlan {
+                rows: vec![],
+                lookups: plan.lookups,
+                fully_covered: plan.fully_covered,
+                selected: plan.selected,
+            });
+        }
+
+        let first = &plan.selected[0];
         // Low-cardinality singleton indexes are bit-sliced. When composition starts with two
         // such indexes, intersect their equality masks word-at-a-time instead of materializing
         // either huge singleton posting list.
-        let (mut rows, next) = if selected.len() >= 2 {
-            let second = &selected[1];
+        let (mut rows, next) = if plan.selected.len() >= 2 {
+            let second = &plan.selected[1];
             let first_data = &self.row_hier[first.index].data;
             let second_data = &self.row_hier[second.index].data;
             if let (Some(a), Some(b)) = (first_data.bitslice(), second_data.bitslice()) {
@@ -414,7 +444,7 @@ impl Engine {
             (self.row_hier[first.index].data.rows(first.key), 1usize)
         };
 
-        for candidate in &selected[next..] {
+        for candidate in &plan.selected[next..] {
             rows = self.row_hier[candidate.index]
                 .data
                 .intersect_rows(candidate.key, &rows);
@@ -425,10 +455,78 @@ impl Engine {
 
         Some(RowPlan {
             rows,
-            lookups: considered,
-            fully_covered: uncovered.is_empty(),
-            selected,
+            lookups: plan.lookups,
+            fully_covered: plan.fully_covered,
+            selected: plan.selected,
         })
+    }
+
+    fn candidate_row_page_from(
+        &self,
+        predicates: &[Predicate],
+        limit: usize,
+        first_row: u64,
+    ) -> Option<(Vec<u64>, QueryStats)> {
+        let plan = self.row_selection_plan(predicates)?;
+        if !plan.fully_covered {
+            return None;
+        }
+        let mut out = Vec::with_capacity(limit.min(1024));
+        if limit == 0
+            || plan.selected.is_empty()
+            || plan.selected[0].count == 0
+            || first_row >= self.rows
+            || first_row > u32::MAX as u64
+        {
+            return Some((
+                out,
+                QueryStats {
+                    hits: 0,
+                    rows_checked: 0,
+                    pages_touched: 0,
+                    hierarchy_lookups: plan.lookups,
+                },
+            ));
+        }
+
+        const DRIVER_BATCH: usize = 4096;
+        let driver = &plan.selected[0];
+        let mut cursor = first_row as u32;
+        loop {
+            let mut rows = self.row_hier[driver.index]
+                .data
+                .page_rows_from(driver.key, cursor, DRIVER_BATCH);
+            if rows.is_empty() {
+                break;
+            }
+            let fetched = rows.len();
+            let last = *rows.last().unwrap();
+            for candidate in &plan.selected[1..] {
+                rows = self.row_hier[candidate.index]
+                    .data
+                    .intersect_rows(candidate.key, &rows);
+                if rows.is_empty() {
+                    break;
+                }
+            }
+            let remaining = limit.saturating_sub(out.len());
+            out.extend(rows.into_iter().take(remaining).map(|row| row as u64));
+            if out.len() >= limit || fetched < DRIVER_BATCH || last == u32::MAX {
+                break;
+            }
+            cursor = last + 1;
+        }
+
+        let returned = out.len() as u64;
+        Some((
+            out,
+            QueryStats {
+                hits: returned,
+                rows_checked: 0,
+                pages_touched: 0,
+                hierarchy_lookups: plan.lookups,
+            },
+        ))
     }
 
     fn candidate_pages_with_lookups(&self, predicates: &[Predicate]) -> (Vec<u32>, u64) {
@@ -666,6 +764,22 @@ impl Engine {
         self.query_row_ids_from(predicates, limit, 0)
     }
 
+    /// Internal bounded-page route for callers that only need the next exact matches rather than
+    /// the global hit count. Multi-predicate conjunctions stream the smallest posting in bounded
+    /// chunks and intersect each chunk before advancing, so LIMIT/cursor can stop candidate
+    /// production without materializing the complete conjunction.
+    pub fn query_row_ids_page_from(
+        &self,
+        predicates: &[Predicate],
+        limit: usize,
+        first_row: u64,
+    ) -> (Vec<u64>, QueryStats) {
+        if let Some(result) = self.candidate_row_page_from(predicates, limit, first_row) {
+            return result;
+        }
+        self.query_row_ids_from(predicates, limit, first_row)
+    }
+
     pub fn query_row_ids_from(
         &self,
         predicates: &[Predicate],
@@ -747,6 +861,20 @@ impl Engine {
             }
         }
         (out, stats)
+    }
+
+    pub fn row_projection(&self, id: u64, columns: &[usize]) -> Option<Vec<u64>> {
+        if columns.iter().any(|&column| column >= self.columns) {
+            return None;
+        }
+        let segment = self.segments.iter().find(|segment| {
+            id >= segment.row_start && id < segment.row_start + segment.data.rows() as u64
+        })?;
+        let local = (id - segment.row_start) as usize;
+        columns
+            .iter()
+            .map(|&column| segment.data.value(local, column))
+            .collect()
     }
 
     pub fn row(&self, id: u64) -> Option<Vec<u64>> {
