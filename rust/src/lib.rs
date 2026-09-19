@@ -30,6 +30,7 @@ pub mod query_api;
 pub mod recovery;
 pub mod rowids;
 pub mod schema;
+pub mod segmented_import;
 pub mod segment;
 pub mod service;
 pub mod snapshot;
@@ -50,7 +51,8 @@ pub use buckets::{
 };
 pub use catalog::{
     abandon_generation, begin_generation, list_generations, publish_generation,
-    resolve_dataset_root, rollback_generation, vacuum_generations, GenerationInfo,
+    publish_presealed_generation, resolve_dataset_root, rollback_generation,
+    vacuum_generations, GenerationInfo,
     StagedGeneration, VacuumReport,
 };
 pub use compaction::{compact_dataset, CompactionConfig, CompactionReport};
@@ -79,8 +81,10 @@ pub use maintenance::restore_backup;
 pub use manifest::{ensure_supported_format, HierarchyMeta, Manifest, SegmentMeta, DATASET_FORMAT};
 pub use mutation::{apply_mutations, Mutation, MutationConfig, MutationReport};
 pub use operations::{
-    backup_dataset, dataset_status, read_integrity_manifest, seal_dataset, verify_dataset,
-    DatasetStatus, IntegrityEntry, IntegrityManifest, VerificationReport,
+    backup_dataset, dataset_status, install_integrity_manifest, integrity_entry_for_file,
+    read_integrity_manifest, seal_dataset, verify_dataset, verify_dataset_structure,
+    verify_integrity_metadata, DatasetStatus, IntegrityEntry, IntegrityManifest,
+    VerificationReport,
 };
 pub use overlay::{
     delta_path, read_overlay, write_overlay, write_visibility, DeltaLayerMeta, OverlayCatalog,
@@ -94,6 +98,12 @@ pub use rowids::{RowIdMap, RowIdWriter, ROW_IDS_FILE};
 pub use schema::{
     read_schema, read_schema_file, write_schema, ColumnSchema, DatasetSchema, LogicalType,
     Normalization, SCHEMA_FORMAT,
+};
+pub use segmented_import::{
+    append_csv_segmented_with_progress, import_csv_segmented_initial_with_progress,
+    segmented_import_disk_floor, SegmentedCsvAppendReport, SegmentedCsvImportConfig,
+    SegmentedCsvImportReport, DEFAULT_SEGMENTED_DICTIONARY_RUN_BYTES,
+    DEFAULT_SEGMENTED_PART_BYTES, DEFAULT_SEGMENTED_PART_ROWS,
 };
 pub use segment::Segment;
 pub use service::{serve, ServiceApiKey, ServiceConfig, ServiceRole};

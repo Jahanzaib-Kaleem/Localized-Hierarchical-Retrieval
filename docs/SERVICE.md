@@ -35,6 +35,9 @@ Example configuration:
   "max_batch_rows": 65536,
   "max_sort_records": 1000000,
   "max_dictionary_run_bytes": 268435456,
+  "import_part_rows": 1000000,
+  "import_part_bytes": 536870912,
+  "max_concurrent_import_builds": 1,
   "behind_tls_proxy": false
 }
 ```
@@ -106,9 +109,11 @@ The browser previews at most a small sample, then uploads the CSV in sequential 
 Jobs use explicit modes:
 
 - `create`: the selected bucket must still be empty while the catalog writer lock is held;
-- `append`: the selected bucket must be ready and the incoming schema must match its existing schema by name/type/nullability/normalization/null literals.
+- `append`: the selected bucket must be ready. Columns are matched by name; existing column semantics remain stable, missing columns read as NULL for the appended rows, and newly named columns extend the logical schema with NULLs in older layers.
 
-Append builds only the incoming CSV as a new exact-indexed delta layer and atomically publishes a generation that references the unchanged existing layers.
+Studio create and append jobs use bounded segmented bulk ingestion. The default part ceiling is 1,000,000 rows or about 512 MiB of decoded CSV payload, whichever comes first; operators can tune these with `import_part_rows` and `import_part_bytes`. Each part is built/indexed independently and attached to one unpublished immutable generation. A failure in any later part abandons the whole stage, so `CURRENT` never exposes a partially imported file.
+
+On Linux, disposable Studio upload files also attempt sparse hole punching after a successfully absorbed part. This can return already-consumed source blocks to the filesystem while later parts are built. Failure to reclaim a range is safe: LHR keeps the source range allocated and the per-part free-space guard remains authoritative.
 
 Status exposes `uploading`, `queued`, `validating`, `parsing`, `building`, `indexing`, `publishing`, `complete`, and `failed`. Upload byte counts are exact. Parsed-row counts are exposed when known; fake ETAs/percentages are not.
 
@@ -163,7 +168,9 @@ The service enforces independent ceilings for:
 - mutations per transaction;
 - builder batch size;
 - external-sort records;
-- dictionary-sort memory budget.
+- dictionary-sort memory budget;
+- segmented-import row and byte ceilings per internal part;
+- concurrent heavy import builders (`max_concurrent_import_builds`, default `1` on the low-RAM appliance profile).
 
 Client-supplied limits can tighten these ceilings but cannot raise them.
 
@@ -197,9 +204,9 @@ Persistent per-query telemetry is separate from process counters. It records que
 
 ## Concurrency and snapshots
 
-The database is generation-based. Readers pin a generation with a snapshot lease; publication of a new generation does not change an in-flight reader's view. Lease-aware vacuum will not remove a generation still held by an active reader.
+The database is generation-based. Readers pin a generation with a snapshot lease; publication of a new generation does not change an in-flight reader's view. Lease-aware vacuum will not remove a generation still held by an active reader. The HTTP service caches the opened `VersionedDataset` for each bucket and keys that cache by the resolved generation path, so datasets containing many immutable ingest parts do not reopen every dictionary/index mmap on every request; the cache swaps automatically after `CURRENT` changes.
 
-Writers still obey each selected bucket catalog's single-writer publication lock. Named buckets have independent catalogs/locks, while multi-bucket transfer/combine operations preserve their own validation/publication rules. Expensive imports, mutations, compaction, recovery, and index administration run outside the async HTTP executor on blocking worker threads after any network upload has been streamed to disk.
+Writers still obey each selected bucket catalog's single-writer publication lock. Named buckets have independent catalogs/locks, while multi-bucket transfer/combine operations preserve their own validation/publication rules. Expensive imports, mutations, compaction, recovery, and index administration run outside the async HTTP executor on blocking worker threads after any network upload has been streamed to disk. Import uploads can proceed independently, but completed jobs wait behind a dedicated import-build semaphore; the default permits only one CPU/RAM-heavy import build at a time so multiple buckets cannot accidentally multiply the bounded working set on a ~1 GiB host.
 
 ## Graceful shutdown
 

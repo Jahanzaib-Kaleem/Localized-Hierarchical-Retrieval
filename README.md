@@ -90,7 +90,7 @@ The production-oriented implementation lives under `rust/`. It now includes:
 - exact decomposition of a single bounded signed/unsigned integer range spanning at most 256 values when exact singleton coverage is available;
 - cursor lower-bound seeking for equality queries, including bounded result production for broad single-predicate `bitslice` and `densepost` paths;
 - bounded-memory CSV, JSONL, and streaming JSON-array ingestion with rejects, progress, disk preflight, and resumable preparation;
-- chunked/resumable Studio CSV jobs with explicit create-vs-append semantics, durable progress/error state, atomic publication, delta-based append, ragged-row NULL padding, and additive schema evolution by column name;
+- chunked/resumable Studio CSV jobs with explicit create-vs-append semantics, durable progress/error state, atomic publication, **bounded segmented bulk ingestion** (1M-row / ~512 MiB parts), Linux source-hole reclamation, delta-based append, ragged-row NULL padding, and additive schema evolution by column name;
 - persistent workload telemetry with P50/P95/P99 and workload-based accelerator recommendations;
 - an authenticated role-based HTTP service with rate/concurrency/body/resource limits, audit logging, health/readiness, and Prometheus-style metrics;
 - LHR Studio: an API-backed React/TypeScript/TanStack control plane with bucket management, a 50-row database browser, CSV import, row transfer/combine workflows, and exact query tooling;

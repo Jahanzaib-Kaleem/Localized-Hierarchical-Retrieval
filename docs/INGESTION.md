@@ -13,7 +13,9 @@ Studio:
 3. review the inferred schema;
 4. create the dataset.
 
-The Rust importer is two-pass and bounded-memory. Dictionary values are externally sorted using bounded runs, canonical rows are encoded in bounded batches, exact indexes are built on disk, the staged generation is verified/sealed, and only then is `CURRENT` atomically replaced.
+The low-level Rust importer is two-pass and bounded-memory. Studio import jobs now place that engine behind a **segmented bulk-ingest layer** instead of asking one engine build to absorb an arbitrarily large CSV. The Studio path reads the source sequentially, seals bounded internal parts (default limits: 1,000,000 rows or about 512 MiB of decoded CSV payload), builds each part independently, attaches later parts as immutable internal delta layers, verifies the complete versioned dataset, and only then atomically replaces `CURRENT`.
+
+This means import memory and temporary index-spool size are bounded by an individual part rather than the total file size. A 60 GiB CSV therefore increases the number of immutable parts and total build time; it does not turn into one 60 GiB dictionary/index build. The part engine additionally caps dictionary sort runs at 16 MiB by default for Studio jobs.
 
 CSV headers define column identity. A shorter data record is treated as having missing trailing fields: those cells become NULL and the affected columns are automatically widened to nullable in the published schema. A record containing more fields than the header is still rejected because those extra cells have no safe column names to map to.
 
@@ -117,14 +119,19 @@ Expected scaling:
 
 ```text
 CSV size grows
+  -> number of bounded immutable parts grows
   -> upload/build time grows
-  -> temporary/final disk grows
-  -> application buffers remain bounded
+  -> final disk grows
+  -> per-part application memory/index spool remains bounded
 ```
 
-The strict importer still performs disk-backed dictionary sorting and bounded row batches. Studio chunks are fixed-size. Append builds only the incoming delta rather than materializing the existing bucket in RAM.
+Studio chunks are fixed-size. The segmented builder writes only one bounded CSV part at a time, invokes the existing exact engine for that part, attaches the verified result to the unpublished generation, removes the temporary part workspace, and continues. Append similarly adds only new bounded parts; existing published rows remain hard-linked and immutable.
 
-Peak disk usage during create includes the staged upload plus the generation being built. During append it includes the upload plus the incoming delta build and staging metadata. Before accepting a job, the service requires a conservative free-space floor of four times the declared CSV size plus 64 MiB. This is a safety floor, not a promise that every data distribution will fit: dictionary/index amplification can still require more. Existing generation files are normally hard-linked within the same data filesystem; on a filesystem where hard-linking is unavailable the existing clone helper can fall back to copying, which increases peak disk requirements.
+For disposable Studio upload files on Linux, LHR attempts `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE` after a part has been successfully absorbed into the unpublished generation. On ext4 and other supporting filesystems this releases blocks belonging to already-consumed source ranges while preserving the logical file offset used by the CSV reader. Failure to punch a hole is treated as an optimization miss, not data corruption; the per-part free-space guard continues to protect the build.
+
+The admission floor is therefore no longer four complete copies of the whole CSV. It reserves roughly two source-file sizes plus bounded part workspace (currently four 512 MiB part budgets plus 64 MiB). Before every part build LHR also re-checks free space and requires four times that actual part file plus 64 MiB. These are conservative guards, not guarantees: unusual dictionary/index amplification can still exhaust a filesystem, in which case the unpublished stage is abandoned and the previous `CURRENT` remains unchanged.
+
+Existing generation files are normally hard-linked within the same data filesystem; on a filesystem where hard-linking is unavailable the clone helper can fall back to copying, which increases peak disk requirements.
 
 ## Reverse proxies
 
@@ -150,6 +157,9 @@ export LHR_BASE_URL=http://127.0.0.1:8787
 export LHR_API_TOKEN='...'
 
 python3 scripts/benchmark_import_jobs.py --sizes-mb 50 250 700 1024
+
+# Crunchbase-like width: base 5 columns + 36 extra text columns = 41 total
+python3 scripts/benchmark_import_jobs.py --sizes-mb 700 1024 --extra-text-columns 36
 ```
 
 This creates a separate temporary bucket for each size, generates the CSV incrementally under `/data/temp/import-benchmarks`, uploads it in the same 4 MiB chunks as Studio, polls real server stages, samples RSS/page faults/process I/O and free disk, verifies final row count plus exact lookups, prints JSON reports, and deletes the benchmark buckets/files by default. It never touches the default/Apollo bucket.

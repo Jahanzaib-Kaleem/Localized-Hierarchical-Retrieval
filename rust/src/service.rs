@@ -1,12 +1,14 @@
 use crate::{
-    add_index, append_csv_delta_with_progress, apply_mutations_delta, combine_buckets,
+    add_index, apply_mutations_delta, combine_buckets,
     compact_dataset, create_bucket, dataset_stats, dataset_status, delete_bucket, drop_index,
-    execute_query, import_csv, import_csv_initial_with_progress, leased_generation_ids, list_buckets,
-    list_generations, planner_indexes_for_request, rebuild_index, record_query,
-    recover_catalog, rename_bucket, require_bucket_root, resolve_dataset_root, transfer_rows,
-    vacuum_with_reader_leases, workload_report, CompactionConfig, CsvImportConfig,
-    CsvImportProgress, CsvImportStage, DatasetSchema, Mutation, MutationConfig, QueryRequest,
-    VersionedDataset, DEFAULT_BUCKET,
+    execute_query, import_csv, import_csv_segmented_initial_with_progress, leased_generation_ids,
+    list_buckets, list_generations, planner_indexes_for_request, rebuild_index, record_query,
+    recover_catalog, rename_bucket, require_bucket_root, resolve_dataset_root,
+    segmented_import_disk_floor, transfer_rows, vacuum_with_reader_leases, workload_report,
+    append_csv_segmented_with_progress, CompactionConfig, CsvImportConfig, CsvImportProgress,
+    CsvImportStage, DatasetSchema, Mutation, MutationConfig, QueryRequest,
+    SegmentedCsvImportConfig, VersionedDataset, DEFAULT_BUCKET,
+    DEFAULT_SEGMENTED_PART_BYTES, DEFAULT_SEGMENTED_PART_ROWS,
 };
 use axum::{
     body::{Body, Bytes},
@@ -58,6 +60,9 @@ fn default_mutation_ops() -> usize { 100_000 }
 fn default_batch_rows() -> usize { 65_536 }
 fn default_sort_records() -> usize { 1_000_000 }
 fn default_dictionary_bytes() -> usize { 256 * 1024 * 1024 }
+fn default_import_part_rows() -> u64 { DEFAULT_SEGMENTED_PART_ROWS }
+fn default_import_part_bytes() -> u64 { DEFAULT_SEGMENTED_PART_BYTES }
+fn default_import_builds() -> usize { 1 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -87,6 +92,12 @@ pub struct ServiceConfig {
     pub max_sort_records: usize,
     #[serde(default = "default_dictionary_bytes")]
     pub max_dictionary_run_bytes: usize,
+    #[serde(default = "default_import_part_rows")]
+    pub import_part_rows: u64,
+    #[serde(default = "default_import_part_bytes")]
+    pub import_part_bytes: u64,
+    #[serde(default = "default_import_builds")]
+    pub max_concurrent_import_builds: usize,
     /// A non-loopback HTTP bind is refused unless the operator explicitly confirms that TLS is
     /// terminated by a trusted reverse proxy or the listener lives on an equivalently protected
     /// private transport.
@@ -105,6 +116,8 @@ impl Default for ServiceConfig {
             max_rows_examined: default_rows_examined(), max_query_timeout_ms: default_timeout_ms(),
             max_mutation_ops: default_mutation_ops(), max_batch_rows: default_batch_rows(),
             max_sort_records: default_sort_records(), max_dictionary_run_bytes: default_dictionary_bytes(),
+            import_part_rows: default_import_part_rows(), import_part_bytes: default_import_part_bytes(),
+            max_concurrent_import_builds: default_import_builds(),
             behind_tls_proxy: false, audit_log: None,
         }
     }
@@ -129,6 +142,8 @@ impl ServiceConfig {
         if self.max_body_bytes == 0 || self.max_import_bytes == 0 || self.max_concurrent_requests == 0 || self.max_query_limit == 0
             || self.max_rows_examined == 0 || self.max_query_timeout_ms == 0 || self.max_mutation_ops == 0
             || self.max_batch_rows == 0 || self.max_sort_records == 0 || self.max_dictionary_run_bytes == 0
+            || self.import_part_rows == 0 || self.import_part_bytes == 0
+            || self.max_concurrent_import_builds == 0
         {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "service resource ceilings must all be greater than zero"));
         }
@@ -166,6 +181,8 @@ struct ServiceState {
     metrics: Arc<RuntimeMetrics>,
     next_request_id: Arc<AtomicU64>,
     import_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    import_builds: Arc<Semaphore>,
+    dataset_cache: Arc<Mutex<HashMap<String, Arc<VersionedDataset>>>>,
 }
 
 fn hash_token(token: &str) -> [u8; 32] { Sha256::digest(token.as_bytes()).into() }
@@ -386,7 +403,12 @@ fn recover_import_jobs(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn run_import_job(root: PathBuf, config: CsvImportConfig, id: String) {
+fn run_import_job(
+    root: PathBuf,
+    mut config: SegmentedCsvImportConfig,
+    id: String,
+    dataset_cache: Arc<Mutex<HashMap<String, Arc<VersionedDataset>>>>,
+) {
     let Ok(mut job) = load_import_job(&root, &id) else {
         return;
     };
@@ -424,8 +446,12 @@ fn run_import_job(root: PathBuf, config: CsvImportConfig, id: String) {
     };
 
     let schema = job.schema.clone();
+    // Import-job uploads are disposable staging copies, unlike CLI/source files. The segmented
+    // builder may therefore reclaim already-consumed ranges on Linux while the unpublished
+    // generation grows.
+    config.reclaim_consumed_source = true;
     let result: io::Result<Value> = match job.mode {
-        ImportMode::Create => import_csv_initial_with_progress(
+        ImportMode::Create => import_csv_segmented_initial_with_progress(
             &bucket_root,
             &upload,
             &schema,
@@ -436,7 +462,7 @@ fn run_import_job(root: PathBuf, config: CsvImportConfig, id: String) {
             serde_json::to_value(report)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
         }),
-        ImportMode::Append => append_csv_delta_with_progress(
+        ImportMode::Append => append_csv_segmented_with_progress(
             &bucket_root,
             &upload,
             &schema,
@@ -451,6 +477,9 @@ fn run_import_job(root: PathBuf, config: CsvImportConfig, id: String) {
 
     match result {
         Ok(report) => {
+            if let Ok(mut cache) = dataset_cache.lock() {
+                cache.remove(&job.bucket);
+            }
             job.status = "complete".into();
             job.stage = "complete".into();
             job.result = Some(report);
@@ -630,6 +659,42 @@ fn selected_bucket_root(state: &ServiceState, bucket: &str, request_id: u64) -> 
         .map_err(|error| ApiError::new(io_status(&error), request_id, error.to_string()))
 }
 
+fn cached_dataset(
+    cache: &Mutex<HashMap<String, Arc<VersionedDataset>>>,
+    bucket: &str,
+    root: &Path,
+) -> io::Result<Arc<VersionedDataset>> {
+    let resolved = resolve_dataset_root(root)?;
+    {
+        let guard = cache
+            .lock()
+            .map_err(|_| io::Error::other("dataset cache lock poisoned"))?;
+        if let Some(dataset) = guard.get(bucket) {
+            if dataset.root() == resolved {
+                return Ok(Arc::clone(dataset));
+            }
+        }
+    }
+
+    let opened = Arc::new(VersionedDataset::open(&resolved)?);
+    let mut guard = cache
+        .lock()
+        .map_err(|_| io::Error::other("dataset cache lock poisoned"))?;
+    if let Some(dataset) = guard.get(bucket) {
+        if dataset.root() == resolved {
+            return Ok(Arc::clone(dataset));
+        }
+    }
+    guard.insert(bucket.to_owned(), Arc::clone(&opened));
+    Ok(opened)
+}
+
+fn invalidate_cached_dataset(state: &ServiceState, bucket: &str) {
+    if let Ok(mut cache) = state.dataset_cache.lock() {
+        cache.remove(bucket);
+    }
+}
+
 
 async fn healthz() -> impl IntoResponse { Json(json!({"status":"ok"})) }
 async fn readyz(State(state): State<ServiceState>) -> Response {
@@ -655,9 +720,11 @@ async fn query(State(state): State<ServiceState>, headers: HeaderMap, Json(paylo
     let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
     let telemetry_root = root.clone();
     let request_copy = request.clone();
+    let cache = Arc::clone(&state.dataset_cache);
+    let cache_bucket = bucket.clone();
     state.metrics.queries.fetch_add(1, Ordering::Relaxed);
     let result = tokio::task::spawn_blocking(move || -> io::Result<_> {
-        let dataset = VersionedDataset::open(&root)?;
+        let dataset = cached_dataset(&cache, &cache_bucket, &root)?;
         let indexes = planner_indexes_for_request(&dataset, &request_copy)?;
         let response = execute_query(&dataset, &request_copy)?;
         record_query(&telemetry_root, &request_copy, &response, indexes)?;
@@ -682,8 +749,10 @@ async fn dataset_schema(
 ) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Read).await?;
     let root = selected_bucket_root(&state, &selector.bucket, guard.request_id)?;
+    let cache = Arc::clone(&state.dataset_cache);
+    let cache_bucket = selector.bucket.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let dataset = VersionedDataset::open(root)?;
+        let dataset = cached_dataset(&cache, &cache_bucket, &root)?;
         Ok::<DatasetSchema, io::Error>(dataset.schema().clone())
     })
     .await
@@ -715,10 +784,10 @@ async fn import_job_create(
         .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
     let available = fs2::available_space(&state.root)
         .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
-    let disk_floor = request
-        .bytes_total
-        .saturating_mul(4)
-        .saturating_add(64 * 1024 * 1024);
+    // Segmented Studio imports retain the full upload initially, but reclaim consumed extents
+    // while bounded parts are built. Reserve one additional source-sized budget plus bounded
+    // active-part workspace instead of requiring four complete copies of the entire CSV.
+    let disk_floor = segmented_import_disk_floor(request.bytes_total, state.config.import_part_bytes);
     if disk_floor > available {
         return Err(ApiError::new(
             StatusCode::INSUFFICIENT_STORAGE,
@@ -971,9 +1040,19 @@ async fn import_job_complete(
         .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
 
     let root = state.root.clone();
-    let config = csv_import_config(&state.config);
+    let config = segmented_csv_import_config(&state.config);
     let job_id = id.clone();
-    tokio::task::spawn_blocking(move || run_import_job(root, config, job_id));
+    let import_builds = Arc::clone(&state.import_builds);
+    let dataset_cache = Arc::clone(&state.dataset_cache);
+    tokio::spawn(async move {
+        let Ok(_permit) = import_builds.acquire_owned().await else {
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            run_import_job(root, config, job_id, dataset_cache)
+        })
+        .await;
+    });
     Ok(Json(json!({"request_id":guard.request_id,"result":job})))
 }
 
@@ -997,6 +1076,14 @@ fn csv_import_config(config: &ServiceConfig) -> CsvImportConfig {
         dictionary_run_bytes: defaults.dictionary_run_bytes.min(config.max_dictionary_run_bytes),
         accelerators: Vec::new(),
     }
+}
+
+fn segmented_csv_import_config(config: &ServiceConfig) -> SegmentedCsvImportConfig {
+    let mut out = SegmentedCsvImportConfig::from_engine(csv_import_config(config));
+    out.part_rows = config.import_part_rows;
+    out.part_bytes = config.import_part_bytes;
+    out.reclaim_consumed_source = true;
+    out
 }
 
 async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap, mut multipart: Multipart) -> Result<Json<Value>, ApiError> {
@@ -1347,6 +1434,7 @@ async fn bucket_delete(
         .map_err(|error| join_error(guard.request_id, error))?;
     match result {
         Ok(()) => {
+            invalidate_cached_dataset(&state, &request.id);
             state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
             let _ = append_audit(&state, &AuditEvent {
                 timestamp_ms: now_ms(), request_id: guard.request_id, actor: &guard.actor,
@@ -1565,6 +1653,8 @@ pub async fn serve(root: impl AsRef<Path>, config: ServiceConfig) -> io::Result<
         config: Arc::new(config.clone()), principals: Arc::new(principals), rates: Arc::new(Mutex::new(HashMap::new())),
         metrics: Arc::new(RuntimeMetrics::default()), next_request_id: Arc::new(AtomicU64::new(0)),
         import_locks: Arc::new(Mutex::new(HashMap::new())),
+        import_builds: Arc::new(Semaphore::new(config.max_concurrent_import_builds)),
+        dataset_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     // The control plane is allowed to start before a dataset exists. /readyz remains false and
     // data endpoints return ordinary errors until an initial generation is imported/published.

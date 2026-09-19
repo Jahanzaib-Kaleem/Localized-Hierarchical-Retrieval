@@ -211,11 +211,6 @@ impl Dictionary {
         if this.offset_at(0)? != 0 || this.offset_at(values as usize)? as usize > this.map.len() - data {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad dictionary offsets"));
         }
-        for i in 1..=values as usize {
-            if this.offset_at(i)? < this.offset_at(i - 1)? {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "unsorted dictionary offsets"));
-            }
-        }
         Ok(this)
     }
 
@@ -245,6 +240,24 @@ impl Dictionary {
 
     pub fn value_count(&self) -> u64 {
         self.values
+    }
+
+    /// Deep structural verification is intentionally separate from normal open. Runtime opens
+    /// validate the header and boundary offsets in O(1); explicit verification walks the full
+    /// offset table before a freshly built immutable part is trusted/sealed.
+    pub fn verify_offsets(&self) -> io::Result<()> {
+        let mut previous = self.offset_at(0)?;
+        for i in 1..=self.values as usize {
+            let current = self.offset_at(i)?;
+            if current < previous || current as usize > self.map.len().saturating_sub(self.data) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsorted or out-of-range dictionary offsets",
+                ));
+            }
+            previous = current;
+        }
+        Ok(())
     }
 
     pub fn cardinality(&self) -> u64 {

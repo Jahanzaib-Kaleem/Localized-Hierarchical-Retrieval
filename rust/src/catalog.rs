@@ -1,4 +1,4 @@
-use crate::{seal_dataset, verify_dataset};
+use crate::{seal_dataset, verify_dataset, verify_integrity_metadata};
 use fs2::FileExt;
 use serde::Serialize;
 use std::{
@@ -207,22 +207,61 @@ pub fn begin_generation(root: impl AsRef<Path>) -> io::Result<StagedGeneration> 
 }
 
 pub fn publish_generation(stage: StagedGeneration) -> io::Result<GenerationInfo> {
-    let mut report = verify_dataset(&stage.path)?;
+    let report = if stage.path.join("integrity.json").is_file() {
+        // A caller-supplied seal must be proven against the bytes before publication.
+        verify_dataset(&stage.path)?
+    } else {
+        // seal_dataset already performs the full structural verification immediately before
+        // hashing every stable file. Re-hashing the just-created seal would only reread the same
+        // immutable bytes without adding a new safety boundary.
+        seal_dataset(&stage.path)?;
+        verify_integrity_metadata(&stage.path)?
+    };
     if !report.valid {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("staged generation is invalid: {}", report.errors.join("; ")),
         ));
     }
+
+    let final_path = generation_path(&stage.catalog_root, stage.id);
+    if final_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "generation id already exists",
+        ));
+    }
+    fs::rename(&stage.path, &final_path)?;
+    atomic_write_current(&stage.catalog_root, stage.id)?;
+
+    Ok(GenerationInfo {
+        id: stage.id,
+        path: final_path,
+        current: true,
+        sealed: true,
+    })
+}
+
+/// Publish a generation whose integrity manifest was composed from already verified immutable
+/// parts. This performs structural checks plus file-set/size validation without re-hashing every
+/// unchanged byte. Full checksum verification remains available through `verify_dataset` and
+/// recovery.
+pub fn publish_presealed_generation(stage: StagedGeneration) -> io::Result<GenerationInfo> {
     if !stage.path.join("integrity.json").is_file() {
-        seal_dataset(&stage.path)?;
-        report = verify_dataset(&stage.path)?;
-        if !report.valid {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("sealed generation failed verification: {}", report.errors.join("; ")),
-            ));
-        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "presealed publication requires integrity.json",
+        ));
+    }
+    let report = verify_integrity_metadata(&stage.path)?;
+    if !report.valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "presealed staged generation is invalid: {}",
+                report.errors.join("; ")
+            ),
+        ));
     }
 
     let final_path = generation_path(&stage.catalog_root, stage.id);
@@ -343,7 +382,9 @@ pub fn vacuum_generations(
         let stale_work = name.starts_with(".mutation-work-")
             || name.starts_with(".restore-work-")
             || name.starts_with(".delta-work-")
-            || name.starts_with(".compaction-work-");
+            || name.starts_with(".compaction-work-")
+            || name.starts_with(".segmented-import-work-")
+            || name.starts_with(".segmented-append-work-");
         if entry.file_type()?.is_dir() && stale_work {
             bytes_reclaimed = bytes_reclaimed.saturating_add(directory_bytes(&entry.path())?);
             fs::remove_dir_all(entry.path())?;
