@@ -780,6 +780,75 @@ impl Engine {
         self.query_row_ids_from(predicates, limit, first_row)
     }
 
+    /// Stream a fully covered exact conjunction with one planning pass and bounded candidate
+    /// batches. This is intended for higher-level residual filters that must inspect every exact
+    /// equality candidate to compute a global hit count without rebuilding the conjunction plan
+    /// for every page.
+    pub(crate) fn scan_row_ids<F>(
+        &self,
+        predicates: &[Predicate],
+        batch_rows: usize,
+        first_row: u64,
+        mut visit: F,
+    ) -> io::Result<Option<QueryStats>>
+    where
+        F: FnMut(&[u64]) -> io::Result<()>,
+    {
+        let first_row = first_row.min(self.rows);
+        let Some(plan) = self.row_selection_plan(predicates) else {
+            return Ok(None);
+        };
+        if !plan.fully_covered {
+            return Ok(None);
+        }
+
+        let mut stats = QueryStats {
+            hierarchy_lookups: plan.lookups,
+            ..Default::default()
+        };
+        if batch_rows == 0
+            || plan.selected.is_empty()
+            || plan.selected[0].count == 0
+            || first_row >= self.rows
+            || first_row > u32::MAX as u64
+        {
+            return Ok(Some(stats));
+        }
+
+        let driver = &plan.selected[0];
+        let mut cursor = first_row as u32;
+        loop {
+            let mut rows = self.row_hier[driver.index]
+                .data
+                .page_rows_from(driver.key, cursor, batch_rows);
+            if rows.is_empty() {
+                break;
+            }
+            let fetched = rows.len();
+            let last = *rows.last().unwrap();
+            for candidate in &plan.selected[1..] {
+                rows = self.row_hier[candidate.index]
+                    .data
+                    .intersect_rows(candidate.key, &rows);
+                if rows.is_empty() {
+                    break;
+                }
+            }
+
+            stats.hits = stats.hits.saturating_add(rows.len() as u64);
+            if !rows.is_empty() {
+                let page = rows.into_iter().map(|row| row as u64).collect::<Vec<_>>();
+                visit(&page)?;
+            }
+
+            if fetched < batch_rows || last == u32::MAX {
+                break;
+            }
+            cursor = last + 1;
+        }
+        Ok(Some(stats))
+    }
+
     pub fn query_row_ids_from(
         &self,
         predicates: &[Predicate],

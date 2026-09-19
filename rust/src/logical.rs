@@ -1,6 +1,6 @@
 use crate::{
     read_schema, resolve_dataset_root, DatasetSchema, DecodedValue, Dictionary, Engine, Manifest,
-    Predicate, QueryExplain, RowIdMap,
+    Predicate, QueryExplain, QueryStats, RowIdMap,
 };
 use serde::Serialize;
 use std::{
@@ -315,12 +315,14 @@ impl LogicalDataset {
             self.engine.query_row_ids_from(&encoded, limit, first_physical);
         let mut rows = Vec::with_capacity(physical_ids.len());
         for physical in physical_ids {
-            let decoded = self.decode_physical_projection(physical, &projection)?;
+            // Preserve the established normal exact-query materialization path. Projection-aware
+            // reads are reserved for residual-filter streaming below.
+            let decoded = self.decode_physical_values(physical)?;
             let mut values = Vec::with_capacity(projection.len());
-            for (slot, &column) in projection.iter().enumerate() {
+            for &column in &projection {
                 values.push(NamedValue {
                     column: self.schema.columns[column].name.clone(),
-                    value: decoded[slot].clone(),
+                    value: decoded[column].clone(),
                 });
             }
             let row_id = self.row_ids.logical(physical).ok_or_else(|| {
@@ -385,6 +387,43 @@ impl LogicalDataset {
             pages_touched: stats.pages_touched,
             hierarchy_lookups: stats.hierarchy_lookups,
             rows,
+        })
+    }
+
+    /// Stream every row ID proven by a fully covered exact equality conjunction. The engine
+    /// plans the conjunction once, keeps only a bounded posting batch in memory, and this layer
+    /// decodes only the requested projection for each candidate.
+    pub(crate) fn scan_values<F>(
+        &self,
+        predicates: &[LogicalPredicate],
+        select: Option<&[String]>,
+        batch_rows: usize,
+        mut visit: F,
+    ) -> io::Result<Option<QueryStats>>
+    where
+        F: FnMut(LogicalRow) -> io::Result<()>,
+    {
+        let projection = self.projection(select)?;
+        let Some(encoded) = self.encoded_predicates(predicates)? else {
+            return Ok(Some(QueryStats::default()));
+        };
+
+        self.engine.scan_row_ids(&encoded, batch_rows, 0, |physical_ids| {
+            for &physical in physical_ids {
+                let decoded = self.decode_physical_projection(physical, &projection)?;
+                let mut values = Vec::with_capacity(projection.len());
+                for (slot, &column) in projection.iter().enumerate() {
+                    values.push(NamedValue {
+                        column: self.schema.columns[column].name.clone(),
+                        value: decoded[slot].clone(),
+                    });
+                }
+                let row_id = self.row_ids.logical(physical).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "query returned unmapped row ID")
+                })?;
+                visit(LogicalRow { row_id, values })?;
+            }
+            Ok(())
         })
     }
 

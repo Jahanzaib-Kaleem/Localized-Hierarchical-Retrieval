@@ -291,7 +291,29 @@ impl VersionedDataset {
         Ok(Some(out))
     }
 
-    fn logical_row(
+    fn logical_row_full(
+        &self,
+        row: LogicalRow,
+        map: &[Option<usize>],
+        projection: &[usize],
+    ) -> LogicalRow {
+        let mut values = Vec::with_capacity(projection.len());
+        for &logical in projection {
+            let value = map[logical]
+                .and_then(|physical| row.values.get(physical))
+                .and_then(|value| value.value.clone());
+            values.push(NamedValue {
+                column: self.schema.columns[logical].name.clone(),
+                value,
+            });
+        }
+        LogicalRow {
+            row_id: row.row_id,
+            values,
+        }
+    }
+
+    fn logical_row_projected(
         &self,
         row: LogicalRow,
         _map: &[Option<usize>],
@@ -498,7 +520,7 @@ impl VersionedDataset {
                         .rows
                         .into_iter()
                         .filter(|row| self.visible_in_layer(row.row_id, layer_id))
-                        .map(|row| self.logical_row(row, map, &projection)),
+                        .map(|row| self.logical_row_full(row, map, &projection)),
                 );
                 Ok(())
             };
@@ -568,7 +590,7 @@ impl VersionedDataset {
                         .rows
                         .into_iter()
                         .filter(|row| self.visible_in_layer(row.row_id, layer_id))
-                        .map(|row| self.logical_row(row, map, &projection)),
+                        .map(|row| self.logical_row_projected(row, map, &projection)),
                 );
                 Ok(())
             };
@@ -592,6 +614,68 @@ impl VersionedDataset {
             hierarchy_lookups,
             rows,
         })
+    }
+
+    /// Stream equality candidates layer-by-layer while planning each immutable layer exactly once.
+    /// Visibility is applied before candidates reach the caller. Ordering across layers is not
+    /// guaranteed; callers that need a bounded ordered result can retain only their best LIMIT IDs.
+    pub(crate) fn scan_values<F>(
+        &self,
+        predicates: &[LogicalPredicate],
+        select: Option<&[String]>,
+        batch_rows: usize,
+        mut visit: F,
+    ) -> io::Result<(u64, u64, u64)>
+    where
+        F: FnMut(LogicalRow) -> io::Result<()>,
+    {
+        let projection = self.projection_indices(select)?;
+        let mut rows_checked = 0u64;
+        let mut pages_touched = 0u64;
+        let mut hierarchy_lookups = 0u64;
+
+        let mut run_layer =
+            |layer_id: u32, dataset: &LogicalDataset, map: &[Option<usize>]| -> io::Result<()> {
+                let Some(layer_predicates) =
+                    self.predicates_for_layer(dataset, map, predicates)?
+                else {
+                    return Ok(());
+                };
+                let layer_select = projection
+                    .iter()
+                    .filter_map(|&logical| {
+                        map[logical].map(|physical| dataset.schema().columns[physical].name.clone())
+                    })
+                    .collect::<Vec<_>>();
+
+                let stats = dataset.scan_values(
+                    &layer_predicates,
+                    Some(&layer_select),
+                    batch_rows,
+                    |row| {
+                        if !self.visible_in_layer(row.row_id, layer_id) {
+                            return Ok(());
+                        }
+                        visit(self.logical_row_projected(row, map, &projection))
+                    },
+                )?;
+                let Some(stats) = stats else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "exact singleton candidate scan was not fully covered",
+                    ));
+                };
+                rows_checked = rows_checked.saturating_add(stats.rows_checked);
+                pages_touched = pages_touched.saturating_add(stats.pages_touched);
+                hierarchy_lookups = hierarchy_lookups.saturating_add(stats.hierarchy_lookups);
+                Ok(())
+            };
+
+        run_layer(0, &self.base, &self.base_logical_to_physical)?;
+        for layer in &self.deltas {
+            run_layer(layer.id, &layer.dataset, &layer.logical_to_physical)?;
+        }
+        Ok((rows_checked, pages_touched, hierarchy_lookups))
     }
 
     /// Stream visible rows in stable logical-row-ID order without collecting the whole database.
