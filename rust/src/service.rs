@@ -1,5 +1,5 @@
 use crate::{
-    add_index, append_csv_delta_with_progress, apply_mutations_delta, combine_buckets,
+    add_index, apply_mutations_delta, combine_buckets,
     compact_dataset, create_bucket, dataset_stats, dataset_status, delete_bucket, drop_index,
     execute_query, import_csv, import_csv_segmented_initial_with_progress, leased_generation_ids,
     list_buckets, list_generations, planner_indexes_for_request, rebuild_index, record_query,
