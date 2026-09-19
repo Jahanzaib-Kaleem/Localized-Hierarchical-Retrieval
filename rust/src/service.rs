@@ -62,6 +62,7 @@ fn default_sort_records() -> usize { 1_000_000 }
 fn default_dictionary_bytes() -> usize { 256 * 1024 * 1024 }
 fn default_import_part_rows() -> u64 { DEFAULT_SEGMENTED_PART_ROWS }
 fn default_import_part_bytes() -> u64 { DEFAULT_SEGMENTED_PART_BYTES }
+fn default_import_builds() -> usize { 1 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -95,6 +96,8 @@ pub struct ServiceConfig {
     pub import_part_rows: u64,
     #[serde(default = "default_import_part_bytes")]
     pub import_part_bytes: u64,
+    #[serde(default = "default_import_builds")]
+    pub max_concurrent_import_builds: usize,
     /// A non-loopback HTTP bind is refused unless the operator explicitly confirms that TLS is
     /// terminated by a trusted reverse proxy or the listener lives on an equivalently protected
     /// private transport.
@@ -114,6 +117,7 @@ impl Default for ServiceConfig {
             max_mutation_ops: default_mutation_ops(), max_batch_rows: default_batch_rows(),
             max_sort_records: default_sort_records(), max_dictionary_run_bytes: default_dictionary_bytes(),
             import_part_rows: default_import_part_rows(), import_part_bytes: default_import_part_bytes(),
+            max_concurrent_import_builds: default_import_builds(),
             behind_tls_proxy: false, audit_log: None,
         }
     }
@@ -139,6 +143,7 @@ impl ServiceConfig {
             || self.max_rows_examined == 0 || self.max_query_timeout_ms == 0 || self.max_mutation_ops == 0
             || self.max_batch_rows == 0 || self.max_sort_records == 0 || self.max_dictionary_run_bytes == 0
             || self.import_part_rows == 0 || self.import_part_bytes == 0
+            || self.max_concurrent_import_builds == 0
         {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "service resource ceilings must all be greater than zero"));
         }
@@ -176,6 +181,7 @@ struct ServiceState {
     metrics: Arc<RuntimeMetrics>,
     next_request_id: Arc<AtomicU64>,
     import_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    import_builds: Arc<Semaphore>,
     dataset_cache: Arc<Mutex<HashMap<String, Arc<VersionedDataset>>>>,
 }
 
@@ -397,7 +403,12 @@ fn recover_import_jobs(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn run_import_job(root: PathBuf, mut config: SegmentedCsvImportConfig, id: String) {
+fn run_import_job(
+    root: PathBuf,
+    mut config: SegmentedCsvImportConfig,
+    id: String,
+    dataset_cache: Arc<Mutex<HashMap<String, Arc<VersionedDataset>>>>,
+) {
     let Ok(mut job) = load_import_job(&root, &id) else {
         return;
     };
@@ -466,6 +477,9 @@ fn run_import_job(root: PathBuf, mut config: SegmentedCsvImportConfig, id: Strin
 
     match result {
         Ok(report) => {
+            if let Ok(mut cache) = dataset_cache.lock() {
+                cache.remove(&job.bucket);
+            }
             job.status = "complete".into();
             job.stage = "complete".into();
             job.result = Some(report);
@@ -1028,7 +1042,17 @@ async fn import_job_complete(
     let root = state.root.clone();
     let config = segmented_csv_import_config(&state.config);
     let job_id = id.clone();
-    tokio::task::spawn_blocking(move || run_import_job(root, config, job_id));
+    let import_builds = Arc::clone(&state.import_builds);
+    let dataset_cache = Arc::clone(&state.dataset_cache);
+    tokio::spawn(async move {
+        let Ok(_permit) = import_builds.acquire_owned().await else {
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            run_import_job(root, config, job_id, dataset_cache)
+        })
+        .await;
+    });
     Ok(Json(json!({"request_id":guard.request_id,"result":job})))
 }
 
@@ -1629,6 +1653,7 @@ pub async fn serve(root: impl AsRef<Path>, config: ServiceConfig) -> io::Result<
         config: Arc::new(config.clone()), principals: Arc::new(principals), rates: Arc::new(Mutex::new(HashMap::new())),
         metrics: Arc::new(RuntimeMetrics::default()), next_request_id: Arc::new(AtomicU64::new(0)),
         import_locks: Arc::new(Mutex::new(HashMap::new())),
+        import_builds: Arc::new(Semaphore::new(config.max_concurrent_import_builds)),
         dataset_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     // The control plane is allowed to start before a dataset exists. /readyz remains false and
