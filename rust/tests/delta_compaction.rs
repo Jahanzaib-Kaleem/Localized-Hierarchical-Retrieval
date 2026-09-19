@@ -197,7 +197,7 @@ fn compaction_materializes_an_evolved_append_schema() {
     );
     assert_eq!(compacted.row_values(0).unwrap().unwrap()[3], None);
     assert_eq!(compacted.row_values(2).unwrap().unwrap()[3].as_deref(), Some("42"));
-    assert!(verify_versioned_dataset(catalog.path()).unwrap().valid);
+    assert!(verify_versioned_dataset(&report.generation.path).unwrap().valid);
 }
 
 #[test]
