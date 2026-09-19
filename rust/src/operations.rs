@@ -456,6 +456,11 @@ pub fn verify_dataset_structure(root: &Path) -> io::Result<VerificationReport> {
                 }
             }
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            warnings.push(
+                "dataset has no logical schema; dictionary deep verification was skipped".into(),
+            );
+        }
         Err(error) => errors.push(format!("schema: {error}")),
     }
 
