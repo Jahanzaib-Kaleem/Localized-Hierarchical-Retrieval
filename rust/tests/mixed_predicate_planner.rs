@@ -291,3 +291,104 @@ fn mixed_candidate_stream_plans_each_layer_once() {
         (0u64..25).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn mixed_stream_handles_null_from_schema_evolution_exactly() {
+    let catalog = tempfile::tempdir().unwrap();
+    let base_source = catalog.path().join("base-null-evolution.csv");
+    let delta_source = catalog.path().join("delta-null-evolution.csv");
+
+    let base_schema = DatasetSchema::new(vec![
+        ColumnSchema {
+            name: "id".into(),
+            logical_type: LogicalType::Unsigned,
+            nullable: false,
+            normalization: Normalization::Trim,
+            null_values: vec![],
+        },
+        ColumnSchema {
+            name: "group".into(),
+            logical_type: LogicalType::Text,
+            nullable: false,
+            normalization: Normalization::TrimLowercase,
+            null_values: vec![],
+        },
+        ColumnSchema {
+            name: "visits".into(),
+            logical_type: LogicalType::Unsigned,
+            nullable: false,
+            normalization: Normalization::Trim,
+            null_values: vec![],
+        },
+    ])
+    .unwrap();
+    let evolved_schema = DatasetSchema::new(vec![
+        base_schema.columns[0].clone(),
+        base_schema.columns[1].clone(),
+        base_schema.columns[2].clone(),
+        ColumnSchema {
+            name: "tag".into(),
+            logical_type: LogicalType::Text,
+            nullable: false,
+            normalization: Normalization::TrimLowercase,
+            null_values: vec![],
+        },
+    ])
+    .unwrap();
+    let config = CsvImportConfig {
+        page_rows: 32,
+        batch_rows: 64,
+        max_sort_records: 512,
+        dictionary_run_bytes: 8 * 1024,
+        accelerators: vec![],
+    };
+
+    let mut base_csv = String::from("id,group,visits\n");
+    let mut delta_csv = String::from("id,group,visits,tag\n");
+    for row in 0u64..100 {
+        base_csv.push_str(&format!("{row},target,{row}\n"));
+    }
+    for row in 100u64..200 {
+        delta_csv.push_str(&format!("{row},target,{},hot\n", row - 100));
+    }
+    fs::write(&base_source, base_csv).unwrap();
+    fs::write(&delta_source, delta_csv).unwrap();
+    import_csv(catalog.path(), &base_source, &base_schema, &config).unwrap();
+    append_csv_delta(catalog.path(), &delta_source, &evolved_schema, &config).unwrap();
+
+    let dataset = VersionedDataset::open(catalog.path()).unwrap();
+    let response = execute_query(
+        &dataset,
+        &QueryRequest {
+            filters: vec![
+                QueryFilter::Eq {
+                    column: "tag".into(),
+                    value: None,
+                },
+                QueryFilter::Range {
+                    column: "visits".into(),
+                    gte: Some("10".into()),
+                    lte: Some("19".into()),
+                },
+            ],
+            select: vec!["id".into(), "tag".into()],
+            limit: 50,
+            after_row_id: None,
+            max_rows_examined: Some(100),
+            timeout_ms: Some(5_000),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(response.stats.hits, 10);
+    assert_eq!(response.stats.rows_examined, 100);
+    assert_eq!(response.stats.hierarchy_lookups, 0);
+    assert_eq!(
+        response.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+        (10u64..20).collect::<Vec<_>>()
+    );
+    assert!(response
+        .rows
+        .iter()
+        .all(|row| row.values[1].column == "tag" && row.values[1].value.is_none()));
+}

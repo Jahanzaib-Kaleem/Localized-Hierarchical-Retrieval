@@ -192,6 +192,59 @@ fn matches_filters(schema: &DatasetSchema, values: &[Option<String>], filters: &
     Ok(true)
 }
 
+fn prepared_filter_column(filter: &PreparedFilter) -> usize {
+    match filter {
+        PreparedFilter::Eq { column, .. }
+        | PreparedFilter::In { column, .. }
+        | PreparedFilter::Range { column, .. } => *column,
+    }
+}
+
+fn matches_projected_filters(
+    schema: &DatasetSchema,
+    values: &[NamedValue],
+    filters: &[PreparedFilter],
+    slots: &[usize],
+) -> io::Result<bool> {
+    if filters.len() != slots.len() {
+        return Err(invalid("projected filter slot count mismatch"));
+    }
+    for (filter, &slot) in filters.iter().zip(slots) {
+        let projected = values.get(slot).ok_or_else(|| {
+            invalid(format!("projected filter slot {slot} is out of bounds"))
+        })?;
+        match filter {
+            PreparedFilter::Eq { value, .. } => {
+                if &projected.value != value {
+                    return Ok(false);
+                }
+            }
+            PreparedFilter::In { values: accepted, .. } => {
+                if accepted.binary_search(&projected.value).is_err() {
+                    return Ok(false);
+                }
+            }
+            PreparedFilter::Range { column, gte, lte } => {
+                let Some(value) = projected.value.as_deref() else {
+                    return Ok(false);
+                };
+                let kind = &schema.columns[*column].logical_type;
+                if let Some(lo) = gte {
+                    if compare_typed(kind, value, lo)? == Ordering::Less {
+                        return Ok(false);
+                    }
+                }
+                if let Some(hi) = lte {
+                    if compare_typed(kind, value, hi)? == Ordering::Greater {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn projection(schema: &DatasetSchema, select: &[String]) -> io::Result<Vec<usize>> {
     if select.is_empty() { return Ok((0..schema.columns.len()).collect()); }
     select.iter().map(|name| schema.column_index(name).ok_or_else(|| invalid(format!("unknown selected column {name}")))).collect()
@@ -437,14 +490,18 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
             .collect::<Vec<_>>();
         let mut residual_columns = residual_filters
             .iter()
-            .map(|filter| match filter {
-                PreparedFilter::Eq { column, .. }
-                | PreparedFilter::In { column, .. }
-                | PreparedFilter::Range { column, .. } => *column,
-            })
+            .map(prepared_filter_column)
             .collect::<Vec<_>>();
         residual_columns.sort_unstable();
         residual_columns.dedup();
+        let residual_slots = residual_filters
+            .iter()
+            .map(|filter| {
+                residual_columns
+                    .binary_search(&prepared_filter_column(filter))
+                    .expect("residual filter column must be projected")
+            })
+            .collect::<Vec<_>>();
         let candidate_select = residual_columns
             .iter()
             .map(|&column| dataset.schema().columns[column].name.clone())
@@ -465,18 +522,12 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
                     enforce_deadline(deadline)?;
                 }
 
-                let mut values = vec![None; dataset.schema().columns.len()];
-                for value in candidate.values {
-                    let column = dataset
-                        .schema()
-                        .column_index(&value.column)
-                        .ok_or_else(|| invalid(format!(
-                            "candidate projection returned unknown column {}",
-                            value.column
-                        )))?;
-                    values[column] = value.value;
-                }
-                if !matches_filters(dataset.schema(), &values, &residual_filters)? {
+                if !matches_projected_filters(
+                    dataset.schema(),
+                    &candidate.values,
+                    &residual_filters,
+                    &residual_slots,
+                )? {
                     return Ok(());
                 }
 
