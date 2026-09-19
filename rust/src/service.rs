@@ -773,7 +773,7 @@ async fn import_job_create(
     // Segmented Studio imports retain the full upload initially, but reclaim consumed extents
     // while bounded parts are built. Reserve one additional source-sized budget plus bounded
     // active-part workspace instead of requiring four complete copies of the entire CSV.
-    let disk_floor = segmented_import_disk_floor(request.bytes_total);
+    let disk_floor = segmented_import_disk_floor(request.bytes_total, state.config.import_part_bytes);
     if disk_floor > available {
         return Err(ApiError::new(
             StatusCode::INSUFFICIENT_STORAGE,
