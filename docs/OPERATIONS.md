@@ -60,6 +60,14 @@ Two ingestion surfaces exist.
 
 `lhr import csv` provides the original two-pass bounded-memory CSV builder. It externally sorts dictionary values, tokenizes rows in batches, writes canonical segments, and builds exact singleton indexes plus configured accelerators.
 
+### CSV append
+
+A ready catalog can be extended with `append_csv_delta`. Append validates schema compatibility, builds/indexes only the incoming CSV as a new immutable delta layer, allocates new monotonically increasing logical row IDs, and publishes the updated overlay atomically. Existing physical rows are not loaded into RAM or rewritten merely because new rows were appended.
+
+CSV column order may differ because headers are mapped by name. Missing/extra columns and type/nullability/normalization/null-literal mismatches are rejected.
+
+Studio reaches this primitive through the chunked import-job API described in [INGESTION.md](INGESTION.md).
+
 ### External/reject-aware ingestion
 
 `lhr import external` supports:

@@ -86,9 +86,11 @@ The production-oriented implementation lives under `rust/`. It now includes:
 - SHA-256 integrity seals, verified backup/restore, rollback, and recovery;
 - exact index administration, statistics, and EXPLAIN;
 - typed equality / set / numeric-range queries with stable cursor pagination and resource limits;
+- candidate-first mixed filtering: exact equality predicates can drive a bounded candidate stream before residual range/set checks instead of forcing a whole-dataset scan;
 - exact decomposition of a single bounded signed/unsigned integer range spanning at most 256 values when exact singleton coverage is available;
 - cursor lower-bound seeking for equality queries, including bounded result production for broad single-predicate `bitslice` and `densepost` paths;
-- CSV, JSONL, and streaming JSON-array ingestion with rejects, progress, disk preflight, and resumable preparation;
+- bounded-memory CSV, JSONL, and streaming JSON-array ingestion with rejects, progress, disk preflight, and resumable preparation;
+- chunked/resumable Studio CSV jobs with explicit create-vs-append semantics, durable progress/error state, atomic publication, and delta-based append;
 - persistent workload telemetry with P50/P95/P99 and workload-based accelerator recommendations;
 - an authenticated role-based HTTP service with rate/concurrency/body/resource limits, audit logging, health/readiness, and Prometheus-style metrics;
 - LHR Studio: an API-backed React/TypeScript/TanStack control plane with bucket management, a 50-row database browser, CSV import, row transfer/combine workflows, and exact query tooling;
@@ -171,7 +173,9 @@ The low-level engine accepts encoded equality predicates. The typed API adds:
 
 Pure equality queries retain the optimized exact-index path. Equality pagination seeks from the stable logical-row cursor rather than replaying an ever-growing prefix; for a broad single exact predicate backed by `bitslice` or `densepost`, the engine can produce only the requested page while taking the total hit count directly from the index.
 
-A request containing exactly one bounded signed/unsigned integer range can also use the exact singleton backbone when the interval spans at most 256 integer values and every visible layer has singleton coverage. LHR expands the interval into disjoint equality streams and merges them in stable logical-row order. Wider, open-ended, mixed, set-membership, or otherwise unaccelerated shapes retain the deterministic versioned-row fallback under explicit row/time ceilings.
+A request containing exactly one bounded signed/unsigned integer range can also use the exact singleton backbone when the interval spans at most 256 integer values and every visible layer has singleton coverage. LHR expands the interval into disjoint equality streams and merges them in stable logical-row order.
+
+For mixed shapes, usable exact equality predicates are now a candidate-driving access path: LHR streams their exact intersection in bounded pages and applies residual range/set checks only to those candidates. A whole visible-row scan is retained only when no better exact candidate route is available. Resource ceilings still apply to the residual rows examined.
 
 An empty filter list is the exact table-browse path used by Studio/API clients: it advances directly by stable logical row ID and materializes only the requested page.
 
@@ -201,7 +205,7 @@ The MCP tool surface covers:
 - compaction, vacuum, recovery and exact-index administration for admin-role clients;
 - a constrained admin software-update request that is consumed by a root-owned host watcher on supported Linux/systemd installs, without mounting the Docker socket into LHR.
 
-This is intended to let an AI client answer normal lead questions and also act as an operator when explicitly granted a stronger credential. Large file ingestion and filesystem backup/restore remain CLI/local by design.
+This is intended to let an AI client answer normal lead questions and also act as an operator when explicitly granted a stronger credential. MCP deliberately does not accept bulk file payloads. Large CSV ingestion is handled by the chunked Studio/HTTP import-job path or local CLI; filesystem backup/restore remains local-only by design.
 
 See [`docs/MCP.md`](docs/MCP.md).
 
@@ -223,6 +227,7 @@ See [`docs/FORMAT.md`](docs/FORMAT.md).
 - [`docs/SECURITY.md`](docs/SECURITY.md) — Studio lock screen, deployment secret bootstrap, credential rotation, and HTTPS requirements.
 - [`docs/MCP.md`](docs/MCP.md) — MCP connection, tool, security, diagnostic and AI-operator contract.
 - [`docs/BUCKETS.md`](docs/BUCKETS.md) — default/named bucket compatibility, row browsing, transfer, combine, and API semantics.
+- [`docs/INGESTION.md`](docs/INGESTION.md) — bounded-memory CSV create/append, resumable Studio uploads, progress/failure semantics, duplicate behavior, and proxy guidance.
 - [`docs/INSTALL_AND_UPGRADE.md`](docs/INSTALL_AND_UPGRADE.md) — idempotent manual upgrades and the host-side MCP update watcher.
 - [`docs/FORMAT.md`](docs/FORMAT.md) — LHR/1 on-disk compatibility contract.
 - [`docs/STREAMING.md`](docs/STREAMING.md) — historical page-routing/streaming prototype.

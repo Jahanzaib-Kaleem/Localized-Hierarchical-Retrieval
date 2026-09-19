@@ -41,7 +41,8 @@ The Data workspace provides:
 - the existing dataset automatically visible in the default bucket;
 - a database-style row browser with 50 rows per page;
 - stable cursor pagination rather than offset/prefix replay;
-- CSV import into the active bucket;
+- CSV create for an empty active bucket and explicit CSV append for a populated bucket;
+- resumable chunked upload progress plus persistent failure state for large Studio imports;
 - selected-row copy or move between buckets; an empty destination is initialized from the source schema, while populated destinations must have an identical schema;
 - whole-bucket combine into a new bucket using a streaming bounded-memory build;
 - schema and storage information for the active bucket.
@@ -71,7 +72,7 @@ Stats:
 GET /v1/stats?bucket=prospects
 ```
 
-CSV import includes a multipart `bucket` field. Mutations, compaction, vacuum, recovery, and index administration also accept a bucket.
+Studio CSV jobs carry the bucket in `POST /v1/admin/imports`; the legacy multipart import carries a `bucket` form field. Mutations, compaction, vacuum, recovery, and index administration also accept a bucket.
 
 Bucket management endpoints:
 
@@ -86,9 +87,13 @@ POST /v1/buckets/transfer
 
 Deleting the reserved default bucket is not allowed.
 
-## Combine semantics
+## Append vs combine
+
+Appending extends one ready bucket in place at the logical level. The incoming CSV must be schema-compatible, only the incoming rows are built into a new indexed delta layer, and publication is atomic.
 
 Combining buckets creates a new target bucket and leaves each source bucket unchanged. Source schemas must match exactly. Rows are streamed through a temporary CSV into the existing bounded-memory importer, so memory does not scale with the combined row count.
+
+See [INGESTION.md](INGESTION.md) for CSV create/append and large-upload behavior.
 
 ## Empty buckets
 

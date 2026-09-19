@@ -1,10 +1,13 @@
 import type {
-  ApiEnvelope, ApiFailure, BucketCombineReport, BucketInfo, BucketTransferReport, CsvImportReport,
-  DatasetStats, GenerationInfo, HealthResponse, ImportDatasetSchema, IndexChangeReport, MutationOperation,
-  MutationReport, QueryRequest, QueryResponse, ReadyResponse, VacuumReport, WorkloadReport,
+  ApiEnvelope, ApiFailure, BucketCombineReport, BucketInfo, BucketTransferReport, CsvImportResult,
+  DatasetStats, GenerationInfo, HealthResponse, ImportDatasetSchema, ImportJobStatus, ImportMode,
+  IndexChangeReport, MutationOperation, MutationReport, QueryRequest, QueryResponse, ReadyResponse,
+  VacuumReport, WorkloadReport,
 } from './types'
 
 const TOKEN_KEY = 'lhr.studio.api-token'
+const ACTIVE_IMPORT_KEY = 'lhr.studio.active-import'
+const IMPORT_CHUNK_BYTES = 4 * 1024 * 1024
 
 export class ApiError extends Error {
   readonly status: number
@@ -44,22 +47,154 @@ const json = (value: unknown) => JSON.stringify(value)
 
 const bucketQuery = (path: string, bucket = 'default') => `${path}?bucket=${encodeURIComponent(bucket)}`
 
+
+const delay = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms))
+
+async function importJob(id: string): Promise<ImportJobStatus> {
+  return (await request<ApiEnvelope<ImportJobStatus>>(`/v1/admin/imports/${encodeURIComponent(id)}`)).result
+}
+
+async function waitForImport(
+  id: string,
+  onProgress?: (job: ImportJobStatus) => void,
+): Promise<CsvImportResult> {
+  while (true) {
+    const job = await importJob(id)
+    onProgress?.(job)
+    if (job.status === 'complete') {
+      sessionStorage.removeItem(ACTIVE_IMPORT_KEY)
+      if (!job.result) throw new ApiError('Import completed without a result.', 500)
+      return job.result
+    }
+    if (job.status === 'failed') {
+      sessionStorage.removeItem(ACTIVE_IMPORT_KEY)
+      const safety = job.existing_dataset_preserved
+        ? ' The previously published dataset was preserved.'
+        : ' Check the current generation before retrying.'
+      throw new ApiError((job.error ?? 'Import failed.') + safety, 422)
+    }
+    if (job.status === 'uploading') {
+      throw new ApiError(
+        `Upload is paused at ${job.bytes_received} of ${job.bytes_total} bytes. Re-select the same file to resume.`,
+        409,
+      )
+    }
+    await delay(800)
+  }
+}
+
+async function createOrResumeImport(
+  file: File,
+  schema: ImportDatasetSchema,
+  bucket: string,
+  mode: ImportMode,
+): Promise<ImportJobStatus> {
+  const active = sessionStorage.getItem(ACTIVE_IMPORT_KEY)
+  if (active) {
+    try {
+      const job = await importJob(active)
+      if (
+        job.status === 'uploading'
+        && job.bucket === bucket
+        && job.mode === mode
+        && job.file_name === file.name
+        && job.bytes_total === file.size
+      ) {
+        const verificationChunk = file.slice(0, Math.min(file.size, IMPORT_CHUNK_BYTES))
+        return (await request<ApiEnvelope<ImportJobStatus>>(
+          `/v1/admin/imports/${encodeURIComponent(job.id)}/chunk?offset=0`,
+          {
+            method: 'PUT',
+            headers: { 'content-type': 'application/octet-stream' },
+            body: verificationChunk,
+          },
+        )).result
+      }
+      if (job.status !== 'complete' && job.status !== 'failed') {
+        throw new ApiError(
+          `Another import job (${job.id}) is already active for ${job.bucket}.`,
+          409,
+        )
+      }
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) throw error
+      sessionStorage.removeItem(ACTIVE_IMPORT_KEY)
+    }
+  }
+
+  const job = (await request<ApiEnvelope<ImportJobStatus>>('/v1/admin/imports', {
+    method: 'POST',
+    body: json({
+      bucket,
+      mode,
+      schema,
+      file_name: file.name,
+      bytes_total: file.size,
+    }),
+  })).result
+  sessionStorage.setItem(ACTIVE_IMPORT_KEY, job.id)
+  return job
+}
+
+async function uploadImport(
+  file: File,
+  schema: ImportDatasetSchema,
+  bucket: string,
+  mode: ImportMode,
+  onProgress?: (job: ImportJobStatus) => void,
+): Promise<CsvImportResult> {
+  let job = await createOrResumeImport(file, schema, bucket, mode)
+  onProgress?.(job)
+
+  while (job.bytes_received < file.size) {
+    const offset = job.bytes_received
+    const chunk = file.slice(offset, Math.min(file.size, offset + IMPORT_CHUNK_BYTES))
+    try {
+      job = (await request<ApiEnvelope<ImportJobStatus>>(
+        `/v1/admin/imports/${encodeURIComponent(job.id)}/chunk?offset=${offset}`,
+        {
+          method: 'PUT',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: chunk,
+        },
+      )).result
+    } catch (error) {
+      const current = await importJob(job.id)
+      if (current.bytes_received <= offset) throw error
+      job = current
+    }
+    onProgress?.(job)
+  }
+
+  job = (await request<ApiEnvelope<ImportJobStatus>>(
+    `/v1/admin/imports/${encodeURIComponent(job.id)}/complete`,
+    { method: 'POST' },
+  )).result
+  onProgress?.(job)
+  return waitForImport(job.id, onProgress)
+}
+
 export const api = {
   health: (signal?: AbortSignal) => request<HealthResponse>('/healthz', { signal }, false),
   ready: (signal?: AbortSignal) => request<ReadyResponse>('/readyz', { signal }, false),
   buckets: async (signal?: AbortSignal) => (await request<ApiEnvelope<BucketInfo[]>>('/v1/buckets', { signal })).result,
   stats: async (signal?: AbortSignal, bucket = 'default') => (await request<ApiEnvelope<DatasetStats>>(bucketQuery('/v1/stats', bucket), { signal })).result,
+  schema: async (signal?: AbortSignal, bucket = 'default') => (await request<ApiEnvelope<ImportDatasetSchema>>(bucketQuery('/v1/schema', bucket), { signal })).result,
   workload: async (signal?: AbortSignal, bucket = 'default') => (await request<ApiEnvelope<WorkloadReport>>(bucketQuery('/v1/workload', bucket), { signal })).result,
   generations: async (signal?: AbortSignal, bucket = 'default') => (await request<ApiEnvelope<GenerationInfo[]>>(bucketQuery('/v1/generations', bucket), { signal })).result,
   metrics: (signal?: AbortSignal) => request<string>('/metrics', { signal }),
   query: async (body: QueryRequest, signal?: AbortSignal) => (await request<ApiEnvelope<QueryResponse>>('/v1/query', { method: 'POST', body: json(body), signal })).result,
-  importCsv: async (file: File, schema: ImportDatasetSchema, bucket = 'default') => {
-    const form = new FormData()
-    form.append('bucket', bucket)
-    form.append('schema', JSON.stringify(schema))
-    form.append('file', file, file.name)
-    return (await request<ApiEnvelope<CsvImportReport>>('/v1/admin/import/csv', { method: 'POST', body: form })).result
-  },
+  importCsv: (
+    file: File,
+    schema: ImportDatasetSchema,
+    bucket = 'default',
+    mode: ImportMode = 'create',
+    onProgress?: (job: ImportJobStatus) => void,
+  ) => uploadImport(file, schema, bucket, mode, onProgress),
+  importJob,
+  waitForImport,
+  activeImportId: () => sessionStorage.getItem(ACTIVE_IMPORT_KEY),
+  clearActiveImport: () => sessionStorage.removeItem(ACTIVE_IMPORT_KEY),
   mutate: async (mutations: MutationOperation[], bucket = 'default') => (await request<ApiEnvelope<MutationReport>>('/v1/mutate', { method: 'POST', body: json({ bucket, mutations }) })).result,
   indexChange: async (action: 'add' | 'drop' | 'rebuild', columns: string[], bucket = 'default') => (await request<ApiEnvelope<IndexChangeReport>>(`/v1/admin/index/${action}`, { method: 'POST', body: json({ bucket, columns }) })).result,
   compact: async (bucket = 'default') => (await request<ApiEnvelope<unknown>>('/v1/admin/compact', { method: 'POST', body: json({ bucket }) })).result,

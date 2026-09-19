@@ -1,9 +1,11 @@
 use crate::{
-    abandon_generation, begin_generation, delta_path, import_csv, publish_generation, read_schema,
-    write_overlay, write_schema, write_visibility, CsvImportConfig, DeltaLayerMeta, Manifest,
+    abandon_generation, begin_generation, delta_path, import_csv, import_csv_with_progress,
+    publish_generation, read_schema, write_overlay, write_schema, write_visibility, CsvImportConfig,
+    CsvImportProgress, CsvImportStage, DeltaLayerMeta, GenerationInfo, Manifest,
     Mutation, MutationConfig, MutationReport, RowIdWriter, VersionedDataset, VisibilityTarget,
     ROW_IDS_FILE,
 };
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -361,4 +363,206 @@ pub fn apply_mutations_delta(
             Err(error)
         }
     }
+}
+
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CsvAppendReport {
+    pub generation: GenerationInfo,
+    pub rows_before: u64,
+    pub appended: u64,
+    pub rows_after: u64,
+    pub max_row_id: Option<u64>,
+}
+
+fn ensure_append_schema_compatible(
+    existing: &crate::DatasetSchema,
+    incoming: &crate::DatasetSchema,
+) -> io::Result<()> {
+    if existing.columns.len() != incoming.columns.len() {
+        return Err(invalid(format!(
+            "append schema column count mismatch: existing {}, incoming {}",
+            existing.columns.len(),
+            incoming.columns.len()
+        )));
+    }
+    for expected in &existing.columns {
+        let Some(index) = incoming.column_index(&expected.name) else {
+            return Err(invalid(format!(
+                "append schema is missing existing column {:?}",
+                expected.name
+            )));
+        };
+        let actual = &incoming.columns[index];
+        if actual.logical_type != expected.logical_type
+            || actual.nullable != expected.nullable
+            || actual.normalization != expected.normalization
+            || actual.null_values != expected.null_values
+        {
+            return Err(invalid(format!(
+                "append schema mismatch for column {:?}: existing type={:?} nullable={} normalization={:?} null_values={:?}; incoming type={:?} nullable={} normalization={:?} null_values={:?}",
+                expected.name,
+                expected.logical_type,
+                expected.nullable,
+                expected.normalization,
+                expected.null_values,
+                actual.logical_type,
+                actual.nullable,
+                actual.normalization,
+                actual.null_values
+            )));
+        }
+    }
+    for actual in &incoming.columns {
+        if existing.column_index(&actual.name).is_none() {
+            return Err(invalid(format!(
+                "append schema contains unexpected column {:?}",
+                actual.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Append a compatible CSV as one immutable indexed delta layer.
+///
+/// The currently visible generation is hard-linked into a staging generation; only the incoming
+/// CSV is parsed/indexed. New logical row IDs are allocated monotonically after the current maximum.
+/// Publication remains atomic, so any failure leaves the old CURRENT generation untouched.
+pub fn append_csv_delta_with_progress<F>(
+    catalog_root: impl AsRef<Path>,
+    csv_path: impl AsRef<Path>,
+    incoming_schema: &crate::DatasetSchema,
+    config: &CsvImportConfig,
+    mut progress: F,
+) -> io::Result<CsvAppendReport>
+where
+    F: FnMut(CsvImportProgress),
+{
+    if config.page_rows == 0 || config.max_sort_records == 0 || config.dictionary_run_bytes == 0 {
+        return Err(invalid(
+            "page_rows, max_sort_records, and dictionary_run_bytes must be > 0",
+        ));
+    }
+
+    let catalog_root = catalog_root.as_ref();
+    let csv_path = csv_path.as_ref();
+    let stage = begin_generation(catalog_root)?;
+    let work = catalog_root.join(format!(
+        ".append-work-{}-{}",
+        stage.id,
+        std::process::id()
+    ));
+
+    let result = (|| -> io::Result<(u64, u64, Option<u64>)> {
+        progress(CsvImportProgress { stage: CsvImportStage::Validating, rows_parsed: None });
+        let dataset = VersionedDataset::open(catalog_root)?;
+        let source_root = dataset.root().to_path_buf();
+        let schema = read_schema(&source_root)?;
+        ensure_append_schema_compatible(&schema, incoming_schema)?;
+        let manifest: Manifest = serde_json::from_slice(&fs::read(source_root.join("manifest.json"))?)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        fs::remove_dir_all(&stage.path)?;
+        clone_tree_link(&source_root, &stage.path)?;
+        fs::create_dir_all(&work)?;
+
+        let build_catalog = work.join("build-catalog");
+        let import_config = CsvImportConfig {
+            page_rows: manifest.page_rows,
+            batch_rows: config.batch_rows,
+            max_sort_records: config.max_sort_records,
+            dictionary_run_bytes: config.dictionary_run_bytes,
+            accelerators: exact_accelerators(&manifest),
+        };
+        let built = import_csv_with_progress(
+            &build_catalog,
+            csv_path,
+            &schema,
+            &import_config,
+            |event| {
+                if event.stage != CsvImportStage::Publishing {
+                    progress(event);
+                }
+            },
+        )?;
+
+        let rows_before = dataset.visible_rows();
+        let appended = built.rows;
+        let rows_after = rows_before
+            .checked_add(appended)
+            .ok_or_else(|| invalid("row count overflow during append"))?;
+        let first_row_id = dataset
+            .max_row_id()
+            .map(|value| value.checked_add(1).ok_or_else(|| invalid("logical row ID overflow")))
+            .transpose()?
+            .unwrap_or(0);
+        let max_row_id = first_row_id
+            .checked_add(appended.checked_sub(1).ok_or_else(|| invalid("cannot append an empty CSV"))?)
+            .ok_or_else(|| invalid("logical row ID overflow"))?;
+
+        let mut overlay = dataset.overlay().clone();
+        let layer_id = overlay.next_layer_id()?;
+        let relative = delta_path(layer_id);
+        let destination = stage.path.join(&relative);
+        fs::create_dir_all(destination.parent().unwrap())?;
+        fs::rename(&built.generation.path, &destination)?;
+        let _ = fs::remove_file(destination.join("integrity.json"));
+        let _ = fs::remove_file(destination.join(ROW_IDS_FILE));
+
+        let mut row_ids = RowIdWriter::create(destination.join(ROW_IDS_FILE), appended)?;
+        for offset in 0..appended {
+            row_ids.push(
+                first_row_id
+                    .checked_add(offset)
+                    .ok_or_else(|| invalid("logical row ID overflow"))?,
+            )?;
+        }
+        row_ids.finish()?;
+        write_schema(&destination, &schema)?;
+
+        overlay.deltas.push(DeltaLayerMeta {
+            id: layer_id,
+            path: relative.to_string_lossy().replace('\\', "/"),
+            rows: appended,
+        });
+        overlay.visible_rows = rows_after;
+        overlay.max_row_id = Some(max_row_id);
+        write_overlay(&stage.path, &overlay)?;
+
+        drop(dataset);
+        Ok((rows_before, appended, Some(max_row_id)))
+    })();
+
+    match result {
+        Ok((rows_before, appended, max_row_id)) => {
+            let _ = remove_dir_if_exists(&work);
+            progress(CsvImportProgress {
+                stage: CsvImportStage::Publishing,
+                rows_parsed: Some(appended),
+            });
+            let generation = publish_generation(stage)?;
+            Ok(CsvAppendReport {
+                generation,
+                rows_before,
+                appended,
+                rows_after: rows_before.saturating_add(appended),
+                max_row_id,
+            })
+        }
+        Err(error) => {
+            let _ = remove_dir_if_exists(&work);
+            let _ = abandon_generation(stage);
+            Err(error)
+        }
+    }
+}
+
+pub fn append_csv_delta(
+    catalog_root: impl AsRef<Path>,
+    csv_path: impl AsRef<Path>,
+    incoming_schema: &crate::DatasetSchema,
+    config: &CsvImportConfig,
+) -> io::Result<CsvAppendReport> {
+    append_csv_delta_with_progress(catalog_root, csv_path, incoming_schema, config, |_| {})
 }

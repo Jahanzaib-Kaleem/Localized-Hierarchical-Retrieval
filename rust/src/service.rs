@@ -1,18 +1,19 @@
 use crate::{
-    add_index, apply_mutations_delta, combine_buckets, compact_dataset, create_bucket,
-    dataset_stats, dataset_status, delete_bucket, drop_index, execute_query, import_csv,
-    leased_generation_ids, list_buckets, list_generations, planner_indexes_for_request,
-    rebuild_index, record_query, recover_catalog, rename_bucket, require_bucket_root,
-    resolve_dataset_root, transfer_rows, vacuum_with_reader_leases, workload_report,
-    CompactionConfig, CsvImportConfig, DatasetSchema, Mutation, MutationConfig, QueryRequest,
+    add_index, append_csv_delta_with_progress, apply_mutations_delta, combine_buckets,
+    compact_dataset, create_bucket, dataset_stats, dataset_status, delete_bucket, drop_index,
+    execute_query, import_csv, import_csv_initial_with_progress, leased_generation_ids, list_buckets,
+    list_generations, planner_indexes_for_request, read_schema, rebuild_index, record_query,
+    recover_catalog, rename_bucket, require_bucket_root, resolve_dataset_root, transfer_rows,
+    vacuum_with_reader_leases, workload_report, CompactionConfig, CsvImportConfig,
+    CsvImportProgress, CsvImportStage, DatasetSchema, Mutation, MutationConfig, QueryRequest,
     VersionedDataset, DEFAULT_BUCKET,
 };
 use axum::{
-    body::Body,
-    extract::{DefaultBodyLimit, Multipart, OriginalUri, Query as AxumQuery, State},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Multipart, OriginalUri, Path as AxumPath, Query as AxumQuery, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use fs2::FileExt;
@@ -30,7 +31,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{fs as tokio_fs, io::AsyncWriteExt, sync::{OwnedSemaphorePermit, Semaphore}};
 
@@ -47,7 +48,7 @@ pub struct ServiceApiKey {
 
 fn default_bind() -> String { "127.0.0.1:8787".into() }
 fn default_body_bytes() -> usize { 8 * 1024 * 1024 }
-fn default_import_bytes() -> usize { 512 * 1024 * 1024 }
+fn default_import_bytes() -> usize { 64usize * 1024 * 1024 * 1024 }
 fn default_concurrency() -> usize { 64 }
 fn default_rate_limit() -> u64 { 600 }
 fn default_query_limit() -> usize { 10_000 }
@@ -164,6 +165,7 @@ struct ServiceState {
     semaphore: Arc<Semaphore>,
     metrics: Arc<RuntimeMetrics>,
     next_request_id: Arc<AtomicU64>,
+    import_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
 }
 
 fn hash_token(token: &str) -> [u8; 32] { Sha256::digest(token.as_bytes()).into() }
@@ -208,11 +210,337 @@ struct TempFileGuard { path: PathBuf }
 impl TempFileGuard { fn new(path: PathBuf) -> Self { Self { path } } }
 impl Drop for TempFileGuard { fn drop(&mut self) { let _ = fs::remove_file(&self.path); } }
 
+const IMPORT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const IMPORT_FINGERPRINT_BYTES: usize = 1024 * 1024;
+const IMPORT_JOB_MAX_AGE_MS: u128 = 24 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ImportMode {
+    Create,
+    Append,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImportJob {
+    id: String,
+    bucket: String,
+    mode: ImportMode,
+    status: String,
+    stage: String,
+    file_name: String,
+    #[serde(default)]
+    file_fingerprint: Option<String>,
+    bytes_received: u64,
+    bytes_total: u64,
+    rows_parsed: Option<u64>,
+    result: Option<Value>,
+    error: Option<String>,
+    existing_dataset_preserved: bool,
+    retry_safe: bool,
+    updated_at_ms: u128,
+    schema: DatasetSchema,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportJobCreateRequest {
+    #[serde(default = "default_bucket")]
+    bucket: String,
+    mode: ImportMode,
+    schema: DatasetSchema,
+    file_name: String,
+    bytes_total: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportChunkQuery {
+    offset: u64,
+}
+
+fn import_jobs_dir(root: &Path) -> PathBuf {
+    root.join("temp").join("import-jobs")
+}
+
+fn import_uploads_dir(root: &Path) -> PathBuf {
+    root.join("temp").join("studio-uploads")
+}
+
+fn valid_import_job_id(id: &str) -> bool {
+    (1..=96).contains(&id.len())
+        && id.starts_with("import-")
+        && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn import_job_path(root: &Path, id: &str) -> io::Result<PathBuf> {
+    if !valid_import_job_id(id) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid import job id"));
+    }
+    Ok(import_jobs_dir(root).join(format!("{id}.json")))
+}
+
+fn import_upload_path(root: &Path, id: &str) -> io::Result<PathBuf> {
+    if !valid_import_job_id(id) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid import job id"));
+    }
+    Ok(import_uploads_dir(root).join(format!("{id}.csv")))
+}
+
+fn load_import_job(root: &Path, id: &str) -> io::Result<ImportJob> {
+    let path = import_job_path(root, id)?;
+    serde_json::from_slice(&fs::read(path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn save_import_job(root: &Path, job: &ImportJob) -> io::Result<()> {
+    let dir = import_jobs_dir(root);
+    fs::create_dir_all(&dir)?;
+    let path = import_job_path(root, &job.id)?;
+    let tmp = dir.join(format!(".{}.{}.tmp", job.id, std::process::id()));
+    let bytes = serde_json::to_vec_pretty(job)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, &path)
+    })();
+    let _ = fs::remove_file(&tmp);
+    result
+}
+
+fn update_import_progress(root: &Path, job: &mut ImportJob, progress: CsvImportProgress) {
+    job.status = "running".into();
+    job.stage = match progress.stage {
+        CsvImportStage::Validating => "validating",
+        CsvImportStage::Parsing => "parsing",
+        CsvImportStage::Building => "building",
+        CsvImportStage::Indexing => "indexing",
+        CsvImportStage::Publishing => "publishing",
+    }
+    .into();
+    if progress.rows_parsed.is_some() {
+        job.rows_parsed = progress.rows_parsed;
+    }
+    job.updated_at_ms = now_ms();
+    let _ = save_import_job(root, job);
+}
+
+fn recover_import_jobs(root: &Path) -> io::Result<()> {
+    let dir = import_jobs_dir(root);
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(mut job) = serde_json::from_slice::<ImportJob>(&fs::read(&path)?) else {
+            continue;
+        };
+        let upload = import_upload_path(root, &job.id)?;
+        match job.status.as_str() {
+            "uploading" => {
+                let stale = now_ms().saturating_sub(job.updated_at_ms) > IMPORT_JOB_MAX_AGE_MS;
+                let length_matches = fs::metadata(&upload)
+                    .map(|meta| meta.len() == job.bytes_received)
+                    .unwrap_or(false);
+                if stale || !length_matches {
+                    job.status = "failed".into();
+                    job.stage = "failed".into();
+                    job.error = Some(if stale {
+                        "incomplete upload expired before it was resumed".into()
+                    } else {
+                        "incomplete upload file does not match recorded progress".into()
+                    });
+                    job.existing_dataset_preserved = true;
+                    job.retry_safe = true;
+                    job.updated_at_ms = now_ms();
+                    let _ = fs::remove_file(&upload);
+                    let _ = save_import_job(root, &job);
+                }
+            }
+            "queued" | "running" => {
+                job.status = "failed".into();
+                job.stage = "failed".into();
+                job.error = Some(
+                    "service restarted while the import was building; the bucket is atomic, but inspect the current generation before retrying because publication may have completed"
+                        .into(),
+                );
+                job.existing_dataset_preserved = false;
+                job.retry_safe = false;
+                job.updated_at_ms = now_ms();
+                let _ = fs::remove_file(&upload);
+                let _ = save_import_job(root, &job);
+            }
+            "complete" | "failed" => {
+                let _ = fs::remove_file(&upload);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn run_import_job(root: PathBuf, config: CsvImportConfig, id: String) {
+    let Ok(mut job) = load_import_job(&root, &id) else {
+        return;
+    };
+    job.status = "running".into();
+    job.stage = "validating".into();
+    job.updated_at_ms = now_ms();
+    let _ = save_import_job(&root, &job);
+
+    let upload = match import_upload_path(&root, &job.id) {
+        Ok(path) => path,
+        Err(error) => {
+            job.status = "failed".into();
+            job.stage = "failed".into();
+            job.error = Some(error.to_string());
+            job.existing_dataset_preserved = true;
+            job.retry_safe = true;
+            job.updated_at_ms = now_ms();
+            let _ = save_import_job(&root, &job);
+            return;
+        }
+    };
+    let bucket_root = match require_bucket_root(&root, &job.bucket) {
+        Ok(path) => path,
+        Err(error) => {
+            job.status = "failed".into();
+            job.stage = "failed".into();
+            job.error = Some(error.to_string());
+            job.existing_dataset_preserved = true;
+            job.retry_safe = true;
+            job.updated_at_ms = now_ms();
+            let _ = fs::remove_file(&upload);
+            let _ = save_import_job(&root, &job);
+            return;
+        }
+    };
+
+    let schema = job.schema.clone();
+    let result: io::Result<Value> = match job.mode {
+        ImportMode::Create => import_csv_initial_with_progress(
+            &bucket_root,
+            &upload,
+            &schema,
+            &config,
+            |progress| update_import_progress(&root, &mut job, progress),
+        )
+        .and_then(|report| {
+            serde_json::to_value(report)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }),
+        ImportMode::Append => append_csv_delta_with_progress(
+            &bucket_root,
+            &upload,
+            &schema,
+            &config,
+            |progress| update_import_progress(&root, &mut job, progress),
+        )
+        .and_then(|report| {
+            serde_json::to_value(report)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }),
+    };
+
+    match result {
+        Ok(report) => {
+            job.status = "complete".into();
+            job.stage = "complete".into();
+            job.result = Some(report);
+            job.error = None;
+            job.existing_dataset_preserved = true;
+            job.retry_safe = false;
+        }
+        Err(error) => {
+            job.status = "failed".into();
+            job.stage = "failed".into();
+            job.error = Some(error.to_string());
+            job.existing_dataset_preserved = true;
+            job.retry_safe = true;
+        }
+    }
+    job.updated_at_ms = now_ms();
+    let _ = fs::remove_file(&upload);
+    let _ = save_import_job(&root, &job);
+}
+
+
+fn import_job_semaphore(state: &ServiceState, id: &str) -> io::Result<Arc<Semaphore>> {
+    let mut locks = state
+        .import_locks
+        .lock()
+        .map_err(|_| io::Error::other("import job lock map poisoned"))?;
+    Ok(locks
+        .entry(id.to_owned())
+        .or_insert_with(|| Arc::new(Semaphore::new(1)))
+        .clone())
+}
+
+async fn cleanup_expired_import_jobs(state: &ServiceState) {
+    let dir = import_jobs_dir(&state.root);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    let now = now_ms();
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(id) = entry
+            .path()
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Ok(semaphore) = import_job_semaphore(state, &id) else {
+            continue;
+        };
+        let Ok(_permit) = semaphore.acquire_owned().await else {
+            continue;
+        };
+        let Ok(mut job) = load_import_job(&state.root, &id) else {
+            continue;
+        };
+        if job.status == "uploading"
+            && now.saturating_sub(job.updated_at_ms) > IMPORT_JOB_MAX_AGE_MS
+        {
+            job.status = "failed".into();
+            job.stage = "failed".into();
+            job.error = Some("incomplete upload expired before it was resumed".into());
+            job.existing_dataset_preserved = true;
+            job.retry_safe = true;
+            job.updated_at_ms = now;
+            if let Ok(upload) = import_upload_path(&state.root, &id) {
+                let _ = fs::remove_file(upload);
+            }
+            let _ = save_import_job(&state.root, &job);
+        } else if matches!(job.status.as_str(), "complete" | "failed") {
+            if let Ok(upload) = import_upload_path(&state.root, &id) {
+                let _ = fs::remove_file(upload);
+            }
+        }
+    }
+}
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
 }
 
-async fn begin_request(state: &ServiceState, headers: &HeaderMap, required: ServiceRole) -> Result<RequestGuard, ApiError> {
+async fn begin_request_inner(
+    state: &ServiceState,
+    headers: &HeaderMap,
+    required: ServiceRole,
+    enforce_rate_limit: bool,
+) -> Result<RequestGuard, ApiError> {
     let request_id = state.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     state.metrics.requests.fetch_add(1, Ordering::Relaxed);
     let principal = if state.principals.is_empty() {
@@ -232,7 +560,7 @@ async fn begin_request(state: &ServiceState, headers: &HeaderMap, required: Serv
         state.metrics.auth_failures.fetch_add(1, Ordering::Relaxed); state.metrics.errors.fetch_add(1, Ordering::Relaxed);
         return Err(ApiError::new(StatusCode::FORBIDDEN, request_id, "insufficient API-key role"));
     }
-    if state.config.rate_limit_per_minute > 0 {
+    if enforce_rate_limit && state.config.rate_limit_per_minute > 0 {
         let mut rates = state.rates.lock().map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, request_id, "rate limiter lock poisoned"))?;
         let now = Instant::now();
         let window = rates.entry(principal.id.clone()).or_insert(RateWindow { started: now, count: 0 });
@@ -249,6 +577,25 @@ async fn begin_request(state: &ServiceState, headers: &HeaderMap, required: Serv
     })?;
     state.metrics.active.fetch_add(1, Ordering::Relaxed);
     Ok(RequestGuard { request_id, actor: principal.id, metrics: state.metrics.clone(), _permit: permit })
+}
+
+async fn begin_request(
+    state: &ServiceState,
+    headers: &HeaderMap,
+    required: ServiceRole,
+) -> Result<RequestGuard, ApiError> {
+    begin_request_inner(state, headers, required, true).await
+}
+
+async fn begin_upload_chunk_request(
+    state: &ServiceState,
+    headers: &HeaderMap,
+) -> Result<RequestGuard, ApiError> {
+    // Upload chunks are admin-only, fixed-size, sequential-offset constrained, aggregate-size
+    // capped, disk-preflighted, and still subject to the global concurrency ceiling. Counting each
+    // 4 MiB chunk against the ordinary request-per-minute bucket would make multi-GB ingestion
+    // fail merely because the transport is intentionally chunked.
+    begin_request_inner(state, headers, ServiceRole::Admin, false).await
 }
 
 #[derive(Debug, Serialize)]
@@ -326,6 +673,319 @@ async fn query(State(state): State<ServiceState>, headers: HeaderMap, Json(paylo
             Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()))
         }
     }
+}
+
+async fn dataset_schema(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    AxumQuery(selector): AxumQuery<BucketSelector>,
+) -> Result<Json<Value>, ApiError> {
+    let guard = begin_request(&state, &headers, ServiceRole::Read).await?;
+    let root = selected_bucket_root(&state, &selector.bucket, guard.request_id)?;
+    let result = tokio::task::spawn_blocking(move || {
+        let resolved = resolve_dataset_root(root)?;
+        read_schema(resolved)
+    })
+    .await
+    .map_err(|error| join_error(guard.request_id, error))?
+    .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    Ok(Json(json!({"request_id":guard.request_id,"bucket":selector.bucket,"result":result})))
+}
+
+async fn import_job_create(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    Json(request): Json<ImportJobCreateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
+    if request.bytes_total == 0 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "CSV file is empty"));
+    }
+    let max_import = u64::try_from(state.config.max_import_bytes).unwrap_or(u64::MAX);
+    if request.bytes_total > max_import {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            guard.request_id,
+            format!("CSV exceeds the {} byte import limit", state.config.max_import_bytes),
+        ));
+    }
+    request
+        .schema
+        .validate()
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let available = fs2::available_space(&state.root)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let disk_floor = request
+        .bytes_total
+        .saturating_mul(4)
+        .saturating_add(64 * 1024 * 1024);
+    if disk_floor > available {
+        return Err(ApiError::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            guard.request_id,
+            format!(
+                "insufficient free space for a safe import build: need at least {disk_floor} bytes available for upload/build staging, found {available}"
+            ),
+        ));
+    }
+    let bucket_root = selected_bucket_root(&state, &request.bucket, guard.request_id)?;
+    match (request.mode, resolve_dataset_root(&bucket_root)) {
+        (ImportMode::Create, Ok(_)) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                guard.request_id,
+                "bucket is already initialized; use append",
+            ));
+        }
+        (ImportMode::Append, Err(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                guard.request_id,
+                "bucket is empty; create its initial dataset first",
+            ));
+        }
+        (_, Err(error)) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()));
+        }
+        _ => {}
+    }
+
+    let id = format!("import-{}-{}", now_ms(), guard.request_id);
+    let uploads = import_uploads_dir(&state.root);
+    let jobs = import_jobs_dir(&state.root);
+    tokio_fs::create_dir_all(&uploads)
+        .await
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    tokio_fs::create_dir_all(&jobs)
+        .await
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let upload = import_upload_path(&state.root, &id)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    tokio_fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&upload)
+        .await
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+
+    let file_name = Path::new(&request.file_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("upload.csv")
+        .chars()
+        .take(240)
+        .collect::<String>();
+    let job = ImportJob {
+        id,
+        bucket: request.bucket,
+        mode: request.mode,
+        status: "uploading".into(),
+        stage: "uploading".into(),
+        file_name,
+        file_fingerprint: None,
+        bytes_received: 0,
+        bytes_total: request.bytes_total,
+        rows_parsed: None,
+        result: None,
+        error: None,
+        existing_dataset_preserved: true,
+        retry_safe: true,
+        updated_at_ms: now_ms(),
+        schema: request.schema,
+    };
+    if let Err(error) = save_import_job(&state.root, &job) {
+        let _ = tokio_fs::remove_file(&upload).await;
+        return Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()));
+    }
+    Ok(Json(json!({"request_id":guard.request_id,"result":job})))
+}
+
+async fn import_job_chunk(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    AxumQuery(query): AxumQuery<ImportChunkQuery>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let guard = begin_upload_chunk_request(&state, &headers).await?;
+    let job_semaphore = import_job_semaphore(&state, &id)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let _job_permit = job_semaphore
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, guard.request_id, "import job lock closed"))?;
+    if body.is_empty() || body.len() > IMPORT_CHUNK_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            guard.request_id,
+            format!("import chunks must contain 1..={IMPORT_CHUNK_BYTES} bytes"),
+        ));
+    }
+    let mut job = load_import_job(&state.root, &id)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    if job.status != "uploading" {
+        return Err(ApiError::new(StatusCode::CONFLICT, guard.request_id, "import is no longer accepting upload chunks"));
+    }
+    if query.offset == 0 {
+        let required = usize::try_from(job.bytes_total.min(IMPORT_FINGERPRINT_BYTES as u64))
+            .unwrap_or(IMPORT_FINGERPRINT_BYTES);
+        if body.len() < required {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                guard.request_id,
+                format!("first import chunk must contain at least {required} bytes for fingerprint validation"),
+            ));
+        }
+        let digest = Sha256::digest(&body[..required]);
+        let actual = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        match job.file_fingerprint.as_deref() {
+            Some(expected) if expected != actual => {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    guard.request_id,
+                    "selected file does not match the import job fingerprint",
+                ));
+            }
+            None if job.bytes_received == 0 => {
+                job.file_fingerprint = Some(actual);
+            }
+            None => {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    guard.request_id,
+                    "upload progress exists without a durable file fingerprint",
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    if query.offset < job.bytes_received {
+        return Ok(Json(json!({"request_id":guard.request_id,"result":job})));
+    }
+    if query.offset != job.bytes_received {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            guard.request_id,
+            format!("chunk offset mismatch: server expects {}", job.bytes_received),
+        ));
+    }
+
+    let chunk_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+    let next = job
+        .bytes_received
+        .checked_add(chunk_len)
+        .ok_or_else(|| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, guard.request_id, "upload size overflow"))?;
+    if next > job.bytes_total {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, guard.request_id, "chunk exceeds declared CSV size"));
+    }
+
+    let upload = import_upload_path(&state.root, &id)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let mut output = tokio_fs::OpenOptions::new()
+        .append(true)
+        .write(true)
+        .open(&upload)
+        .await
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let actual = output
+        .metadata()
+        .await
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?
+        .len();
+    if actual != job.bytes_received {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            guard.request_id,
+            "upload file length does not match persisted job progress",
+        ));
+    }
+    if let Err(error) = output.write_all(&body).await {
+        let _ = output.set_len(job.bytes_received).await;
+        return Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()));
+    }
+    if let Err(error) = output.flush().await {
+        let _ = output.set_len(job.bytes_received).await;
+        return Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()));
+    }
+    if let Err(error) = output.sync_data().await {
+        let _ = output.set_len(job.bytes_received).await;
+        return Err(ApiError::new(io_status(&error), guard.request_id, error.to_string()));
+    }
+
+    job.bytes_received = next;
+    job.updated_at_ms = now_ms();
+    if let Err(error) = save_import_job(&state.root, &job) {
+        let _ = output.set_len(query.offset).await;
+        let _ = output.sync_data().await;
+        return Err(ApiError::new(
+            io_status(&error),
+            guard.request_id,
+            format!("failed to persist upload progress; chunk was rolled back: {error}"),
+        ));
+    }
+    Ok(Json(json!({"request_id":guard.request_id,"result":job})))
+}
+
+async fn import_job_complete(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
+    let job_semaphore = import_job_semaphore(&state, &id)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let _job_permit = job_semaphore
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, guard.request_id, "import job lock closed"))?;
+    let mut job = load_import_job(&state.root, &id)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    if job.status != "uploading" {
+        return Err(ApiError::new(StatusCode::CONFLICT, guard.request_id, "import is not waiting for upload completion"));
+    }
+    if job.bytes_received != job.bytes_total {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            guard.request_id,
+            format!(
+                "upload is incomplete: received {} of {} bytes",
+                job.bytes_received, job.bytes_total
+            ),
+        ));
+    }
+    let upload = import_upload_path(&state.root, &id)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    let actual = tokio_fs::metadata(&upload)
+        .await
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?
+        .len();
+    if actual != job.bytes_total {
+        return Err(ApiError::new(StatusCode::CONFLICT, guard.request_id, "uploaded file size does not match declared size"));
+    }
+
+    job.status = "queued".into();
+    job.stage = "queued".into();
+    job.retry_safe = false;
+    job.updated_at_ms = now_ms();
+    save_import_job(&state.root, &job)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+
+    let root = state.root.clone();
+    let config = csv_import_config(&state.config);
+    let job_id = id.clone();
+    tokio::task::spawn_blocking(move || run_import_job(root, config, job_id));
+    Ok(Json(json!({"request_id":guard.request_id,"result":job})))
+}
+
+async fn import_job_status(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let guard = begin_request(&state, &headers, ServiceRole::Admin).await?;
+    let job = load_import_job(&state.root, &id)
+        .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
+    Ok(Json(json!({"request_id":guard.request_id,"result":job})))
 }
 
 fn csv_import_config(config: &ServiceConfig) -> CsvImportConfig {
@@ -896,6 +1556,7 @@ async fn studio(OriginalUri(uri): OriginalUri) -> Response {
 
 pub async fn serve(root: impl AsRef<Path>, config: ServiceConfig) -> io::Result<()> {
     config.validate()?;
+    recover_import_jobs(root.as_ref())?;
     let bind: SocketAddr = config.bind.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let mut principals = HashMap::new();
     for key in &config.api_keys { principals.insert(hash_token(&key.token), Principal { id: key.id.clone(), role: key.role }); }
@@ -903,6 +1564,7 @@ pub async fn serve(root: impl AsRef<Path>, config: ServiceConfig) -> io::Result<
         root: root.as_ref().to_path_buf(), semaphore: Arc::new(Semaphore::new(config.max_concurrent_requests)),
         config: Arc::new(config.clone()), principals: Arc::new(principals), rates: Arc::new(Mutex::new(HashMap::new())),
         metrics: Arc::new(RuntimeMetrics::default()), next_request_id: Arc::new(AtomicU64::new(0)),
+        import_locks: Arc::new(Mutex::new(HashMap::new())),
     };
     // The control plane is allowed to start before a dataset exists. /readyz remains false and
     // data endpoints return ordinary errors until an initial generation is imported/published.
@@ -915,15 +1577,31 @@ pub async fn serve(root: impl AsRef<Path>, config: ServiceConfig) -> io::Result<
         .route("/v1/admin/buckets/delete", post(bucket_delete))
         .route("/v1/admin/buckets/combine", post(bucket_combine))
         .route("/v1/buckets/transfer", post(bucket_transfer))
-        .route("/v1/query", post(query)).route("/v1/stats", get(stats)).route("/v1/workload", get(workload))
+        .route("/v1/query", post(query)).route("/v1/stats", get(stats)).route("/v1/schema", get(dataset_schema)).route("/v1/workload", get(workload))
         .route("/v1/generations", get(generations)).route("/v1/mutate", post(mutate))
         .route("/v1/admin/import/csv", post(import_csv_upload).layer(DefaultBodyLimit::max(import_limit)))
+        .route("/v1/admin/imports", post(import_job_create))
+        .route("/v1/admin/imports/{id}", get(import_job_status))
+        .route("/v1/admin/imports/{id}/chunk", put(import_job_chunk).layer(DefaultBodyLimit::max(IMPORT_CHUNK_BYTES)))
+        .route("/v1/admin/imports/{id}/complete", post(import_job_complete))
         .route("/v1/admin/compact", post(compact)).route("/v1/admin/vacuum", post(vacuum)).route("/v1/admin/recover", post(recover))
         .route("/v1/admin/index/add", post(index_add)).route("/v1/admin/index/drop", post(index_drop)).route("/v1/admin/index/rebuild", post(index_rebuild))
         .fallback(studio)
-        .layer(DefaultBodyLimit::max(config.max_body_bytes)).with_state(state);
+        .layer(DefaultBodyLimit::max(config.max_body_bytes)).with_state(state.clone());
+    let cleanup_state = state.clone();
+    let cleanup_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            cleanup_expired_import_jobs(&cleanup_state).await;
+        }
+    });
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app).with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; }).await.map_err(io::Error::other)
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })
+        .await
+        .map_err(io::Error::other);
+    cleanup_task.abort();
+    result
 }
 
 #[cfg(test)]
@@ -954,6 +1632,17 @@ mod tests {
         let mut config = ServiceConfig::default();
         config.max_import_bytes = 0;
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn default_import_ceiling_allows_large_multi_part_csvs() {
+        assert!(ServiceConfig::default().max_import_bytes > 737 * 1024 * 1024);
+        assert_eq!(IMPORT_CHUNK_BYTES, 4 * 1024 * 1024);
+    }
+    #[test]
+    fn import_job_ids_reject_path_traversal() {
+        assert!(valid_import_job_id("import-123-4"));
+        assert!(!valid_import_job_id("../import-123"));
+        assert!(!valid_import_job_id("import-123/4"));
     }
     #[test]
     fn temp_file_guard_removes_file_on_drop() {

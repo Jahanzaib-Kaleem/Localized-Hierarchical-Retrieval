@@ -197,6 +197,21 @@ fn projection(schema: &DatasetSchema, select: &[String]) -> io::Result<Vec<usize
     select.iter().map(|name| schema.column_index(name).ok_or_else(|| invalid(format!("unknown selected column {name}")))).collect()
 }
 
+fn equality_subset(filters: &[PreparedFilter], schema: &DatasetSchema) -> (Vec<usize>, Vec<LogicalPredicate>) {
+    let mut columns = Vec::new();
+    let mut predicates = Vec::new();
+    for filter in filters {
+        if let PreparedFilter::Eq { column, value } = filter {
+            columns.push(*column);
+            predicates.push(LogicalPredicate {
+                column: schema.columns[*column].name.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+    (columns, predicates)
+}
+
 fn equality_predicates(filters: &[PreparedFilter], schema: &DatasetSchema) -> Option<Vec<LogicalPredicate>> {
     let mut out = Vec::with_capacity(filters.len());
     for filter in filters {
@@ -333,6 +348,114 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
                 rows_examined: result.rows_checked,
                 pages_touched: result.pages_touched,
                 hierarchy_lookups: result.hierarchy_lookups,
+                elapsed_micros: start.elapsed().as_micros(),
+                optimized_equality_route: true,
+            },
+        });
+    }
+
+
+    // When exact equality filters coexist with filters that do not have a direct access path,
+    // drive the query from the equality intersection first and evaluate the residual predicates
+    // only against that bounded stream. This avoids scanning the whole visible dataset while also
+    // avoiding materializing the entire candidate set in memory.
+    let (candidate_columns, candidate_predicates) = equality_subset(&prepared, dataset.schema());
+    if !candidate_predicates.is_empty()
+        && candidate_predicates.len() < prepared.len()
+        && candidate_columns
+            .iter()
+            .all(|column| dataset.has_exact_singleton(*column))
+    {
+        const CANDIDATE_BATCH: usize = 4096;
+        let mut rows_examined = 0u64;
+        let mut hits = 0u64;
+        let mut pages_touched = 0u64;
+        let mut hierarchy_lookups = 0u64;
+        let mut rows = Vec::with_capacity(request.limit);
+        let mut candidate_after = None;
+
+        loop {
+            enforce_deadline(deadline)?;
+            let result = dataset.query_values_after(
+                &candidate_predicates,
+                None,
+                candidate_after,
+                CANDIDATE_BATCH,
+            )?;
+            pages_touched = pages_touched.saturating_add(result.pages_touched);
+            hierarchy_lookups = hierarchy_lookups.saturating_add(result.hierarchy_lookups);
+            enforce_rows_examined(
+                request.max_rows_examined,
+                rows_examined.saturating_add(result.rows_checked),
+            )?;
+
+            let returned = result.rows.len();
+            if returned == 0 {
+                break;
+            }
+            let mut last_row_id = candidate_after;
+            for candidate in result.rows {
+                rows_examined = rows_examined.saturating_add(1);
+                enforce_rows_examined(request.max_rows_examined, rows_examined)?;
+                if rows_examined % 1024 == 0 {
+                    enforce_deadline(deadline)?;
+                }
+
+                last_row_id = Some(candidate.row_id);
+                let values = candidate
+                    .values
+                    .into_iter()
+                    .map(|value| value.value)
+                    .collect::<Vec<_>>();
+                if !matches_filters(dataset.schema(), &values, &prepared)? {
+                    continue;
+                }
+                hits = hits.saturating_add(1);
+                if request.after_row_id.is_some_and(|cursor| candidate.row_id <= cursor)
+                    || rows.len() >= request.limit
+                {
+                    continue;
+                }
+                let selected = projection
+                    .iter()
+                    .map(|&column| NamedValue {
+                        column: dataset.schema().columns[column].name.clone(),
+                        value: values[column].clone(),
+                    })
+                    .collect();
+                rows.push(QueryApiRow {
+                    row_id: candidate.row_id,
+                    values: selected,
+                });
+            }
+
+            if returned < CANDIDATE_BATCH {
+                break;
+            }
+            let Some(next_after) = last_row_id else {
+                break;
+            };
+            if candidate_after.is_some_and(|old| next_after <= old) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "candidate-first planner cursor did not advance",
+                ));
+            }
+            candidate_after = Some(next_after);
+        }
+
+        enforce_deadline(deadline)?;
+        let next_cursor = (rows.len() == request.limit)
+            .then(|| rows.last().unwrap().row_id);
+        return Ok(QueryResponse {
+            returned: rows.len(),
+            rows,
+            next_cursor,
+            stats: QueryApiStats {
+                hits,
+                rows_examined,
+                pages_touched,
+                hierarchy_lookups,
                 elapsed_micros: start.elapsed().as_micros(),
                 optimized_equality_route: true,
             },

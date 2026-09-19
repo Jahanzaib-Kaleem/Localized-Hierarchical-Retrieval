@@ -1,7 +1,7 @@
 use crate::{
     abandon_generation, add_exact_hierarchies, begin_generation, build_u32_batches,
-    dictionary_filename, publish_generation, write_dictionary_record, write_schema, BuildConfig,
-    DatasetSchema, Dictionary, GenerationInfo, HierarchySpec,
+    dictionary_filename, publish_generation, resolve_dataset_root, write_dictionary_record,
+    write_schema, BuildConfig, DatasetSchema, Dictionary, GenerationInfo, HierarchySpec,
 };
 use csv::{Reader, ReaderBuilder, StringRecord};
 use serde::Serialize;
@@ -46,6 +46,22 @@ pub struct CsvImportReport {
     pub exact_hierarchies: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CsvImportStage {
+    Validating,
+    Parsing,
+    Building,
+    Indexing,
+    Publishing,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct CsvImportProgress {
+    pub stage: CsvImportStage,
+    pub rows_parsed: Option<u64>,
+}
+
 fn csv_error(error: csv::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
@@ -67,6 +83,27 @@ fn header_map(headers: &StringRecord, schema: &DatasetSchema) -> io::Result<Vec<
             ));
         }
     }
+    let unexpected = headers
+        .iter()
+        .filter(|header| schema.column_index(header).is_none())
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("CSV has unexpected column(s): {}", unexpected.join(", ")),
+        ));
+    }
+    if headers.len() != schema.columns.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "CSV column count differs from schema: expected {}, found {}",
+                schema.columns.len(),
+                headers.len()
+            ),
+        ));
+    }
+
     schema
         .columns
         .iter()
@@ -241,12 +278,16 @@ fn external_sort_dictionary(
     Ok(())
 }
 
-fn first_pass(
+fn first_pass<F>(
     csv_path: &Path,
     schema: &DatasetSchema,
     stage: &Path,
     max_run_bytes: usize,
-) -> io::Result<(u64, Vec<u64>)> {
+    progress: &mut F,
+) -> io::Result<(u64, Vec<u64>)>
+where
+    F: FnMut(CsvImportProgress),
+{
     let temp = stage.join("temp").join("dictionaries");
     let dictionaries_dir = stage.join("dictionaries");
     fs::create_dir_all(&temp)?;
@@ -268,6 +309,12 @@ fn first_pass(
     let mut rows = 0u64;
     while reader.read_record(&mut record).map_err(csv_error)? {
         rows += 1;
+        if rows % 65_536 == 0 {
+            progress(CsvImportProgress {
+                stage: CsvImportStage::Parsing,
+                rows_parsed: Some(rows),
+            });
+        }
         for (column_index, column) in schema.columns.iter().enumerate() {
             let raw = record.get(map[column_index]).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "CSV record missing mapped field")
@@ -450,22 +497,29 @@ fn exact_specs(columns: usize, accelerators: &[Vec<usize>]) -> io::Result<Vec<Hi
         .collect())
 }
 
-fn build_stage(
+fn build_stage<F>(
     stage: &Path,
     csv_path: &Path,
     schema: &DatasetSchema,
     config: &CsvImportConfig,
-) -> io::Result<(u64, Vec<u64>, usize)> {
+    progress: &mut F,
+) -> io::Result<(u64, Vec<u64>, usize)>
+where
+    F: FnMut(CsvImportProgress),
+{
     if config.page_rows == 0 || config.max_sort_records == 0 || config.dictionary_run_bytes == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "page_rows, max_sort_records, and dictionary_run_bytes must be > 0",
         ));
     }
+    progress(CsvImportProgress { stage: CsvImportStage::Validating, rows_parsed: None });
     schema.validate()?;
+    progress(CsvImportProgress { stage: CsvImportStage::Parsing, rows_parsed: None });
     let (expected_rows, cardinalities) =
-        first_pass(csv_path, schema, stage, config.dictionary_run_bytes)?;
+        first_pass(csv_path, schema, stage, config.dictionary_run_bytes, progress)?;
 
+    progress(CsvImportProgress { stage: CsvImportStage::Building, rows_parsed: Some(expected_rows) });
     let error = Rc::new(RefCell::new(None));
     let batches = CsvTokenBatches::new(
         csv_path,
@@ -495,6 +549,7 @@ fn build_stage(
         ));
     }
 
+    progress(CsvImportProgress { stage: CsvImportStage::Indexing, rows_parsed: Some(expected_rows) });
     let specs = exact_specs(schema.columns.len(), &config.accelerators)?;
     add_exact_hierarchies(stage, &specs, config.max_sort_records)?;
     write_schema(stage, schema)?;
@@ -504,16 +559,37 @@ fn build_stage(
 /// Two-pass CSV import into a new immutable catalog generation. The old CURRENT generation is not
 /// modified unless dictionary construction, encoding, exact-index construction, verification, and
 /// integrity sealing all succeed.
-pub fn import_csv(
+fn import_csv_with_progress_mode<F>(
     catalog_root: impl AsRef<Path>,
     csv_path: impl AsRef<Path>,
     schema: &DatasetSchema,
     config: &CsvImportConfig,
-) -> io::Result<CsvImportReport> {
+    require_empty: bool,
+    mut progress: F,
+) -> io::Result<CsvImportReport>
+where
+    F: FnMut(CsvImportProgress),
+{
     let catalog_root = catalog_root.as_ref();
     let csv_path = csv_path.as_ref();
     let stage = begin_generation(catalog_root)?;
-    let built = build_stage(&stage.path, csv_path, schema, config);
+    if require_empty {
+        match resolve_dataset_root(catalog_root) {
+            Ok(_) => {
+                let _ = abandon_generation(stage);
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "initial CSV import requires an empty catalog",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let _ = abandon_generation(stage);
+                return Err(error);
+            }
+        }
+    }
+    let built = build_stage(&stage.path, csv_path, schema, config, &mut progress);
     let (rows, cardinalities, exact_hierarchies) = match built {
         Ok(value) => value,
         Err(error) => {
@@ -521,6 +597,7 @@ pub fn import_csv(
             return Err(error);
         }
     };
+    progress(CsvImportProgress { stage: CsvImportStage::Publishing, rows_parsed: Some(rows) });
     let generation = publish_generation(stage)?;
     Ok(CsvImportReport {
         generation,
@@ -528,4 +605,39 @@ pub fn import_csv(
         cardinalities,
         exact_hierarchies,
     })
+}
+
+pub fn import_csv_with_progress<F>(
+    catalog_root: impl AsRef<Path>,
+    csv_path: impl AsRef<Path>,
+    schema: &DatasetSchema,
+    config: &CsvImportConfig,
+    progress: F,
+) -> io::Result<CsvImportReport>
+where
+    F: FnMut(CsvImportProgress),
+{
+    import_csv_with_progress_mode(catalog_root, csv_path, schema, config, false, progress)
+}
+
+pub fn import_csv_initial_with_progress<F>(
+    catalog_root: impl AsRef<Path>,
+    csv_path: impl AsRef<Path>,
+    schema: &DatasetSchema,
+    config: &CsvImportConfig,
+    progress: F,
+) -> io::Result<CsvImportReport>
+where
+    F: FnMut(CsvImportProgress),
+{
+    import_csv_with_progress_mode(catalog_root, csv_path, schema, config, true, progress)
+}
+
+pub fn import_csv(
+    catalog_root: impl AsRef<Path>,
+    csv_path: impl AsRef<Path>,
+    schema: &DatasetSchema,
+    config: &CsvImportConfig,
+) -> io::Result<CsvImportReport> {
+    import_csv_with_progress(catalog_root, csv_path, schema, config, |_| {})
 }

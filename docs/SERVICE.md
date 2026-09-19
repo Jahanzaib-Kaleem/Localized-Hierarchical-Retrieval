@@ -25,7 +25,7 @@ Example configuration:
     {"id": "admin", "token": "replace-with-a-third-long-random-token", "role": "admin"}
   ],
   "max_body_bytes": 8388608,
-  "max_import_bytes": 536870912,
+  "max_import_bytes": 68719476736,
   "max_concurrent_requests": 64,
   "rate_limit_per_minute": 600,
   "max_query_limit": 10000,
@@ -59,6 +59,7 @@ For a reverse-proxy deployment, bind LHR to a private/loopback listener whenever
 - `GET /v1/buckets` — list the reserved default bucket and named bucket workspaces.
 - `POST /v1/query` — bucket-aware typed exact query protocol.
 - `GET /v1/stats?bucket=<id>` — schema/index/storage statistics.
+- `GET /v1/schema?bucket=<id>` — exact logical schema including type, nullability, normalization and null literals.
 - `GET /v1/workload?bucket=<id>` — persistent workload telemetry, latency percentiles, and index recommendations.
 - `GET /v1/generations?bucket=<id>` — immutable generation catalog.
 - `GET /metrics` — Prometheus text exposition including aggregate bucket gauges.
@@ -70,7 +71,11 @@ For a reverse-proxy deployment, bind LHR to a private/loopback listener whenever
 
 ### Administrative API
 
-- `POST /v1/admin/import/csv` — streamed multipart CSV import used by Studio; publishes a new immutable generation inside the selected bucket after the normal exact import/verification pipeline succeeds.
+- `POST /v1/admin/import/csv` — legacy single-request streamed multipart CSV import retained for compatibility.
+- `POST /v1/admin/imports` — create a durable Studio import job in explicit `create` or `append` mode.
+- `PUT /v1/admin/imports/{id}/chunk?offset=<bytes>` — append the next bounded 4 MiB upload chunk.
+- `POST /v1/admin/imports/{id}/complete` — finish upload and start the server-side build.
+- `GET /v1/admin/imports/{id}` — reconnect to durable upload/build/progress/error state.
 - `POST /v1/admin/compact`
 - `POST /v1/admin/vacuum`
 - `POST /v1/admin/recover`
@@ -92,20 +97,26 @@ JSON request bodies such as `/v1/query`, `/v1/mutate`, compaction, vacuum, and i
 
 Named buckets are independent catalogs rather than table namespaces inside one physical generation. See [`BUCKETS.md`](BUCKETS.md) for create/delete/combine/transfer semantics.
 
-### Studio CSV import
+### Studio CSV import jobs
 
-`POST /v1/admin/import/csv` accepts multipart form data with exactly one CSV file plus a reviewed LHR schema JSON field. It requires an `admin` credential.
+Studio uses the import-job API rather than the legacy one-shot multipart route.
 
-The upload path is deliberately disk-first:
+The browser previews at most a small sample, then uploads the CSV in sequential 4 MiB chunks. Job metadata and upload bytes are persisted below `<service-root>/temp/`, which is `/data/temp/` in the normal appliance. Total CSV bytes are checked against `max_import_bytes`, but HTTP request memory/body size is bounded by the per-chunk size rather than the whole CSV.
 
-1. the multipart file is consumed in chunks and written to `<service-root>/temp/studio-uploads/`;
-2. bytes are counted against `max_import_bytes` while streaming;
-3. the uploaded schema is parsed and validated as `LHR-SCHEMA/1`;
-4. the temporary file is passed to the existing two-pass `import_csv` engine;
-5. dictionary construction, exact-index construction, verification, sealing, and atomic publication follow the same rules as a CLI CSV import;
-6. the temporary upload is removed after the build completes.
+Jobs use explicit modes:
 
-Studio uses a bounded browser-side sample only for preview and schema inference. The full CSV is not accumulated in browser state. Large imports that exceed the HTTP convenience limit should continue to use the local CLI rather than raising the network limit indiscriminately.
+- `create`: the selected bucket must still be empty while the catalog writer lock is held;
+- `append`: the selected bucket must be ready and the incoming schema must match its existing schema by name/type/nullability/normalization/null literals.
+
+Append builds only the incoming CSV as a new exact-indexed delta layer and atomically publishes a generation that references the unchanged existing layers.
+
+Status exposes `uploading`, `queued`, `validating`, `parsing`, `building`, `indexing`, `publishing`, `complete`, and `failed`. Upload byte counts are exact. Parsed-row counts are exposed when known; fake ETAs/percentages are not.
+
+Studio stores the active job ID in browser session storage. A build survives page reload. An interrupted upload can resume after the same file is re-selected; a SHA-256 fingerprint of only its first 1 MiB is persisted and verified to prevent mixing two same-name/same-size files.
+
+The legacy `POST /v1/admin/import/csv` endpoint remains for compatible clients and still streams multipart bytes to disk, but it does not provide the resilient chunk/reconnect protocol used by Studio.
+
+See [INGESTION.md](INGESTION.md) for append atomicity, cleanup, duplicate behavior and reverse-proxy guidance.
 
 ## Query protocol
 
@@ -134,7 +145,7 @@ Supported exact predicates:
 - set membership (`in`);
 - inclusive numeric range (`range`) on signed/unsigned columns.
 
-Pure equality queries retain the optimized LHR exact-index path. Narrow bounded integer ranges may reuse the exact singleton backbone when the bounded decomposition route is applicable; wider/open-ended/mixed set/range shapes retain the deterministic versioned fallback until additional exact accelerators are justified.
+Pure equality queries retain the optimized LHR exact-index path. Narrow bounded integer ranges may reuse the exact singleton backbone when the bounded decomposition route is applicable. For mixed shapes, exact equality filters can drive a bounded candidate stream and residual range/set filters are evaluated only on those candidates. A full visible-row fallback remains for shapes with no usable exact candidate access path.
 
 Pagination is based on stable logical row IDs (`after_row_id`), not physical row offsets. Compaction therefore does not invalidate the logical cursor ordering.
 

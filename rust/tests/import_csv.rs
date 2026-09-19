@@ -126,3 +126,47 @@ fn failed_import_does_not_move_current_generation() {
     assert_eq!(generations.len(), 1);
     assert!(generations[0].current);
 }
+
+
+#[test]
+fn csv_import_rejects_unexpected_columns_instead_of_silently_ignoring_them() {
+    let catalog = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let csv = source_dir.path().join("extra.csv");
+    fs::write(
+        &csv,
+        "country,age,active,note,unexpected\npk,20,true,ok,value\n",
+    )
+    .unwrap();
+
+    let error = import_csv(catalog.path(), &csv, &schema(), &config()).unwrap_err();
+    assert!(error.to_string().contains("unexpected column"));
+    assert!(list_generations(catalog.path()).unwrap().is_empty());
+}
+
+
+#[test]
+fn initial_import_refuses_to_replace_an_existing_current_generation() {
+    use lhr::import_csv_initial_with_progress;
+
+    let catalog = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let first = source_dir.path().join("first.csv");
+    let second = source_dir.path().join("second.csv");
+    fs::write(&first, "country,age,active,note\npk,20,true,ok\n").unwrap();
+    fs::write(&second, "country,age,active,note\nus,30,false,NULL\n").unwrap();
+
+    import_csv(catalog.path(), &first, &schema(), &config()).unwrap();
+    let before = resolve_dataset_root(catalog.path()).unwrap();
+    let error = import_csv_initial_with_progress(
+        catalog.path(),
+        &second,
+        &schema(),
+        &config(),
+        |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(resolve_dataset_root(catalog.path()).unwrap(), before);
+    assert_eq!(list_generations(catalog.path()).unwrap().len(), 1);
+}
