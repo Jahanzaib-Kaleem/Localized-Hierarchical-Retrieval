@@ -10,15 +10,76 @@ use std::{
 struct Layer {
     id: u32,
     dataset: LogicalDataset,
+    logical_to_physical: Vec<Option<usize>>,
+}
+
+fn merge_layer_schemas(
+    base: &crate::DatasetSchema,
+    delta_schemas: &[crate::DatasetSchema],
+) -> io::Result<crate::DatasetSchema> {
+    let mut columns = base.columns.clone();
+    for incoming in delta_schemas {
+        for column in &incoming.columns {
+            if let Some(index) = columns.iter().position(|existing| existing.name == column.name) {
+                let existing = &mut columns[index];
+                if existing.logical_type != column.logical_type
+                    || existing.normalization != column.normalization
+                    || existing.null_values != column.null_values
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "schema evolution conflict for column {:?}: type, normalization, and null literals must remain stable",
+                            column.name
+                        ),
+                    ));
+                }
+                existing.nullable |= column.nullable;
+            } else {
+                let mut evolved = column.clone();
+                // Every earlier layer lacks this newly introduced column.
+                evolved.nullable = true;
+                columns.push(evolved);
+            }
+        }
+    }
+
+    let mut schemas = Vec::with_capacity(delta_schemas.len() + 1);
+    schemas.push(base);
+    schemas.extend(delta_schemas.iter());
+    for column in &mut columns {
+        if schemas
+            .iter()
+            .any(|schema| schema.column_index(&column.name).is_none())
+        {
+            column.nullable = true;
+        }
+    }
+    crate::DatasetSchema::new(columns)
+}
+
+fn schema_map(
+    logical: &crate::DatasetSchema,
+    physical: &crate::DatasetSchema,
+) -> Vec<Option<usize>> {
+    logical
+        .columns
+        .iter()
+        .map(|column| physical.column_index(&column.name))
+        .collect()
 }
 
 /// A logical view over one immutable base generation plus zero or more immutable delta layers.
-/// Visibility overrides select the newest row version (or a tombstone) by stable logical row ID.
-/// A shared generation lease pins the resolved CURRENT snapshot for the lifetime of this object.
+/// Delta layers may add or omit named columns. The logical schema is their deterministic union:
+/// shared columns keep stable type/normalization semantics, while columns absent from any layer are
+/// nullable and read as NULL for that layer. Existing immutable rows never need rewriting merely
+/// because a later append introduces a new column.
 pub struct VersionedDataset {
     root: PathBuf,
     base: LogicalDataset,
+    base_logical_to_physical: Vec<Option<usize>>,
     deltas: Vec<Layer>,
+    schema: crate::DatasetSchema,
     overlay: OverlayCatalog,
     visibility: VisibilityMap,
     _snapshot: SnapshotLease,
@@ -31,23 +92,37 @@ impl VersionedDataset {
         let base = LogicalDataset::open(&root)?;
         let overlay = read_overlay(&root, base.physical_rows(), base.max_row_id())?;
         let visibility = VisibilityMap::open_optional(&root)?;
-        let mut deltas = Vec::with_capacity(overlay.deltas.len());
+
+        let mut physical_deltas = Vec::with_capacity(overlay.deltas.len());
         for meta in &overlay.deltas {
             let dataset = LogicalDataset::open(root.join(&meta.path))?;
-            if dataset.schema() != base.schema() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("delta layer {} schema differs from base schema", meta.id),
-                ));
-            }
             if dataset.physical_rows() != meta.rows {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("delta layer {} row count mismatch", meta.id),
                 ));
             }
-            deltas.push(Layer { id: meta.id, dataset });
+            physical_deltas.push((meta.id, dataset));
         }
+
+        let delta_schemas = physical_deltas
+            .iter()
+            .map(|(_, dataset)| dataset.schema().clone())
+            .collect::<Vec<_>>();
+        let schema = merge_layer_schemas(base.schema(), &delta_schemas)?;
+        let base_logical_to_physical = schema_map(&schema, base.schema());
+        let deltas = physical_deltas
+            .into_iter()
+            .map(|(id, dataset)| {
+                let logical_to_physical = schema_map(&schema, dataset.schema());
+                Layer {
+                    id,
+                    dataset,
+                    logical_to_physical,
+                }
+            })
+            .collect::<Vec<_>>();
+
         for index in 0..visibility.len() {
             let Some((_, target)) = visibility.entry(index) else { continue; };
             if let VisibilityTarget::Layer(layer) = target {
@@ -62,7 +137,9 @@ impl VersionedDataset {
         Ok(Self {
             root,
             base,
+            base_logical_to_physical,
             deltas,
+            schema,
             overlay,
             visibility,
             _snapshot: snapshot,
@@ -73,7 +150,7 @@ impl VersionedDataset {
         &self.root
     }
     pub fn schema(&self) -> &crate::DatasetSchema {
-        self.base.schema()
+        &self.schema
     }
     pub fn visible_rows(&self) -> u64 {
         self.overlay.visible_rows
