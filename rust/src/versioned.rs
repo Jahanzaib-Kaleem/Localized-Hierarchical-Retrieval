@@ -1,6 +1,6 @@
 use crate::{
     read_overlay, DeltaLayerMeta, LogicalDataset, LogicalExplain, LogicalPredicate, LogicalQueryResult,
-    LogicalRow, OverlayCatalog, SnapshotLease, VisibilityMap, VisibilityTarget,
+    LogicalRow, NamedValue, OverlayCatalog, SnapshotLease, VisibilityMap, VisibilityTarget,
 };
 use std::{
     io,
@@ -166,29 +166,51 @@ impl VersionedDataset {
     }
 
     pub fn contains_canonical_value(&self, column: usize, value: &str) -> bool {
-        self.base.contains_canonical_value(column, value)
-            || self
-                .deltas
-                .iter()
-                .any(|x| x.dataset.contains_canonical_value(column, value))
+        if column >= self.schema.columns.len() {
+            return false;
+        }
+        if let Some(physical) = self.base_logical_to_physical[column] {
+            if self.base.contains_canonical_value(physical, value) {
+                return true;
+            }
+        }
+        self.deltas.iter().any(|layer| {
+            layer.logical_to_physical[column]
+                .map(|physical| layer.dataset.contains_canonical_value(physical, value))
+                .unwrap_or(false)
+        })
     }
 
     pub fn has_exact_singleton(&self, column: usize) -> bool {
-        self.base.has_exact_singleton(column)
-            && self
-                .deltas
-                .iter()
-                .all(|layer| layer.dataset.has_exact_singleton(column))
+        if column >= self.schema.columns.len() {
+            return false;
+        }
+        let mut present = false;
+        if let Some(physical) = self.base_logical_to_physical[column] {
+            present = true;
+            if !self.base.has_exact_singleton(physical) {
+                return false;
+            }
+        }
+        for layer in &self.deltas {
+            if let Some(physical) = layer.logical_to_physical[column] {
+                present = true;
+                if !layer.dataset.has_exact_singleton(physical) {
+                    return false;
+                }
+            }
+        }
+        present
     }
 
-    fn layer(&self, id: u32) -> Option<&LogicalDataset> {
+    fn layer_with_map(&self, id: u32) -> Option<(&LogicalDataset, &[Option<usize>])> {
         if id == 0 {
-            return Some(&self.base);
+            return Some((&self.base, &self.base_logical_to_physical));
         }
         self.deltas
             .iter()
             .find(|x| x.id == id)
-            .map(|x| &x.dataset)
+            .map(|x| (&x.dataset, x.logical_to_physical.as_slice()))
     }
 
     fn visible_in_layer(&self, row_id: u64, layer: u32) -> bool {
@@ -199,11 +221,103 @@ impl VersionedDataset {
         }
     }
 
+    fn align_values(
+        &self,
+        map: &[Option<usize>],
+        physical_values: &[Option<String>],
+    ) -> Vec<Option<String>> {
+        map.iter()
+            .map(|physical| physical.and_then(|index| physical_values.get(index).cloned().flatten()))
+            .collect()
+    }
+
+    fn projection_indices(&self, select: Option<&[String]>) -> io::Result<Vec<usize>> {
+        match select {
+            None => Ok((0..self.schema.columns.len()).collect()),
+            Some(names) => names
+                .iter()
+                .map(|name| {
+                    self.schema.column_index(name).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("unknown selected column {name}"),
+                        )
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn predicates_for_layer(
+        &self,
+        dataset: &LogicalDataset,
+        map: &[Option<usize>],
+        predicates: &[LogicalPredicate],
+    ) -> io::Result<Option<Vec<LogicalPredicate>>> {
+        let mut out = Vec::with_capacity(predicates.len());
+        for predicate in predicates {
+            let logical = self.schema.column_index(&predicate.column).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown column {}", predicate.column),
+                )
+            })?;
+            let logical_column = &self.schema.columns[logical];
+            let is_null = match predicate.value.as_deref() {
+                None => {
+                    if !logical_column.nullable {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("column {} is not nullable", logical_column.name),
+                        ));
+                    }
+                    true
+                }
+                Some(raw) => logical_column.is_null_literal(raw),
+            };
+
+            let Some(physical) = map[logical] else {
+                if is_null {
+                    continue;
+                }
+                return Ok(None);
+            };
+            let physical_column = &dataset.schema().columns[physical];
+            if is_null && !physical_column.nullable {
+                return Ok(None);
+            }
+            out.push(predicate.clone());
+        }
+        Ok(Some(out))
+    }
+
+    fn logical_row(
+        &self,
+        row: LogicalRow,
+        map: &[Option<usize>],
+        projection: &[usize],
+    ) -> LogicalRow {
+        let mut values = Vec::with_capacity(projection.len());
+        for &logical in projection {
+            let value = map[logical]
+                .and_then(|physical| row.values.get(physical))
+                .and_then(|value| value.value.clone());
+            values.push(NamedValue {
+                column: self.schema.columns[logical].name.clone(),
+                value,
+            });
+        }
+        LogicalRow {
+            row_id: row.row_id,
+            values,
+        }
+    }
+
     pub fn row_values(&self, row_id: u64) -> io::Result<Option<Vec<Option<String>>>> {
         match self.visibility.target(row_id) {
             Some(VisibilityTarget::Deleted) => Ok(None),
             Some(VisibilityTarget::Layer(layer)) => {
-                let dataset = self.layer(layer).ok_or_else(|| {
+                let (dataset, map) = self.layer_with_map(layer).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "visibility target layer is missing")
                 })?;
                 let Some(physical) = dataset.physical_row_id(row_id) else {
@@ -212,16 +326,19 @@ impl VersionedDataset {
                         format!("visibility layer {layer} does not contain row {row_id}"),
                     ));
                 };
-                Ok(Some(dataset.decode_physical_values(physical)?))
+                let values = dataset.decode_physical_values(physical)?;
+                Ok(Some(self.align_values(map, &values)))
             }
             None => {
                 for layer in self.deltas.iter().rev() {
                     if let Some(physical) = layer.dataset.physical_row_id(row_id) {
-                        return Ok(Some(layer.dataset.decode_physical_values(physical)?));
+                        let values = layer.dataset.decode_physical_values(physical)?;
+                        return Ok(Some(self.align_values(&layer.logical_to_physical, &values)));
                     }
                 }
                 if let Some(physical) = self.base.physical_row_id(row_id) {
-                    return Ok(Some(self.base.decode_physical_values(physical)?));
+                    let values = self.base.decode_physical_values(physical)?;
+                    return Ok(Some(self.align_values(&self.base_logical_to_physical, &values)));
                 }
                 Ok(None)
             }
@@ -234,15 +351,12 @@ impl VersionedDataset {
         predicates: &[LogicalPredicate],
     ) -> io::Result<bool> {
         for predicate in predicates {
-            let column = self
-                .schema()
-                .column_index(&predicate.column)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("unknown column {}", predicate.column),
-                    )
-                })?;
+            let column = self.schema().column_index(&predicate.column).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown column {}", predicate.column),
+                )
+            })?;
             let schema = &self.schema().columns[column];
             let expected = match predicate.value.as_deref() {
                 None => {
@@ -268,6 +382,7 @@ impl VersionedDataset {
         &self,
         layer_id: u32,
         dataset: &LogicalDataset,
+        map: &[Option<usize>],
         predicates: &[LogicalPredicate],
     ) -> io::Result<(u64, usize)> {
         let mut hidden_hits = 0u64;
@@ -279,7 +394,8 @@ impl VersionedDataset {
             }
             let Some(physical) = dataset.physical_row_id(row_id) else { continue; };
             hidden_rows = hidden_rows.saturating_add(1);
-            let values = dataset.decode_physical_values(physical)?;
+            let physical_values = dataset.decode_physical_values(physical)?;
+            let values = self.align_values(map, &physical_values);
             if self.values_match(&values, predicates)? {
                 hidden_hits += 1;
             }
@@ -292,9 +408,26 @@ impl VersionedDataset {
         predicates: &[LogicalPredicate],
     ) -> io::Result<Vec<(u32, LogicalExplain)>> {
         let mut plans = Vec::with_capacity(self.deltas.len() + 1);
-        plans.push((0, self.base.explain_values(predicates)?));
+        let mut explain_layer =
+            |id: u32, dataset: &LogicalDataset, map: &[Option<usize>]| -> io::Result<()> {
+                let explain = match self.predicates_for_layer(dataset, map, predicates)? {
+                    None => LogicalExplain {
+                        predicates: predicates.to_vec(),
+                        dictionary_miss: true,
+                        plan: None,
+                    },
+                    Some(layer_predicates) => {
+                        let mut explain = dataset.explain_values(&layer_predicates)?;
+                        explain.predicates = predicates.to_vec();
+                        explain
+                    }
+                };
+                plans.push((id, explain));
+                Ok(())
+            };
+        explain_layer(0, &self.base, &self.base_logical_to_physical)?;
         for layer in &self.deltas {
-            plans.push((layer.id, layer.dataset.explain_values(predicates)?));
+            explain_layer(layer.id, &layer.dataset, &layer.logical_to_physical)?;
         }
         Ok(plans)
     }
@@ -315,34 +448,43 @@ impl VersionedDataset {
         after_row_id: Option<u64>,
         limit: usize,
     ) -> io::Result<LogicalQueryResult> {
+        let projection = self.projection_indices(select)?;
         let mut hits = 0u64;
         let mut rows_checked = 0u64;
         let mut pages_touched = 0u64;
         let mut hierarchy_lookups = 0u64;
         let mut rows = Vec::<LogicalRow>::new();
 
-        let mut run_layer = |layer_id: u32, dataset: &LogicalDataset| -> io::Result<()> {
-            let (hidden_hits, hidden_rows) =
-                self.hidden_match_count(layer_id, dataset, predicates)?;
-            let fetch_limit = limit.saturating_add(hidden_rows);
-            let result =
-                dataset.query_values_after(predicates, select, after_row_id, fetch_limit)?;
-            hits = hits.saturating_add(result.hits.saturating_sub(hidden_hits));
-            rows_checked = rows_checked.saturating_add(result.rows_checked);
-            pages_touched = pages_touched.saturating_add(result.pages_touched);
-            hierarchy_lookups = hierarchy_lookups.saturating_add(result.hierarchy_lookups);
-            rows.extend(
-                result
-                    .rows
-                    .into_iter()
-                    .filter(|row| self.visible_in_layer(row.row_id, layer_id)),
-            );
-            Ok(())
-        };
+        let mut run_layer =
+            |layer_id: u32, dataset: &LogicalDataset, map: &[Option<usize>]| -> io::Result<()> {
+                let Some(layer_predicates) =
+                    self.predicates_for_layer(dataset, map, predicates)?
+                else {
+                    return Ok(());
+                };
+                let (hidden_hits, hidden_rows) =
+                    self.hidden_match_count(layer_id, dataset, map, predicates)?;
+                let fetch_limit = limit.saturating_add(hidden_rows);
+                // Fetch the complete physical row so it can be projected into the union schema.
+                let result =
+                    dataset.query_values_after(&layer_predicates, None, after_row_id, fetch_limit)?;
+                hits = hits.saturating_add(result.hits.saturating_sub(hidden_hits));
+                rows_checked = rows_checked.saturating_add(result.rows_checked);
+                pages_touched = pages_touched.saturating_add(result.pages_touched);
+                hierarchy_lookups = hierarchy_lookups.saturating_add(result.hierarchy_lookups);
+                rows.extend(
+                    result
+                        .rows
+                        .into_iter()
+                        .filter(|row| self.visible_in_layer(row.row_id, layer_id))
+                        .map(|row| self.logical_row(row, map, &projection)),
+                );
+                Ok(())
+            };
 
-        run_layer(0, &self.base)?;
+        run_layer(0, &self.base, &self.base_logical_to_physical)?;
         for layer in &self.deltas {
-            run_layer(layer.id, &layer.dataset)?;
+            run_layer(layer.id, &layer.dataset, &layer.logical_to_physical)?;
         }
         rows.sort_unstable_by_key(|row| row.row_id);
         rows.dedup_by_key(|row| row.row_id);
