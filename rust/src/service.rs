@@ -2,7 +2,7 @@ use crate::{
     add_index, append_csv_delta_with_progress, apply_mutations_delta, combine_buckets,
     compact_dataset, create_bucket, dataset_stats, dataset_status, delete_bucket, drop_index,
     execute_query, import_csv, import_csv_initial_with_progress, leased_generation_ids, list_buckets,
-    list_generations, planner_indexes_for_request, read_schema, rebuild_index, record_query,
+    list_generations, planner_indexes_for_request, rebuild_index, record_query,
     recover_catalog, rename_bucket, require_bucket_root, resolve_dataset_root, transfer_rows,
     vacuum_with_reader_leases, workload_report, CompactionConfig, CsvImportConfig,
     CsvImportProgress, CsvImportStage, DatasetSchema, Mutation, MutationConfig, QueryRequest,
