@@ -4,7 +4,8 @@ use lhr::{
     dataset_status, drop_index, execute_query, import_csv, import_external, list_generations,
     list_indexes, planner_indexes_for_request, read_schema_file, rebuild_index, record_query,
     recover_catalog, resolve_dataset_root, restore_backup, rollback_generation, seal_dataset,
-    serve, vacuum_with_reader_leases, verify_versioned_dataset, workload_report, CompactionConfig,
+    serve, upgrade_numeric_orders, vacuum_with_reader_leases, verify_versioned_dataset,
+    workload_report, CompactionConfig,
     CsvImportConfig, DatasetSchema, Engine, ExternalFormat, ExternalImportConfig, LogicalPredicate,
     Mutation, MutationConfig, Predicate, QueryRequest, ServiceConfig, SnapshotLease,
     VersionedDataset,
@@ -192,6 +193,11 @@ enum IndexCommand {
         #[arg(long, default_value_t = 250_000)]
         max_sort_records: usize,
     },
+    /// Build/rebuild exact numeric-order sidecars for the base and every delta layer.
+    UpgradeNumeric {
+        #[arg(long, default_value_t = 250_000)]
+        max_sort_records: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -326,6 +332,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             IndexCommand::Add { columns, max_sort_records } => print_json(&add_index(&cli.root, &columns, max_sort_records)?)?,
             IndexCommand::Drop { columns } => print_json(&drop_index(&cli.root, &columns)?)?,
             IndexCommand::Rebuild { columns, max_sort_records } => print_json(&rebuild_index(&cli.root, &columns, max_sort_records)?)?,
+            IndexCommand::UpgradeNumeric { max_sort_records } => {
+                print_json(&upgrade_numeric_orders(&cli.root, max_sort_records)?)?
+            }
         },
         Command::Restore { backup } => print_json(&restore_backup(&cli.root, backup)?)?,
         Command::Recover => print_json(&recover_catalog(&cli.root)?)?,

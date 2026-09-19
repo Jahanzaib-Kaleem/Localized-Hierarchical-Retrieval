@@ -1,7 +1,7 @@
 use crate::{
-    abandon_generation, add_exact_hierarchies, begin_generation, dataset_status, publish_generation,
-    read_overlay, read_schema, resolve_dataset_root, DatasetSchema, GenerationInfo, HierarchySpec,
-    Manifest,
+    abandon_generation, add_exact_hierarchies, begin_generation, build_numeric_orders,
+    dataset_status, publish_generation, read_overlay, read_schema, resolve_dataset_root,
+    DatasetSchema, GenerationInfo, HierarchySpec, Manifest,
 };
 use serde::Serialize;
 use std::{
@@ -42,6 +42,13 @@ pub struct DatasetStatsReport {
     pub total_bytes: u64,
     pub column_stats: Vec<ColumnStats>,
     pub indexes: Vec<IndexInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NumericOrderUpgradeReport {
+    pub generation: GenerationInfo,
+    pub layers: usize,
+    pub sidecars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -372,3 +379,50 @@ pub fn rebuild_index(
         }
     }
 }
+
+pub fn upgrade_numeric_orders(
+    catalog_root: impl AsRef<Path>,
+    max_sort_records: usize,
+) -> io::Result<NumericOrderUpgradeReport> {
+    if max_sort_records == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max_sort_records must be > 0",
+        ));
+    }
+    let catalog_root = catalog_root.as_ref();
+    let (stage, base_schema, manifest) = clone_current(catalog_root)?;
+    let result = (|| {
+        let mut layers = 1usize;
+        let mut sidecars =
+            build_numeric_orders(&stage.path, &base_schema, max_sort_records)?;
+        let overlay = read_overlay(&stage.path, manifest.rows, None)?;
+        for delta in &overlay.deltas {
+            let layer_root = stage.path.join(&delta.path);
+            let schema = read_schema(&layer_root)?;
+            sidecars = sidecars.saturating_add(build_numeric_orders(
+                &layer_root,
+                &schema,
+                max_sort_records,
+            )?);
+            layers = layers.saturating_add(1);
+        }
+        Ok((layers, sidecars))
+    })();
+
+    match result {
+        Ok((layers, sidecars)) => {
+            let generation = publish_generation(stage)?;
+            Ok(NumericOrderUpgradeReport {
+                generation,
+                layers,
+                sidecars,
+            })
+        }
+        Err(error) => {
+            let _ = abandon_generation(stage);
+            Err(error)
+        }
+    }
+}
+

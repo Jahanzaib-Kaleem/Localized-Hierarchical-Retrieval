@@ -39,8 +39,8 @@ pub mod telemetry;
 pub mod versioned;
 
 pub use admin::{
-    add_index, dataset_stats, drop_index, list_indexes, rebuild_index, ColumnStats,
-    DatasetStatsReport, IndexChangeReport, IndexInfo,
+    add_index, dataset_stats, drop_index, list_indexes, rebuild_index, upgrade_numeric_orders,
+    ColumnStats, DatasetStatsReport, IndexChangeReport, IndexInfo, NumericOrderUpgradeReport,
 };
 pub use bitmap::BitmapHierarchy;
 pub use bitslice_postings::BitSlicePostingHierarchy;

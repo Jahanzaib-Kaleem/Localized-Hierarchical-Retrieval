@@ -1,4 +1,7 @@
-use crate::{dictionary_filename, read_schema, Dictionary, Engine, Manifest, Segment};
+use crate::{
+    dictionary_filename, numeric_order_filename, read_schema, Dictionary, Engine, Manifest,
+    NumericKind, NumericOrder, Segment,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -446,6 +449,34 @@ pub fn verify_dataset_structure(root: &Path) -> io::Result<VerificationReport> {
                             }
                             if let Err(error) = dictionary.verify_offsets() {
                                 errors.push(format!("dictionary {}: {error}", spec.name));
+                            }
+                            if NumericKind::from_logical_type(&spec.logical_type).is_some() {
+                                let numeric_path =
+                                    root.join("routing").join(numeric_order_filename(column));
+                                if numeric_path.is_file() {
+                                    match NumericOrder::open(&numeric_path) {
+                                        Ok(order) => {
+                                            checked_files += 1;
+                                            if let Err(error) =
+                                                order.validate_for(&dictionary, &spec.logical_type)
+                                            {
+                                                errors.push(format!(
+                                                    "numeric order {}: {error}",
+                                                    spec.name
+                                                ));
+                                            } else if let Err(error) = order.verify() {
+                                                errors.push(format!(
+                                                    "numeric order {}: {error}",
+                                                    spec.name
+                                                ));
+                                            }
+                                        }
+                                        Err(error) => errors.push(format!(
+                                            "numeric order {}: {error}",
+                                            spec.name
+                                        )),
+                                    }
+                                }
                             }
                         }
                         Err(error) => errors.push(format!(
