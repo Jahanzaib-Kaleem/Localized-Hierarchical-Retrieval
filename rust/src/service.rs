@@ -1,12 +1,13 @@
 use crate::{
     add_index, append_csv_delta_with_progress, apply_mutations_delta, combine_buckets,
     compact_dataset, create_bucket, dataset_stats, dataset_status, delete_bucket, drop_index,
-    execute_query, import_csv, import_csv_initial_with_progress, leased_generation_ids, list_buckets,
-    list_generations, planner_indexes_for_request, rebuild_index, record_query,
-    recover_catalog, rename_bucket, require_bucket_root, resolve_dataset_root, transfer_rows,
-    vacuum_with_reader_leases, workload_report, CompactionConfig, CsvImportConfig,
-    CsvImportProgress, CsvImportStage, DatasetSchema, Mutation, MutationConfig, QueryRequest,
-    VersionedDataset, DEFAULT_BUCKET,
+    execute_query, import_csv, import_csv_segmented_initial_with_progress, leased_generation_ids,
+    list_buckets, list_generations, planner_indexes_for_request, rebuild_index, record_query,
+    recover_catalog, rename_bucket, require_bucket_root, resolve_dataset_root,
+    segmented_import_disk_floor, transfer_rows, vacuum_with_reader_leases, workload_report,
+    append_csv_segmented_with_progress, CompactionConfig, CsvImportConfig, CsvImportProgress,
+    CsvImportStage, DatasetSchema, Mutation, MutationConfig, QueryRequest,
+    SegmentedCsvImportConfig, VersionedDataset, DEFAULT_BUCKET,
 };
 use axum::{
     body::{Body, Bytes},
@@ -424,23 +425,28 @@ fn run_import_job(root: PathBuf, config: CsvImportConfig, id: String) {
     };
 
     let schema = job.schema.clone();
+    let mut segmented = SegmentedCsvImportConfig::from_engine(config);
+    // Import-job uploads are disposable staging copies, unlike CLI/source files. The segmented
+    // builder may therefore reclaim already-consumed ranges on Linux while the unpublished
+    // generation grows.
+    segmented.reclaim_consumed_source = true;
     let result: io::Result<Value> = match job.mode {
-        ImportMode::Create => import_csv_initial_with_progress(
+        ImportMode::Create => import_csv_segmented_initial_with_progress(
             &bucket_root,
             &upload,
             &schema,
-            &config,
+            &segmented,
             |progress| update_import_progress(&root, &mut job, progress),
         )
         .and_then(|report| {
             serde_json::to_value(report)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
         }),
-        ImportMode::Append => append_csv_delta_with_progress(
+        ImportMode::Append => append_csv_segmented_with_progress(
             &bucket_root,
             &upload,
             &schema,
-            &config,
+            &segmented,
             |progress| update_import_progress(&root, &mut job, progress),
         )
         .and_then(|report| {
@@ -715,10 +721,10 @@ async fn import_job_create(
         .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
     let available = fs2::available_space(&state.root)
         .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
-    let disk_floor = request
-        .bytes_total
-        .saturating_mul(4)
-        .saturating_add(64 * 1024 * 1024);
+    // Segmented Studio imports retain the full upload initially, but reclaim consumed extents
+    // while bounded parts are built. Reserve one additional source-sized budget plus bounded
+    // active-part workspace instead of requiring four complete copies of the entire CSV.
+    let disk_floor = segmented_import_disk_floor(request.bytes_total);
     if disk_floor > available {
         return Err(ApiError::new(
             StatusCode::INSUFFICIENT_STORAGE,
