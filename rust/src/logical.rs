@@ -390,6 +390,133 @@ impl LogicalDataset {
         })
     }
 
+    /// Stream exact equality candidates while testing one numeric range directly against the
+    /// canonical token. Dictionary text is borrowed from mmap and parsed in place, avoiding a
+    /// per-candidate String allocation and avoiding materializing unrelated columns.
+    pub(crate) fn scan_numeric_range_candidates<F>(
+        &self,
+        predicates: &[LogicalPredicate],
+        column: usize,
+        gte: Option<&str>,
+        lte: Option<&str>,
+        batch_rows: usize,
+        mut visit: F,
+    ) -> io::Result<Option<QueryStats>>
+    where
+        F: FnMut(u64, bool) -> io::Result<()>,
+    {
+        if column >= self.schema.columns.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "numeric range column is out of bounds",
+            ));
+        }
+
+        enum Bounds {
+            Unsigned(Option<u64>, Option<u64>),
+            Signed(Option<i64>, Option<i64>),
+        }
+
+        let bounds = match self.schema.columns[column].logical_type {
+            crate::LogicalType::Unsigned => Bounds::Unsigned(
+                gte.map(|value| {
+                    value.parse::<u64>().map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid canonical unsigned range bound: {error}"),
+                        )
+                    })
+                }).transpose()?,
+                lte.map(|value| {
+                    value.parse::<u64>().map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid canonical unsigned range bound: {error}"),
+                        )
+                    })
+                }).transpose()?,
+            ),
+            crate::LogicalType::Signed => Bounds::Signed(
+                gte.map(|value| {
+                    value.parse::<i64>().map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid canonical signed range bound: {error}"),
+                        )
+                    })
+                }).transpose()?,
+                lte.map(|value| {
+                    value.parse::<i64>().map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid canonical signed range bound: {error}"),
+                        )
+                    })
+                }).transpose()?,
+            ),
+            ref other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("numeric range stream requires signed/unsigned column, got {other:?}"),
+                ))
+            }
+        };
+
+        let Some(encoded) = self.encoded_predicates(predicates)? else {
+            return Ok(Some(QueryStats::default()));
+        };
+
+        self.engine.scan_row_ids(&encoded, batch_rows, 0, |physical_ids| {
+            for &physical in physical_ids {
+                let raw_token = self.engine.row_value(physical, column).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "candidate row is missing numeric range token",
+                    )
+                })?;
+                let token = u32::try_from(raw_token).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "numeric range token exceeds u32",
+                    )
+                })?;
+                let matches = match self.dictionaries[column].decode(token) {
+                    Some(DecodedValue::Null) | None => false,
+                    Some(DecodedValue::Text(text)) => match bounds {
+                        Bounds::Unsigned(lo, hi) => {
+                            let value = text.parse::<u64>().map_err(|error| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("invalid canonical unsigned value: {error}"),
+                                )
+                            })?;
+                            lo.map_or(true, |bound| value >= bound)
+                                && hi.map_or(true, |bound| value <= bound)
+                        }
+                        Bounds::Signed(lo, hi) => {
+                            let value = text.parse::<i64>().map_err(|error| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("invalid canonical signed value: {error}"),
+                                )
+                            })?;
+                            lo.map_or(true, |bound| value >= bound)
+                                && hi.map_or(true, |bound| value <= bound)
+                        }
+                    },
+                };
+                let row_id = self.row_ids.logical(physical).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "query returned unmapped row ID",
+                    )
+                })?;
+                visit(row_id, matches)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Stream logical row IDs for a fully covered exact equality conjunction without decoding
     /// canonical column values.
     pub(crate) fn scan_row_ids<F>(

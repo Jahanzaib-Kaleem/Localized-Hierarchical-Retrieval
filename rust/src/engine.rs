@@ -1015,6 +1015,15 @@ impl Engine {
         (id < end).then_some(segment)
     }
 
+    pub(crate) fn row_value(&self, id: u64, column: usize) -> Option<u64> {
+        if column >= self.columns {
+            return None;
+        }
+        let segment = self.segment_for_row(id)?;
+        let local = (id - segment.row_start) as usize;
+        segment.data.value(local, column)
+    }
+
     pub fn row_projection(&self, id: u64, columns: &[usize]) -> Option<Vec<u64>> {
         if columns.iter().any(|&column| column >= self.columns) {
             return None;

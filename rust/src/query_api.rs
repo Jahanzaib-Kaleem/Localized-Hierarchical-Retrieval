@@ -511,6 +511,85 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
         let mut hits = 0u64;
         let mut best_row_ids = BinaryHeap::<u64>::with_capacity(request.limit.saturating_add(1));
 
+        // The real-data hot shape is several exact equalities plus one numeric range. Avoid even
+        // the small projected String allocation in that case: compare the canonical numeric token
+        // directly inside the physical layer and surface only (row_id, matches_range).
+        if residual_filters.len() == 1 {
+            if let PreparedFilter::Range { column, gte, lte } = &residual_filters[0] {
+                let (scan_rows_checked, pages_touched, hierarchy_lookups) =
+                    dataset.scan_numeric_range_candidates(
+                        &candidate_predicates,
+                        *column,
+                        gte.as_deref(),
+                        lte.as_deref(),
+                        CANDIDATE_BATCH,
+                        |row_id, matches| {
+                            rows_examined = rows_examined.saturating_add(1);
+                            enforce_rows_examined(request.max_rows_examined, rows_examined)?;
+                            if rows_examined % 1024 == 0 {
+                                enforce_deadline(deadline)?;
+                            }
+                            if !matches {
+                                return Ok(());
+                            }
+
+                            hits = hits.saturating_add(1);
+                            if request.after_row_id.is_some_and(|cursor| row_id <= cursor) {
+                                return Ok(());
+                            }
+                            if best_row_ids.len() < request.limit {
+                                best_row_ids.push(row_id);
+                            } else if request.limit > 0
+                                && best_row_ids.peek().is_some_and(|&largest| row_id < largest)
+                            {
+                                best_row_ids.pop();
+                                best_row_ids.push(row_id);
+                            }
+                            Ok(())
+                        },
+                    )?;
+                rows_examined = rows_examined.saturating_add(scan_rows_checked);
+                enforce_rows_examined(request.max_rows_examined, rows_examined)?;
+                enforce_deadline(deadline)?;
+
+                let mut row_ids = best_row_ids.into_vec();
+                row_ids.sort_unstable();
+                let mut rows = Vec::with_capacity(row_ids.len());
+                for row_id in row_ids {
+                    let values = dataset.row_values(row_id)?.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("candidate row {row_id} disappeared during snapshot query"),
+                        )
+                    })?;
+                    let selected = projection
+                        .iter()
+                        .map(|&column| NamedValue {
+                            column: dataset.schema().columns[column].name.clone(),
+                            value: values[column].clone(),
+                        })
+                        .collect();
+                    rows.push(QueryApiRow { row_id, values: selected });
+                }
+
+                let next_cursor = (rows.len() == request.limit)
+                    .then(|| rows.last().unwrap().row_id);
+                return Ok(QueryResponse {
+                    returned: rows.len(),
+                    rows,
+                    next_cursor,
+                    stats: QueryApiStats {
+                        hits,
+                        rows_examined,
+                        pages_touched,
+                        hierarchy_lookups,
+                        elapsed_micros: start.elapsed().as_micros(),
+                        optimized_equality_route: true,
+                    },
+                });
+            }
+        }
+
         let (scan_rows_checked, pages_touched, hierarchy_lookups) = dataset.scan_values(
             &candidate_predicates,
             Some(&candidate_select),

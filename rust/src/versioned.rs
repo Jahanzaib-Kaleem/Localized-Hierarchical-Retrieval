@@ -616,6 +616,75 @@ impl VersionedDataset {
         })
     }
 
+    /// Stream visible equality candidates while evaluating one numeric range inside each
+    /// physical layer without allocating decoded row values. Layers that predate the numeric
+    /// column are exact NULLs for that column and therefore cannot satisfy a numeric range.
+    pub(crate) fn scan_numeric_range_candidates<F>(
+        &self,
+        predicates: &[LogicalPredicate],
+        column: usize,
+        gte: Option<&str>,
+        lte: Option<&str>,
+        batch_rows: usize,
+        mut visit: F,
+    ) -> io::Result<(u64, u64, u64)>
+    where
+        F: FnMut(u64, bool) -> io::Result<()>,
+    {
+        if column >= self.schema.columns.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "numeric range column is out of bounds",
+            ));
+        }
+        let mut rows_checked = 0u64;
+        let mut pages_touched = 0u64;
+        let mut hierarchy_lookups = 0u64;
+
+        let mut run_layer =
+            |layer_id: u32, dataset: &LogicalDataset, map: &[Option<usize>]| -> io::Result<()> {
+                let Some(physical_column) = map[column] else {
+                    // The logical value is NULL throughout this layer, which cannot satisfy a
+                    // signed/unsigned range predicate.
+                    return Ok(());
+                };
+                let Some(layer_predicates) =
+                    self.predicates_for_layer(dataset, map, predicates)?
+                else {
+                    return Ok(());
+                };
+                let stats = dataset.scan_numeric_range_candidates(
+                    &layer_predicates,
+                    physical_column,
+                    gte,
+                    lte,
+                    batch_rows,
+                    |row_id, matches| {
+                        if self.visible_in_layer(row_id, layer_id) {
+                            visit(row_id, matches)?;
+                        }
+                        Ok(())
+                    },
+                )?;
+                let Some(stats) = stats else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "exact singleton numeric-range scan was not fully covered",
+                    ));
+                };
+                rows_checked = rows_checked.saturating_add(stats.rows_checked);
+                pages_touched = pages_touched.saturating_add(stats.pages_touched);
+                hierarchy_lookups = hierarchy_lookups.saturating_add(stats.hierarchy_lookups);
+                Ok(())
+            };
+
+        run_layer(0, &self.base, &self.base_logical_to_physical)?;
+        for layer in &self.deltas {
+            run_layer(layer.id, &layer.dataset, &layer.logical_to_physical)?;
+        }
+        Ok((rows_checked, pages_touched, hierarchy_lookups))
+    }
+
     /// Stream visible logical row IDs proven by exact equality indexes while planning each
     /// immutable layer once. A predicate that is logically true for every row in an older schema
     /// layer (for example, an absent evolved column queried as NULL) is represented by an empty
