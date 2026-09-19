@@ -1004,13 +1004,22 @@ impl Engine {
         (out, stats)
     }
 
+    fn segment_for_row(&self, id: u64) -> Option<&LoadedSegment> {
+        let upper = self
+            .segments
+            .partition_point(|segment| segment.row_start <= id);
+        let segment = self.segments.get(upper.checked_sub(1)?)?;
+        let end = segment
+            .row_start
+            .checked_add(segment.data.rows() as u64)?;
+        (id < end).then_some(segment)
+    }
+
     pub fn row_projection(&self, id: u64, columns: &[usize]) -> Option<Vec<u64>> {
         if columns.iter().any(|&column| column >= self.columns) {
             return None;
         }
-        let segment = self.segments.iter().find(|segment| {
-            id >= segment.row_start && id < segment.row_start + segment.data.rows() as u64
-        })?;
+        let segment = self.segment_for_row(id)?;
         let local = (id - segment.row_start) as usize;
         columns
             .iter()
@@ -1019,9 +1028,7 @@ impl Engine {
     }
 
     pub fn row(&self, id: u64) -> Option<Vec<u64>> {
-        let segment = self.segments.iter().find(|segment| {
-            id >= segment.row_start && id < segment.row_start + segment.data.rows() as u64
-        })?;
+        let segment = self.segment_for_row(id)?;
         let local = (id - segment.row_start) as usize;
         Some(
             (0..self.columns)
