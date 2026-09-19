@@ -167,6 +167,7 @@ struct ServiceState {
     metrics: Arc<RuntimeMetrics>,
     next_request_id: Arc<AtomicU64>,
     import_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    dataset_cache: Arc<Mutex<HashMap<String, Arc<VersionedDataset>>>>,
 }
 
 fn hash_token(token: &str) -> [u8; 32] { Sha256::digest(token.as_bytes()).into() }
@@ -636,6 +637,42 @@ fn selected_bucket_root(state: &ServiceState, bucket: &str, request_id: u64) -> 
         .map_err(|error| ApiError::new(io_status(&error), request_id, error.to_string()))
 }
 
+fn cached_dataset(
+    cache: &Mutex<HashMap<String, Arc<VersionedDataset>>>,
+    bucket: &str,
+    root: &Path,
+) -> io::Result<Arc<VersionedDataset>> {
+    let resolved = resolve_dataset_root(root)?;
+    {
+        let guard = cache
+            .lock()
+            .map_err(|_| io::Error::other("dataset cache lock poisoned"))?;
+        if let Some(dataset) = guard.get(bucket) {
+            if dataset.root() == resolved {
+                return Ok(Arc::clone(dataset));
+            }
+        }
+    }
+
+    let opened = Arc::new(VersionedDataset::open(&resolved)?);
+    let mut guard = cache
+        .lock()
+        .map_err(|_| io::Error::other("dataset cache lock poisoned"))?;
+    if let Some(dataset) = guard.get(bucket) {
+        if dataset.root() == resolved {
+            return Ok(Arc::clone(dataset));
+        }
+    }
+    guard.insert(bucket.to_owned(), Arc::clone(&opened));
+    Ok(opened)
+}
+
+fn invalidate_cached_dataset(state: &ServiceState, bucket: &str) {
+    if let Ok(mut cache) = state.dataset_cache.lock() {
+        cache.remove(bucket);
+    }
+}
+
 
 async fn healthz() -> impl IntoResponse { Json(json!({"status":"ok"})) }
 async fn readyz(State(state): State<ServiceState>) -> Response {
@@ -661,9 +698,11 @@ async fn query(State(state): State<ServiceState>, headers: HeaderMap, Json(paylo
     let root = selected_bucket_root(&state, &bucket, guard.request_id)?;
     let telemetry_root = root.clone();
     let request_copy = request.clone();
+    let cache = Arc::clone(&state.dataset_cache);
+    let cache_bucket = bucket.clone();
     state.metrics.queries.fetch_add(1, Ordering::Relaxed);
     let result = tokio::task::spawn_blocking(move || -> io::Result<_> {
-        let dataset = VersionedDataset::open(&root)?;
+        let dataset = cached_dataset(&cache, &cache_bucket, &root)?;
         let indexes = planner_indexes_for_request(&dataset, &request_copy)?;
         let response = execute_query(&dataset, &request_copy)?;
         record_query(&telemetry_root, &request_copy, &response, indexes)?;
@@ -688,8 +727,10 @@ async fn dataset_schema(
 ) -> Result<Json<Value>, ApiError> {
     let guard = begin_request(&state, &headers, ServiceRole::Read).await?;
     let root = selected_bucket_root(&state, &selector.bucket, guard.request_id)?;
+    let cache = Arc::clone(&state.dataset_cache);
+    let cache_bucket = selector.bucket.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let dataset = VersionedDataset::open(root)?;
+        let dataset = cached_dataset(&cache, &cache_bucket, &root)?;
         Ok::<DatasetSchema, io::Error>(dataset.schema().clone())
     })
     .await
@@ -1353,6 +1394,7 @@ async fn bucket_delete(
         .map_err(|error| join_error(guard.request_id, error))?;
     match result {
         Ok(()) => {
+            invalidate_cached_dataset(&state, &request.id);
             state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
             let _ = append_audit(&state, &AuditEvent {
                 timestamp_ms: now_ms(), request_id: guard.request_id, actor: &guard.actor,
@@ -1571,6 +1613,7 @@ pub async fn serve(root: impl AsRef<Path>, config: ServiceConfig) -> io::Result<
         config: Arc::new(config.clone()), principals: Arc::new(principals), rates: Arc::new(Mutex::new(HashMap::new())),
         metrics: Arc::new(RuntimeMetrics::default()), next_request_id: Arc::new(AtomicU64::new(0)),
         import_locks: Arc::new(Mutex::new(HashMap::new())),
+        dataset_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     // The control plane is allowed to start before a dataset exists. /readyz remains false and
     // data endpoints return ordinary errors until an initial generation is imported/published.
