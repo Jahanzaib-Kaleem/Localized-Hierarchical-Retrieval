@@ -1,6 +1,6 @@
 use crate::{
-    read_schema, resolve_dataset_root, DatasetSchema, DecodedValue, Dictionary, Engine, Manifest,
-    Predicate, QueryExplain, QueryStats, RowIdMap,
+    numeric_order_filename, read_schema, resolve_dataset_root, DatasetSchema, DecodedValue,
+    Dictionary, Engine, Manifest, NumericOrder, Predicate, QueryExplain, QueryStats, RowIdMap,
 };
 use serde::Serialize;
 use std::{
@@ -52,6 +52,7 @@ pub struct LogicalDataset {
     root: PathBuf,
     schema: DatasetSchema,
     dictionaries: Vec<Dictionary>,
+    numeric_orders: Vec<Option<NumericOrder>>,
     engine: Engine,
     row_ids: RowIdMap,
     rows: u64,
@@ -101,12 +102,25 @@ impl LogicalDataset {
             }
             dictionaries.push(dict);
         }
+        let mut numeric_orders = Vec::with_capacity(schema.columns.len());
+        for (index, column) in schema.columns.iter().enumerate() {
+            let path = root.join("routing").join(numeric_order_filename(index));
+            if path.is_file() {
+                let order = NumericOrder::open(&path)?;
+                order.validate_for(&dictionaries[index], &column.logical_type)?;
+                numeric_orders.push(Some(order));
+            } else {
+                numeric_orders.push(None);
+            }
+        }
+
         let engine = Engine::open(&root)?;
         let row_ids = RowIdMap::open_optional(&root, manifest.rows)?;
         Ok(Self {
             root,
             schema,
             dictionaries,
+            numeric_orders,
             engine,
             row_ids,
             rows: manifest.rows,
@@ -417,49 +431,57 @@ impl LogicalDataset {
             Signed(Option<i64>, Option<i64>),
         }
 
-        let bounds = match self.schema.columns[column].logical_type {
-            crate::LogicalType::Unsigned => Bounds::Unsigned(
-                gte.map(|value| {
-                    value.parse::<u64>().map_err(|error| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("invalid canonical unsigned range bound: {error}"),
-                        )
-                    })
-                }).transpose()?,
-                lte.map(|value| {
-                    value.parse::<u64>().map_err(|error| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("invalid canonical unsigned range bound: {error}"),
-                        )
-                    })
-                }).transpose()?,
-            ),
-            crate::LogicalType::Signed => Bounds::Signed(
-                gte.map(|value| {
-                    value.parse::<i64>().map_err(|error| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("invalid canonical signed range bound: {error}"),
-                        )
-                    })
-                }).transpose()?,
-                lte.map(|value| {
-                    value.parse::<i64>().map_err(|error| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("invalid canonical signed range bound: {error}"),
-                        )
-                    })
-                }).transpose()?,
-            ),
-            ref other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("numeric range stream requires signed/unsigned column, got {other:?}"),
-                ))
-            }
+        let rank_bounds = self.numeric_orders[column]
+            .as_ref()
+            .map(|order| order.rank_bounds(gte, lte))
+            .transpose()?;
+        let fallback_bounds = if rank_bounds.is_none() {
+            Some(match self.schema.columns[column].logical_type {
+                crate::LogicalType::Unsigned => Bounds::Unsigned(
+                    gte.map(|value| {
+                        value.parse::<u64>().map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("invalid canonical unsigned range bound: {error}"),
+                            )
+                        })
+                    }).transpose()?,
+                    lte.map(|value| {
+                        value.parse::<u64>().map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("invalid canonical unsigned range bound: {error}"),
+                            )
+                        })
+                    }).transpose()?,
+                ),
+                crate::LogicalType::Signed => Bounds::Signed(
+                    gte.map(|value| {
+                        value.parse::<i64>().map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("invalid canonical signed range bound: {error}"),
+                            )
+                        })
+                    }).transpose()?,
+                    lte.map(|value| {
+                        value.parse::<i64>().map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("invalid canonical signed range bound: {error}"),
+                            )
+                        })
+                    }).transpose()?,
+                ),
+                ref other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("numeric range stream requires signed/unsigned column, got {other:?}"),
+                    ))
+                }
+            })
+        } else {
+            None
         };
 
         let Some(encoded) = self.encoded_predicates(predicates)? else {
@@ -480,30 +502,36 @@ impl LogicalDataset {
                         "numeric range token exceeds u32",
                     )
                 })?;
-                let matches = match self.dictionaries[column].decode(token) {
-                    Some(DecodedValue::Null) | None => false,
-                    Some(DecodedValue::Text(text)) => match &bounds {
-                        Bounds::Unsigned(lo, hi) => {
-                            let value = text.parse::<u64>().map_err(|error| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("invalid canonical unsigned value: {error}"),
-                                )
-                            })?;
-                            lo.map_or(true, |bound| value >= bound)
-                                && hi.map_or(true, |bound| value <= bound)
-                        }
-                        Bounds::Signed(lo, hi) => {
-                            let value = text.parse::<i64>().map_err(|error| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("invalid canonical signed value: {error}"),
-                                )
-                            })?;
-                            lo.map_or(true, |bound| value >= bound)
-                                && hi.map_or(true, |bound| value <= bound)
-                        }
-                    },
+                let matches = if let (Some(order), Some((lo, hi))) =
+                    (self.numeric_orders[column].as_ref(), rank_bounds)
+                {
+                    order.token_in_rank_bounds(token, lo, hi)
+                } else {
+                    match self.dictionaries[column].decode(token) {
+                        Some(DecodedValue::Null) | None => false,
+                        Some(DecodedValue::Text(text)) => match fallback_bounds.as_ref().unwrap() {
+                            Bounds::Unsigned(lo, hi) => {
+                                let value = text.parse::<u64>().map_err(|error| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!("invalid canonical unsigned value: {error}"),
+                                    )
+                                })?;
+                                lo.as_ref().map_or(true, |bound| value >= *bound)
+                                    && hi.as_ref().map_or(true, |bound| value <= *bound)
+                            }
+                            Bounds::Signed(lo, hi) => {
+                                let value = text.parse::<i64>().map_err(|error| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!("invalid canonical signed value: {error}"),
+                                    )
+                                })?;
+                                lo.as_ref().map_or(true, |bound| value >= *bound)
+                                    && hi.as_ref().map_or(true, |bound| value <= *bound)
+                            }
+                        },
+                    }
                 };
                 let row_id = self.row_ids.logical(physical).ok_or_else(|| {
                     io::Error::new(

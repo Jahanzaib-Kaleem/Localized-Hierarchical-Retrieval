@@ -22,6 +22,7 @@ pub mod logical;
 pub mod maintenance;
 pub mod manifest;
 pub mod mutation;
+pub mod numeric_order;
 pub mod operations;
 pub mod overlay;
 pub mod planner;
@@ -80,6 +81,9 @@ pub use logical::{
 pub use maintenance::restore_backup;
 pub use manifest::{ensure_supported_format, HierarchyMeta, Manifest, SegmentMeta, DATASET_FORMAT};
 pub use mutation::{apply_mutations, Mutation, MutationConfig, MutationReport};
+pub use numeric_order::{
+    build_numeric_order, build_numeric_orders, numeric_order_filename, NumericKind, NumericOrder,
+};
 pub use operations::{
     backup_dataset, dataset_status, install_integrity_manifest, integrity_entry_for_file,
     read_integrity_manifest, seal_dataset, verify_dataset, verify_dataset_structure,

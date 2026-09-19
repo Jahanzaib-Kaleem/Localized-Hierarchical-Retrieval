@@ -1,6 +1,7 @@
 use crate::{
-    abandon_generation, add_exact_hierarchies, begin_generation, build_u32_batches,
-    dictionary_filename, publish_generation, resolve_dataset_root, write_dictionary_record,
+    abandon_generation, add_exact_hierarchies, begin_generation, build_numeric_orders,
+    build_u32_batches, dictionary_filename, publish_generation, resolve_dataset_root,
+    write_dictionary_record,
     write_schema, BuildConfig, DatasetSchema, Dictionary, GenerationInfo, HierarchySpec,
 };
 use csv::{Reader, ReaderBuilder, StringRecord};
@@ -573,6 +574,7 @@ where
     let specs = exact_specs(effective_schema.columns.len(), &config.accelerators)?;
     add_exact_hierarchies(stage, &specs, config.max_sort_records)?;
     write_schema(stage, &effective_schema)?;
+    build_numeric_orders(stage, &effective_schema, config.max_sort_records)?;
     Ok((expected_rows, cardinalities, specs.len()))
 }
 
