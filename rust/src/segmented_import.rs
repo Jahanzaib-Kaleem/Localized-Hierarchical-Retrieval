@@ -1,8 +1,9 @@
 use crate::{
-    abandon_generation, begin_generation, delta_path, import_csv, publish_generation, read_schema,
+    abandon_generation, begin_generation, delta_path, import_csv, install_integrity_manifest,
+    integrity_entry_for_file, publish_presealed_generation, read_integrity_manifest, read_schema,
     verify_versioned_dataset, write_overlay, CsvImportConfig, CsvImportProgress, CsvImportStage,
-    DeltaLayerMeta, GenerationInfo, Manifest, OverlayCatalog, RowIdWriter, VersionedDataset,
-    ROW_IDS_FILE,
+    DeltaLayerMeta, GenerationInfo, IntegrityEntry, IntegrityManifest, Manifest, OverlayCatalog,
+    RowIdWriter, VersionedDataset, OVERLAY_FILE, ROW_IDS_FILE, VISIBILITY_FILE,
 };
 use csv::{ReaderBuilder, StringRecord, Writer, WriterBuilder};
 use fs2::available_space;
@@ -291,7 +292,7 @@ fn attach_layer(
     built_root: &Path,
     rows: u64,
     first_row_id: u64,
-) -> io::Result<()> {
+) -> io::Result<PathBuf> {
     let layer_id = overlay.next_layer_id()?;
     let relative = delta_path(layer_id);
     let destination = stage_root.join(&relative);
@@ -321,7 +322,53 @@ fn attach_layer(
         .ok_or_else(|| invalid("row count overflow"))?;
     overlay.max_row_id = first_row_id
         .checked_add(rows.checked_sub(1).ok_or_else(|| invalid("empty part"))?);
-    write_overlay(stage_root, overlay)
+    write_overlay(stage_root, overlay)?;
+    Ok(relative)
+}
+
+fn reusable_child_entries(seal: &IntegrityManifest) -> Vec<IntegrityEntry> {
+    seal.entries
+        .iter()
+        .filter(|entry| {
+            entry.path != ROW_IDS_FILE
+                && entry.path != OVERLAY_FILE
+                && entry.path != VISIBILITY_FILE
+        })
+        .cloned()
+        .collect()
+}
+
+fn prefixed_entries(entries: &[IntegrityEntry], prefix: &Path) -> Vec<IntegrityEntry> {
+    let prefix = prefix.to_string_lossy().replace('\\', "/");
+    entries
+        .iter()
+        .map(|entry| IntegrityEntry {
+            path: format!("{prefix}/{}", entry.path),
+            bytes: entry.bytes,
+            sha256: entry.sha256.clone(),
+        })
+        .collect()
+}
+
+fn require_integrity(root: &Path) -> io::Result<IntegrityManifest> {
+    read_integrity_manifest(root)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("immutable part {} is missing its integrity seal", root.display()),
+        )
+    })
+}
+
+fn replace_integrity_entry(
+    root: &Path,
+    entries: &mut Vec<IntegrityEntry>,
+    relative: impl AsRef<Path>,
+) -> io::Result<()> {
+    let relative = relative.as_ref();
+    let normalized = relative.to_string_lossy().replace('\\', "/");
+    entries.retain(|entry| entry.path != normalized);
+    entries.push(integrity_entry_for_file(root, relative)?);
+    Ok(())
 }
 
 fn for_each_csv_part<F, P>(
@@ -501,6 +548,7 @@ where
     ));
     let engine = part_engine_config(config);
     let mut overlay: Option<OverlayCatalog> = None;
+    let mut integrity_entries = Vec::<IntegrityEntry>::new();
     let mut exact_hierarchies = 0usize;
 
     let result = for_each_csv_part(
@@ -514,6 +562,8 @@ where
             let build_catalog = work.join(format!("build-{part_index:06}"));
             remove_dir_if_exists(&build_catalog)?;
             let built = import_csv(&build_catalog, part_path, schema, &engine)?;
+            let child_seal = require_integrity(&built.generation.path)?;
+            let child_entries = reusable_child_entries(&child_seal);
             exact_hierarchies = exact_hierarchies.saturating_add(built.exact_hierarchies);
 
             if part_index == 0 {
@@ -525,18 +575,25 @@ where
                     part_rows.checked_sub(1),
                 ));
                 write_overlay(&stage.path, overlay.as_ref().unwrap())?;
+                integrity_entries.extend(child_entries);
             } else {
                 let first_row_id = overlay
                     .as_ref()
                     .and_then(|x| x.max_row_id)
                     .and_then(|x| x.checked_add(1))
                     .ok_or_else(|| invalid("logical row ID overflow"))?;
-                attach_layer(
+                let relative = attach_layer(
                     &stage.path,
                     overlay.as_mut().unwrap(),
                     &built.generation.path,
                     part_rows,
                     first_row_id,
+                )?;
+                integrity_entries.extend(prefixed_entries(&child_entries, &relative));
+                replace_integrity_entry(
+                    &stage.path,
+                    &mut integrity_entries,
+                    relative.join(ROW_IDS_FILE),
                 )?;
             }
             remove_dir_if_exists(&build_catalog)?;
@@ -556,12 +613,14 @@ where
                     format!("segmented staged generation is invalid: {message}"),
                 ));
             }
+            replace_integrity_entry(&stage.path, &mut integrity_entries, OVERLAY_FILE)?;
+            install_integrity_manifest(&stage.path, integrity_entries)?;
             let _ = remove_dir_if_exists(&work);
             progress(CsvImportProgress {
                 stage: CsvImportStage::Publishing,
                 rows_parsed: Some(rows),
             });
-            let generation = publish_generation(stage)?;
+            let generation = publish_presealed_generation(stage)?;
             Ok(SegmentedCsvImportReport {
                 generation,
                 rows,
@@ -603,6 +662,9 @@ where
         let source_root = dataset.root().to_path_buf();
         let logical_schema = dataset.schema().clone();
         ensure_append_schema_compatible(&logical_schema, incoming_schema)?;
+        let source_seal = require_integrity(&source_root)?;
+        let mut integrity_entries = source_seal.entries;
+        integrity_entries.retain(|entry| entry.path != OVERLAY_FILE);
         let base_schema = read_schema(&source_root)?;
         let manifest: Manifest = serde_json::from_slice(&fs::read(source_root.join("manifest.json"))?)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -635,12 +697,20 @@ where
                 let build_catalog = work.join(format!("build-{part_index:06}"));
                 remove_dir_if_exists(&build_catalog)?;
                 let built = import_csv(&build_catalog, part_path, incoming_schema, &engine)?;
-                attach_layer(
+                let child_seal = require_integrity(&built.generation.path)?;
+                let child_entries = reusable_child_entries(&child_seal);
+                let relative = attach_layer(
                     &stage.path,
                     &mut overlay,
                     &built.generation.path,
                     part_rows,
                     next_row_id,
+                )?;
+                integrity_entries.extend(prefixed_entries(&child_entries, &relative));
+                replace_integrity_entry(
+                    &stage.path,
+                    &mut integrity_entries,
+                    relative.join(ROW_IDS_FILE),
                 )?;
                 next_row_id = next_row_id
                     .checked_add(part_rows)
@@ -660,6 +730,8 @@ where
                 ),
             ));
         }
+        replace_integrity_entry(&stage.path, &mut integrity_entries, OVERLAY_FILE)?;
+        install_integrity_manifest(&stage.path, integrity_entries)?;
 
         Ok((rows_before, appended, parts, reclaimed, overlay.max_row_id))
     })();
@@ -671,7 +743,7 @@ where
                 stage: CsvImportStage::Publishing,
                 rows_parsed: Some(appended),
             });
-            let generation = publish_generation(stage)?;
+            let generation = publish_presealed_generation(stage)?;
             Ok(SegmentedCsvAppendReport {
                 generation,
                 rows_before,
