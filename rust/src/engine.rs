@@ -493,15 +493,41 @@ impl Engine {
         let driver = &plan.selected[0];
         let mut cursor = first_row as u32;
         loop {
-            let mut rows = self.row_hier[driver.index]
-                .data
-                .page_rows_from(driver.key, cursor, DRIVER_BATCH);
+            let (mut rows, next) = if plan.selected.len() >= 2 {
+                let second = &plan.selected[1];
+                let first_data = &self.row_hier[driver.index].data;
+                let second_data = &self.row_hier[second.index].data;
+                if let (Some(a), Some(b)) = (first_data.bitslice(), second_data.bitslice()) {
+                    (
+                        a.intersect_hierarchy_from(
+                            driver.key,
+                            b,
+                            second.key,
+                            cursor,
+                            DRIVER_BATCH,
+                        ),
+                        2usize,
+                    )
+                } else {
+                    (
+                        first_data.page_rows_from(driver.key, cursor, DRIVER_BATCH),
+                        1usize,
+                    )
+                }
+            } else {
+                (
+                    self.row_hier[driver.index]
+                        .data
+                        .page_rows_from(driver.key, cursor, DRIVER_BATCH),
+                    1usize,
+                )
+            };
             if rows.is_empty() {
                 break;
             }
             let fetched = rows.len();
             let last = *rows.last().unwrap();
-            for candidate in &plan.selected[1..] {
+            for candidate in &plan.selected[next..] {
                 rows = self.row_hier[candidate.index]
                     .data
                     .intersect_rows(candidate.key, &rows);
@@ -835,15 +861,44 @@ impl Engine {
         let driver = &plan.selected[0];
         let mut cursor = first_row as u32;
         loop {
-            let mut rows = self.row_hier[driver.index]
-                .data
-                .page_rows_from(driver.key, cursor, batch_rows);
+            // Preserve the direct machine-word AND fast path when the two most selective exact
+            // hierarchies are both bit-sliced. The bounded variant avoids materializing either
+            // broad posting while still allowing the stream to advance with fixed memory.
+            let (mut rows, next) = if plan.selected.len() >= 2 {
+                let second = &plan.selected[1];
+                let first_data = &self.row_hier[driver.index].data;
+                let second_data = &self.row_hier[second.index].data;
+                if let (Some(a), Some(b)) = (first_data.bitslice(), second_data.bitslice()) {
+                    (
+                        a.intersect_hierarchy_from(
+                            driver.key,
+                            b,
+                            second.key,
+                            cursor,
+                            batch_rows,
+                        ),
+                        2usize,
+                    )
+                } else {
+                    (
+                        first_data.page_rows_from(driver.key, cursor, batch_rows),
+                        1usize,
+                    )
+                }
+            } else {
+                (
+                    self.row_hier[driver.index]
+                        .data
+                        .page_rows_from(driver.key, cursor, batch_rows),
+                    1usize,
+                )
+            };
             if rows.is_empty() {
                 break;
             }
             let fetched = rows.len();
             let last = *rows.last().unwrap();
-            for candidate in &plan.selected[1..] {
+            for candidate in &plan.selected[next..] {
                 rows = self.row_hier[candidate.index]
                     .data
                     .intersect_rows(candidate.key, &rows);

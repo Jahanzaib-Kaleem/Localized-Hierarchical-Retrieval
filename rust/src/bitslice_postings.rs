@@ -214,6 +214,47 @@ impl BitSlicePostingHierarchy {
         out
     }
 
+    pub fn intersect_hierarchy_from(
+        &self,
+        key: u64,
+        other: &BitSlicePostingHierarchy,
+        other_key: u64,
+        first_row: u32,
+        limit: usize,
+    ) -> Vec<u32> {
+        if key >= self.keyspace
+            || other_key >= other.keyspace
+            || self.rows != other.rows
+            || self.words != other.words
+            || limit == 0
+            || first_row >= self.rows
+        {
+            return Vec::new();
+        }
+
+        let mut out = Vec::with_capacity(
+            limit.min(self.count_at(key).min(other.count_at(other_key))),
+        );
+        let first_word = first_row as usize / 64;
+        let first_bit = first_row as usize % 64;
+        for word in first_word..self.words {
+            let mut mask =
+                self.equality_word(key, word) & other.equality_word(other_key, word);
+            if word == first_word && first_bit != 0 {
+                mask &= !((1u64 << first_bit) - 1);
+            }
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                out.push((word * 64 + bit) as u32);
+                if out.len() == limit {
+                    return out;
+                }
+                mask &= mask - 1;
+            }
+        }
+        out
+    }
+
     pub fn intersect_hierarchy(&self, key: u64, other: &BitSlicePostingHierarchy, other_key: u64) -> Vec<u32> {
         if key >= self.keyspace || other_key >= other.keyspace || self.rows != other.rows || self.words != other.words {
             return Vec::new();
@@ -270,5 +311,8 @@ mod tests {
         BitSlicePostingHierarchy::build_from_sorted(&source2, &output2, 2, 6).unwrap();
         let y = BitSlicePostingHierarchy::open(&output2).unwrap();
         assert_eq!(x.intersect_hierarchy(1, &y, 0), vec![1]);
+        assert_eq!(x.intersect_hierarchy_from(1, &y, 0, 0, 10), vec![1]);
+        assert_eq!(x.intersect_hierarchy_from(1, &y, 0, 1, 1), vec![1]);
+        assert!(x.intersect_hierarchy_from(1, &y, 0, 2, 10).is_empty());
     }
 }
