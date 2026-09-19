@@ -1,7 +1,8 @@
 use lhr::{
-    add_index, dataset_stats, drop_index, import_csv, list_indexes, rebuild_index, verify_dataset,
-    ColumnSchema, CsvImportConfig, DatasetSchema, LogicalDataset, LogicalPredicate, LogicalType,
-    Normalization,
+    add_index, append_csv_delta, dataset_stats, drop_index, execute_query, import_csv, list_indexes,
+    rebuild_index, resolve_dataset_root, seal_dataset, upgrade_numeric_orders, verify_dataset,
+    verify_versioned_dataset, ColumnSchema, CsvImportConfig, DatasetSchema, LogicalDataset,
+    LogicalPredicate, LogicalType, Normalization, QueryFilter, QueryRequest, VersionedDataset,
 };
 use std::{collections::BTreeSet, fs};
 
@@ -172,4 +173,131 @@ fn stats_and_index_lifecycle_are_generation_safe() {
         .unwrap();
     assert_eq!(result.hits, 1);
     assert_eq!(result.rows[0].values[0].value.as_deref(), Some("c@example.com"));
+}
+
+fn numeric_schema() -> DatasetSchema {
+    DatasetSchema::new(vec![
+        ColumnSchema {
+            name: "id".into(),
+            logical_type: LogicalType::Unsigned,
+            nullable: false,
+            normalization: Normalization::Trim,
+            null_values: vec![],
+        },
+        ColumnSchema {
+            name: "group".into(),
+            logical_type: LogicalType::Text,
+            nullable: false,
+            normalization: Normalization::TrimLowercase,
+            null_values: vec![],
+        },
+        ColumnSchema {
+            name: "visits".into(),
+            logical_type: LogicalType::Unsigned,
+            nullable: false,
+            normalization: Normalization::Trim,
+            null_values: vec![],
+        },
+    ])
+    .unwrap()
+}
+
+fn remove_numeric_sidecars(path: &std::path::Path) {
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let entry_path = entry.path();
+        if entry.file_type().unwrap().is_dir() {
+            remove_numeric_sidecars(&entry_path);
+        } else if entry_path.extension().and_then(|x| x.to_str()) == Some("nord") {
+            fs::remove_file(entry_path).unwrap();
+        }
+    }
+}
+
+fn count_numeric_sidecars(path: &std::path::Path) -> usize {
+    let mut count = 0usize;
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let entry_path = entry.path();
+        if entry.file_type().unwrap().is_dir() {
+            count += count_numeric_sidecars(&entry_path);
+        } else if entry_path.extension().and_then(|x| x.to_str()) == Some("nord") {
+            count += 1;
+        }
+    }
+    count
+}
+
+#[test]
+fn numeric_order_upgrade_migrates_existing_base_and_delta_safely() {
+    let catalog = tempfile::tempdir().unwrap();
+    let base = catalog.path().join("base.csv");
+    let delta = catalog.path().join("delta.csv");
+    let mut base_csv = String::from("id,group,visits\n");
+    let mut delta_csv = String::from("id,group,visits\n");
+    for row in 0u64..100 {
+        base_csv.push_str(&format!("{row},target,{}\n", row % 10));
+    }
+    for row in 100u64..200 {
+        delta_csv.push_str(&format!("{row},target,{}\n", row % 10));
+    }
+    fs::write(&base, base_csv).unwrap();
+    fs::write(&delta, delta_csv).unwrap();
+
+    let config = CsvImportConfig {
+        page_rows: 32,
+        batch_rows: 64,
+        max_sort_records: 32,
+        dictionary_run_bytes: 4 * 1024,
+        accelerators: vec![],
+    };
+    import_csv(catalog.path(), &base, &numeric_schema(), &config).unwrap();
+    append_csv_delta(catalog.path(), &delta, &numeric_schema(), &config).unwrap();
+
+    // Simulate a pre-sidecar published dataset: remove only optional accelerator files and reseal.
+    let legacy = resolve_dataset_root(catalog.path()).unwrap();
+    assert!(count_numeric_sidecars(&legacy) >= 2);
+    remove_numeric_sidecars(&legacy);
+    assert_eq!(count_numeric_sidecars(&legacy), 0);
+    seal_dataset(&legacy).unwrap();
+
+    let upgraded = upgrade_numeric_orders(catalog.path(), 32).unwrap();
+    assert_eq!(upgraded.layers, 2);
+    assert_eq!(upgraded.sidecars, 2);
+    assert_eq!(count_numeric_sidecars(&upgraded.generation.path), 2);
+    assert!(verify_versioned_dataset(&upgraded.generation.path).unwrap().valid);
+
+    let dataset = VersionedDataset::open(catalog.path()).unwrap();
+    let response = execute_query(
+        &dataset,
+        &QueryRequest {
+            filters: vec![
+                QueryFilter::Eq {
+                    column: "group".into(),
+                    value: Some("TARGET".into()),
+                },
+                QueryFilter::Range {
+                    column: "visits".into(),
+                    gte: Some("7".into()),
+                    lte: Some("9".into()),
+                },
+            ],
+            select: vec!["id".into()],
+            limit: 100,
+            after_row_id: None,
+            max_rows_examined: Some(200),
+            timeout_ms: Some(5_000),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(response.stats.hits, 60);
+    assert_eq!(response.stats.rows_examined, 200);
+    assert_eq!(response.returned, 60);
+    assert_eq!(
+        response.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+        (0u64..200)
+            .filter(|row| row % 10 >= 7)
+            .collect::<Vec<_>>()
+    );
 }
