@@ -30,6 +30,7 @@ pub mod query_api;
 pub mod recovery;
 pub mod rowids;
 pub mod schema;
+pub mod segmented_import;
 pub mod segment;
 pub mod service;
 pub mod snapshot;
@@ -94,6 +95,12 @@ pub use rowids::{RowIdMap, RowIdWriter, ROW_IDS_FILE};
 pub use schema::{
     read_schema, read_schema_file, write_schema, ColumnSchema, DatasetSchema, LogicalType,
     Normalization, SCHEMA_FORMAT,
+};
+pub use segmented_import::{
+    append_csv_segmented_with_progress, import_csv_segmented_initial_with_progress,
+    segmented_import_disk_floor, SegmentedCsvAppendReport, SegmentedCsvImportConfig,
+    SegmentedCsvImportReport, DEFAULT_SEGMENTED_DICTIONARY_RUN_BYTES,
+    DEFAULT_SEGMENTED_PART_BYTES, DEFAULT_SEGMENTED_PART_ROWS,
 };
 pub use segment::Segment;
 pub use service::{serve, ServiceApiKey, ServiceConfig, ServiceRole};
