@@ -1,5 +1,5 @@
 use crate::{
-    abandon_generation, begin_generation, import_csv, publish_generation, write_schema, CsvImportConfig,
+    begin_generation, import_csv, publish_generation, write_schema, CsvImportConfig,
     CsvImportReport, DatasetSchema, GenerationInfo,
 };
 use serde::{de::{Error as DeError, SeqAccess, Visitor}, Deserialize, Deserializer, Serialize};
