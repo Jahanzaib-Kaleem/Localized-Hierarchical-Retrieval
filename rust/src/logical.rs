@@ -482,7 +482,7 @@ impl LogicalDataset {
                 })?;
                 let matches = match self.dictionaries[column].decode(token) {
                     Some(DecodedValue::Null) | None => false,
-                    Some(DecodedValue::Text(text)) => match bounds {
+                    Some(DecodedValue::Text(text)) => match &bounds {
                         Bounds::Unsigned(lo, hi) => {
                             let value = text.parse::<u64>().map_err(|error| {
                                 io::Error::new(
