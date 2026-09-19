@@ -37,6 +37,7 @@ Example configuration:
   "max_dictionary_run_bytes": 268435456,
   "import_part_rows": 1000000,
   "import_part_bytes": 536870912,
+  "max_concurrent_import_builds": 1,
   "behind_tls_proxy": false
 }
 ```
@@ -168,7 +169,8 @@ The service enforces independent ceilings for:
 - builder batch size;
 - external-sort records;
 - dictionary-sort memory budget;
-- segmented-import row and byte ceilings per internal part.
+- segmented-import row and byte ceilings per internal part;
+- concurrent heavy import builders (`max_concurrent_import_builds`, default `1` on the low-RAM appliance profile).
 
 Client-supplied limits can tighten these ceilings but cannot raise them.
 
@@ -204,7 +206,7 @@ Persistent per-query telemetry is separate from process counters. It records que
 
 The database is generation-based. Readers pin a generation with a snapshot lease; publication of a new generation does not change an in-flight reader's view. Lease-aware vacuum will not remove a generation still held by an active reader. The HTTP service caches the opened `VersionedDataset` for each bucket and keys that cache by the resolved generation path, so datasets containing many immutable ingest parts do not reopen every dictionary/index mmap on every request; the cache swaps automatically after `CURRENT` changes.
 
-Writers still obey each selected bucket catalog's single-writer publication lock. Named buckets have independent catalogs/locks, while multi-bucket transfer/combine operations preserve their own validation/publication rules. Expensive imports, mutations, compaction, recovery, and index administration run outside the async HTTP executor on blocking worker threads after any network upload has been streamed to disk.
+Writers still obey each selected bucket catalog's single-writer publication lock. Named buckets have independent catalogs/locks, while multi-bucket transfer/combine operations preserve their own validation/publication rules. Expensive imports, mutations, compaction, recovery, and index administration run outside the async HTTP executor on blocking worker threads after any network upload has been streamed to disk. Import uploads can proceed independently, but completed jobs wait behind a dedicated import-build semaphore; the default permits only one CPU/RAM-heavy import build at a time so multiple buckets cannot accidentally multiply the bounded working set on a ~1 GiB host.
 
 ## Graceful shutdown
 
