@@ -23,46 +23,58 @@ from typing import Any
 CHUNK_BYTES = 4 * 1024 * 1024
 FINGERPRINT_BYTES = 1024 * 1024
 
-SCHEMA = {
-    "format": "LHR-SCHEMA/1",
-    "columns": [
+BASE_COLUMNS = [
+    {
+        "name": "id",
+        "logical_type": "unsigned",
+        "nullable": False,
+        "normalization": "trim",
+        "null_values": [],
+    },
+    {
+        "name": "segment",
+        "logical_type": "text",
+        "nullable": False,
+        "normalization": "trim_lowercase",
+        "null_values": [],
+    },
+    {
+        "name": "visits",
+        "logical_type": "unsigned",
+        "nullable": False,
+        "normalization": "trim",
+        "null_values": [],
+    },
+    {
+        "name": "email",
+        "logical_type": "text",
+        "nullable": False,
+        "normalization": "trim_lowercase",
+        "null_values": [],
+    },
+    {
+        "name": "active",
+        "logical_type": "boolean",
+        "nullable": False,
+        "normalization": "trim",
+        "null_values": [],
+    },
+]
+
+
+def make_schema(extra_text_columns: int) -> dict[str, Any]:
+    columns = [dict(column) for column in BASE_COLUMNS]
+    columns.extend(
         {
-            "name": "id",
-            "logical_type": "unsigned",
-            "nullable": False,
-            "normalization": "trim",
-            "null_values": [],
-        },
-        {
-            "name": "segment",
+            "name": f"extra_{index:02d}",
             "logical_type": "text",
             "nullable": False,
             "normalization": "trim_lowercase",
             "null_values": [],
-        },
-        {
-            "name": "visits",
-            "logical_type": "unsigned",
-            "nullable": False,
-            "normalization": "trim",
-            "null_values": [],
-        },
-        {
-            "name": "email",
-            "logical_type": "text",
-            "nullable": False,
-            "normalization": "trim_lowercase",
-            "null_values": [],
-        },
-        {
-            "name": "active",
-            "logical_type": "boolean",
-            "nullable": False,
-            "normalization": "trim",
-            "null_values": [],
-        },
-    ],
-}
+        }
+        for index in range(extra_text_columns)
+    )
+    return {"format": "LHR-SCHEMA/1", "columns": columns}
 
 
 class ApiFailure(RuntimeError):
@@ -114,18 +126,29 @@ def api_request(
         raise ApiFailure(f"{method} {path} failed: {error}") from error
 
 
-def generate_csv(path: Path, target_bytes: int, first_id: int) -> tuple[int, int]:
+def generate_csv(
+    path: Path,
+    target_bytes: int,
+    first_id: int,
+    extra_text_columns: int,
+) -> tuple[int, int]:
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = 0
+    extra_names = [f"extra_{index:02d}" for index in range(extra_text_columns)]
     with path.open("wb", buffering=1024 * 1024) as output:
-        header = b"id,segment,visits,email,active\n"
+        header = ("id,segment,visits,email,active" + "".join(f",{name}" for name in extra_names) + "\n").encode()
         output.write(header)
         written = len(header)
         while written < target_bytes:
             row_id = first_id + rows
+            extras = "".join(
+                f",value-{index:02d}-{row_id % (1000 + index + 1)}"
+                for index in range(extra_text_columns)
+            )
             record = (
                 f"{row_id},segment-{row_id % 64},{row_id % 100000},"
-                f"user-{row_id}@example.test,{'true' if row_id % 3 else 'false'}\n"
+                f"user-{row_id}@example.test,{'true' if row_id % 3 else 'false'}"
+                f"{extras}\n"
             ).encode()
             output.write(record)
             written += len(record)
@@ -233,6 +256,7 @@ def create_job(
     bucket: str,
     mode: str,
     path: Path,
+    schema: dict[str, Any],
 ) -> dict[str, Any]:
     response = api_request(
         base_url,
@@ -242,7 +266,7 @@ def create_job(
         payload={
             "bucket": bucket,
             "mode": mode,
-            "schema": SCHEMA,
+            "schema": schema,
             "file_name": path.name,
             "bytes_total": path.stat().st_size,
         },
@@ -384,12 +408,15 @@ def run_part(
 ) -> tuple[dict[str, Any], int]:
     target_bytes = size_mb * 1024 * 1024
     path = args.workdir / f"{bucket}-part-{index:02d}-{size_mb}mb.csv"
-    generated_rows, source_bytes = generate_csv(path, target_bytes, first_id)
+    schema = make_schema(args.extra_text_columns)
+    generated_rows, source_bytes = generate_csv(
+        path, target_bytes, first_id, args.extra_text_columns
+    )
     sampler = Sampler(args.base_url, args.token, args.workdir)
     sampler.sample()
     started = time.monotonic()
     try:
-        job = create_job(args.base_url, args.token, bucket, mode, path)
+        job = create_job(args.base_url, args.token, bucket, mode, path, schema)
         job, upload_seconds = upload_job(args.base_url, args.token, path, job, sampler)
         job, build_seconds = complete_and_wait(
             args.base_url,
@@ -414,7 +441,7 @@ def run_part(
             "target_mb": size_mb,
             "source_csv_bytes": source_bytes,
             "generated_rows": generated_rows,
-            "columns": len(SCHEMA["columns"]),
+            "columns": len(schema["columns"]),
             "rows_before": expected_rows_before,
             "rows_after": final_expected,
             "upload_seconds": round(upload_seconds, 3),
@@ -492,6 +519,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--bucket-prefix", default="import-bench")
     parser.add_argument("--timeout-minutes", type=float, default=120.0)
+    parser.add_argument(
+        "--extra-text-columns",
+        type=int,
+        default=0,
+        help="Add synthetic text columns beyond the base five; use 36 for a 41-column workload.",
+    )
     parser.add_argument("--keep-files", action="store_true")
     parser.add_argument("--keep-buckets", action="store_true")
     modes = parser.add_mutually_exclusive_group(required=True)
@@ -511,6 +544,8 @@ def parse_args() -> argparse.Namespace:
     values = args.sizes_mb or args.append_parts_mb
     if any(value <= 0 for value in values):
         parser.error("all benchmark sizes must be positive")
+    if args.extra_text_columns < 0:
+        parser.error("--extra-text-columns must be >= 0")
     args.workdir.mkdir(parents=True, exist_ok=True)
     return args
 
