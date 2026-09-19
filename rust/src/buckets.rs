@@ -136,14 +136,19 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 
 fn info(root: &Path, id: &str, name: String) -> BucketInfo {
     match dataset_stats(root) {
-        Ok(stats) => BucketInfo {
-            id: id.into(),
-            name,
-            is_default: id == DEFAULT_BUCKET,
-            ready: true,
-            rows: stats.rows,
-            columns: stats.columns,
-            total_bytes: stats.total_bytes,
+        Ok(stats) => {
+            let columns = VersionedDataset::open(root)
+                .map(|dataset| dataset.schema().columns.len())
+                .unwrap_or(stats.columns);
+            BucketInfo {
+                id: id.into(),
+                name,
+                is_default: id == DEFAULT_BUCKET,
+                ready: true,
+                rows: stats.rows,
+                columns,
+                total_bytes: stats.total_bytes,
+            }
         },
         Err(_) => BucketInfo {
             id: id.into(),
