@@ -8,6 +8,7 @@ use crate::{
     append_csv_segmented_with_progress, CompactionConfig, CsvImportConfig, CsvImportProgress,
     CsvImportStage, DatasetSchema, Mutation, MutationConfig, QueryRequest,
     SegmentedCsvImportConfig, VersionedDataset, DEFAULT_BUCKET,
+    DEFAULT_SEGMENTED_PART_BYTES, DEFAULT_SEGMENTED_PART_ROWS,
 };
 use axum::{
     body::{Body, Bytes},
@@ -59,6 +60,8 @@ fn default_mutation_ops() -> usize { 100_000 }
 fn default_batch_rows() -> usize { 65_536 }
 fn default_sort_records() -> usize { 1_000_000 }
 fn default_dictionary_bytes() -> usize { 256 * 1024 * 1024 }
+fn default_import_part_rows() -> u64 { DEFAULT_SEGMENTED_PART_ROWS }
+fn default_import_part_bytes() -> u64 { DEFAULT_SEGMENTED_PART_BYTES }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -88,6 +91,10 @@ pub struct ServiceConfig {
     pub max_sort_records: usize,
     #[serde(default = "default_dictionary_bytes")]
     pub max_dictionary_run_bytes: usize,
+    #[serde(default = "default_import_part_rows")]
+    pub import_part_rows: u64,
+    #[serde(default = "default_import_part_bytes")]
+    pub import_part_bytes: u64,
     /// A non-loopback HTTP bind is refused unless the operator explicitly confirms that TLS is
     /// terminated by a trusted reverse proxy or the listener lives on an equivalently protected
     /// private transport.
@@ -106,6 +113,7 @@ impl Default for ServiceConfig {
             max_rows_examined: default_rows_examined(), max_query_timeout_ms: default_timeout_ms(),
             max_mutation_ops: default_mutation_ops(), max_batch_rows: default_batch_rows(),
             max_sort_records: default_sort_records(), max_dictionary_run_bytes: default_dictionary_bytes(),
+            import_part_rows: default_import_part_rows(), import_part_bytes: default_import_part_bytes(),
             behind_tls_proxy: false, audit_log: None,
         }
     }
@@ -130,6 +138,7 @@ impl ServiceConfig {
         if self.max_body_bytes == 0 || self.max_import_bytes == 0 || self.max_concurrent_requests == 0 || self.max_query_limit == 0
             || self.max_rows_examined == 0 || self.max_query_timeout_ms == 0 || self.max_mutation_ops == 0
             || self.max_batch_rows == 0 || self.max_sort_records == 0 || self.max_dictionary_run_bytes == 0
+            || self.import_part_rows == 0 || self.import_part_bytes == 0
         {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "service resource ceilings must all be greater than zero"));
         }
@@ -388,7 +397,7 @@ fn recover_import_jobs(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn run_import_job(root: PathBuf, config: CsvImportConfig, id: String) {
+fn run_import_job(root: PathBuf, mut config: SegmentedCsvImportConfig, id: String) {
     let Ok(mut job) = load_import_job(&root, &id) else {
         return;
     };
@@ -426,17 +435,16 @@ fn run_import_job(root: PathBuf, config: CsvImportConfig, id: String) {
     };
 
     let schema = job.schema.clone();
-    let mut segmented = SegmentedCsvImportConfig::from_engine(config);
     // Import-job uploads are disposable staging copies, unlike CLI/source files. The segmented
     // builder may therefore reclaim already-consumed ranges on Linux while the unpublished
     // generation grows.
-    segmented.reclaim_consumed_source = true;
+    config.reclaim_consumed_source = true;
     let result: io::Result<Value> = match job.mode {
         ImportMode::Create => import_csv_segmented_initial_with_progress(
             &bucket_root,
             &upload,
             &schema,
-            &segmented,
+            &config,
             |progress| update_import_progress(&root, &mut job, progress),
         )
         .and_then(|report| {
@@ -447,7 +455,7 @@ fn run_import_job(root: PathBuf, config: CsvImportConfig, id: String) {
             &bucket_root,
             &upload,
             &schema,
-            &segmented,
+            &config,
             |progress| update_import_progress(&root, &mut job, progress),
         )
         .and_then(|report| {
@@ -1018,7 +1026,7 @@ async fn import_job_complete(
         .map_err(|error| ApiError::new(io_status(&error), guard.request_id, error.to_string()))?;
 
     let root = state.root.clone();
-    let config = csv_import_config(&state.config);
+    let config = segmented_csv_import_config(&state.config);
     let job_id = id.clone();
     tokio::task::spawn_blocking(move || run_import_job(root, config, job_id));
     Ok(Json(json!({"request_id":guard.request_id,"result":job})))
@@ -1044,6 +1052,14 @@ fn csv_import_config(config: &ServiceConfig) -> CsvImportConfig {
         dictionary_run_bytes: defaults.dictionary_run_bytes.min(config.max_dictionary_run_bytes),
         accelerators: Vec::new(),
     }
+}
+
+fn segmented_csv_import_config(config: &ServiceConfig) -> SegmentedCsvImportConfig {
+    let mut out = SegmentedCsvImportConfig::from_engine(csv_import_config(config));
+    out.part_rows = config.import_part_rows;
+    out.part_bytes = config.import_part_bytes;
+    out.reclaim_consumed_source = true;
+    out
 }
 
 async fn import_csv_upload(State(state): State<ServiceState>, headers: HeaderMap, mut multipart: Multipart) -> Result<Json<Value>, ApiError> {
