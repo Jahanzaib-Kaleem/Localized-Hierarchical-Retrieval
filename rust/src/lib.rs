@@ -51,7 +51,8 @@ pub use buckets::{
 };
 pub use catalog::{
     abandon_generation, begin_generation, list_generations, publish_generation,
-    resolve_dataset_root, rollback_generation, vacuum_generations, GenerationInfo,
+    publish_presealed_generation, resolve_dataset_root, rollback_generation,
+    vacuum_generations, GenerationInfo,
     StagedGeneration, VacuumReport,
 };
 pub use compaction::{compact_dataset, CompactionConfig, CompactionReport};
