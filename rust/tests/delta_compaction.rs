@@ -1,5 +1,5 @@
 use lhr::{
-    apply_mutations_delta, compact_dataset, import_csv, resolve_dataset_root,
+    append_csv_delta, apply_mutations_delta, compact_dataset, import_csv, resolve_dataset_root,
     verify_versioned_dataset, ColumnSchema, CompactionConfig, CsvImportConfig, DatasetSchema,
     LogicalPredicate, LogicalType, Mutation, MutationConfig, Normalization, VersionedDataset,
 };
@@ -139,6 +139,65 @@ fn deltas_keep_base_immutable_and_compaction_preserves_results() {
     assert_eq!(query_email(&compacted, "b@example.com").hits, 0);
     assert_eq!(query_email(&compacted, "d@example.com").rows[0].row_id, 3);
     assert_eq!(resolve_dataset_root(catalog.path()).unwrap(), compact.generation.path);
+}
+
+#[test]
+fn compaction_materializes_an_evolved_append_schema() {
+    let catalog = tempfile::tempdir().unwrap();
+    let first = catalog.path().join("seed.csv");
+    let second = catalog.path().join("evolved.csv");
+    fs::write(
+        &first,
+        "email,country,note\na@example.com,pk,one\nb@example.com,us,NULL\n",
+    )
+    .unwrap();
+    fs::write(&second, "email,score\nc@example.com,42\n").unwrap();
+    import_csv(catalog.path(), &first, &schema(), &import_config()).unwrap();
+
+    let incoming = DatasetSchema::new(vec![
+        schema().columns[0].clone(),
+        ColumnSchema {
+            name: "score".into(),
+            logical_type: LogicalType::Unsigned,
+            nullable: false,
+            normalization: Normalization::Trim,
+            null_values: vec![],
+        },
+    ])
+    .unwrap();
+    append_csv_delta(catalog.path(), &second, &incoming, &import_config()).unwrap();
+
+    let before = VersionedDataset::open(catalog.path()).unwrap();
+    assert_eq!(before.schema().columns.len(), 4);
+    assert_eq!(before.row_values(0).unwrap().unwrap()[3], None);
+    assert_eq!(before.row_values(2).unwrap().unwrap()[3].as_deref(), Some("42"));
+    drop(before);
+
+    let report = compact_dataset(
+        catalog.path(),
+        &CompactionConfig {
+            batch_rows: 2,
+            max_sort_records: 32,
+            dictionary_run_bytes: 64,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.rows, 3);
+
+    let compacted = VersionedDataset::open(catalog.path()).unwrap();
+    assert!(compacted.delta_meta().is_empty());
+    assert_eq!(
+        compacted
+            .schema()
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["email", "country", "note", "score"]
+    );
+    assert_eq!(compacted.row_values(0).unwrap().unwrap()[3], None);
+    assert_eq!(compacted.row_values(2).unwrap().unwrap()[3].as_deref(), Some("42"));
+    assert!(verify_versioned_dataset(&report.generation.path).unwrap().valid);
 }
 
 #[test]

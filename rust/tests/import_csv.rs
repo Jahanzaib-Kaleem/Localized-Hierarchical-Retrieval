@@ -1,5 +1,5 @@
 use lhr::{
-    import_csv, list_generations, resolve_dataset_root, verify_dataset, ColumnSchema, CsvImportConfig,
+    import_csv, list_generations, read_schema, resolve_dataset_root, verify_dataset, ColumnSchema, CsvImportConfig,
     DatasetSchema, LogicalDataset, LogicalPredicate, LogicalType, Normalization,
 };
 use std::fs;
@@ -127,6 +127,35 @@ fn failed_import_does_not_move_current_generation() {
     assert!(generations[0].current);
 }
 
+
+#[test]
+fn csv_import_short_rows_are_padded_with_null_and_schema_widens() {
+    let catalog = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let csv = source_dir.path().join("ragged.csv");
+    fs::write(
+        &csv,
+        "country,age,active,note\npk,20,true,ok\nus,30\n",
+    )
+    .unwrap();
+
+    let report = import_csv(catalog.path(), &csv, &schema(), &config()).unwrap();
+    assert_eq!(report.rows, 2);
+
+    let resolved = resolve_dataset_root(catalog.path()).unwrap();
+    let evolved = read_schema(&resolved).unwrap();
+    assert!(!evolved.columns[0].nullable);
+    assert!(!evolved.columns[1].nullable);
+    assert!(evolved.columns[2].nullable);
+    assert!(evolved.columns[3].nullable);
+
+    let logical = LogicalDataset::open(catalog.path()).unwrap();
+    let row = logical.decode_physical_values(1).unwrap();
+    assert_eq!(row[0].as_deref(), Some("us"));
+    assert_eq!(row[1].as_deref(), Some("30"));
+    assert_eq!(row[2], None);
+    assert_eq!(row[3], None);
+}
 
 #[test]
 fn csv_import_rejects_unexpected_columns_instead_of_silently_ignoring_them() {

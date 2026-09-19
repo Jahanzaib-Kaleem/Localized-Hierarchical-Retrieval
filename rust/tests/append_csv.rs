@@ -85,6 +85,90 @@ fn append_csv_adds_an_indexed_delta_without_rewriting_existing_rows() {
 }
 
 #[test]
+fn append_schema_evolves_with_new_and_missing_named_columns() {
+    let catalog = tempfile::tempdir().unwrap();
+    let first = catalog.path().join("first.csv");
+    let second = catalog.path().join("second.csv");
+    fs::write(
+        &first,
+        "email,visits,note\na@example.com,10,one\nb@example.com,20,NULL\nc@example.com,30,three\n",
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        "email,new_tag\nD@EXAMPLE.COM,hot\ne@example.com,warm\n",
+    )
+    .unwrap();
+
+    import_csv(catalog.path(), &first, &schema(), &config()).unwrap();
+    let incoming = DatasetSchema::new(vec![
+        schema().columns[0].clone(),
+        ColumnSchema {
+            name: "new_tag".into(),
+            logical_type: LogicalType::Text,
+            nullable: false,
+            normalization: Normalization::Trim,
+            null_values: vec![],
+        },
+    ])
+    .unwrap();
+
+    let report = append_csv_delta(catalog.path(), &second, &incoming, &config()).unwrap();
+    assert_eq!(report.rows_after, 5);
+
+    let view = VersionedDataset::open(catalog.path()).unwrap();
+    assert_eq!(
+        view.schema().columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>(),
+        vec!["email", "visits", "note", "new_tag"]
+    );
+    assert!(!view.schema().columns[0].nullable);
+    assert!(view.schema().columns[1].nullable);
+    assert!(view.schema().columns[2].nullable);
+    assert!(view.schema().columns[3].nullable);
+
+    let old = view.row_values(0).unwrap().unwrap();
+    assert_eq!(old[0].as_deref(), Some("a@example.com"));
+    assert_eq!(old[1].as_deref(), Some("10"));
+    assert_eq!(old[3], None);
+
+    let appended = view.row_values(3).unwrap().unwrap();
+    assert_eq!(appended[0].as_deref(), Some("d@example.com"));
+    assert_eq!(appended[1], None);
+    assert_eq!(appended[2], None);
+    assert_eq!(appended[3].as_deref(), Some("hot"));
+
+    let tagged = view
+        .query_values(
+            &[LogicalPredicate {
+                column: "new_tag".into(),
+                value: Some("hot".into()),
+            }],
+            Some(&["email".into(), "visits".into(), "new_tag".into()]),
+            10,
+        )
+        .unwrap();
+    assert_eq!(tagged.hits, 1);
+    assert_eq!(tagged.rows[0].row_id, 3);
+    assert_eq!(tagged.rows[0].values[0].value.as_deref(), Some("d@example.com"));
+    assert_eq!(tagged.rows[0].values[1].value, None);
+    assert_eq!(tagged.rows[0].values[2].value.as_deref(), Some("hot"));
+
+    let missing_tag = view
+        .query_values(
+            &[LogicalPredicate {
+                column: "new_tag".into(),
+                value: None,
+            }],
+            Some(&["email".into(), "new_tag".into()]),
+            10,
+        )
+        .unwrap();
+    assert_eq!(missing_tag.hits, 3);
+    assert_eq!(missing_tag.returned, 3);
+    assert!(missing_tag.rows.iter().all(|row| row.values[1].value.is_none()));
+}
+
+#[test]
 fn incompatible_append_is_rejected_and_current_generation_is_unchanged() {
     let catalog = tempfile::tempdir().unwrap();
     let first = catalog.path().join("first.csv");
@@ -97,7 +181,7 @@ fn incompatible_append_is_rejected_and_current_generation_is_unchanged() {
     let mut incompatible = schema();
     incompatible.columns[1].logical_type = LogicalType::Text;
     let error = append_csv_delta(catalog.path(), &bad, &incompatible, &config()).unwrap_err();
-    assert!(error.to_string().contains("append schema mismatch"));
+    assert!(error.to_string().contains("append schema conflict"));
 
     let after = list_generations(catalog.path()).unwrap();
     assert_eq!(after.len(), before.len());

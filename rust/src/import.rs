@@ -121,7 +121,7 @@ fn header_map(headers: &StringRecord, schema: &DatasetSchema) -> io::Result<Vec<
 fn open_csv(path: &Path, schema: &DatasetSchema) -> io::Result<(Reader<File>, Vec<usize>)> {
     let mut reader = ReaderBuilder::new()
         .has_headers(true)
-        .flexible(false)
+        .flexible(true)
         .from_path(path)
         .map_err(csv_error)?;
     let headers = reader.headers().map_err(csv_error)?.clone();
@@ -284,7 +284,7 @@ fn first_pass<F>(
     stage: &Path,
     max_run_bytes: usize,
     progress: &mut F,
-) -> io::Result<(u64, Vec<u64>)>
+) -> io::Result<(u64, Vec<u64>, DatasetSchema)>
 where
     F: FnMut(CsvImportProgress),
 {
@@ -305,6 +305,7 @@ where
         .collect::<Vec<_>>();
 
     let (mut reader, map) = open_csv(csv_path, schema)?;
+    let mut effective_schema = schema.clone();
     let mut record = StringRecord::new();
     let mut rows = 0u64;
     while reader.read_record(&mut record).map_err(csv_error)? {
@@ -315,10 +316,22 @@ where
                 rows_parsed: Some(rows),
             });
         }
+        if record.len() > schema.columns.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "CSV row {} contains {} fields but the header defines {}; unnamed extra fields cannot be mapped safely",
+                    rows + 1,
+                    record.len(),
+                    schema.columns.len()
+                ),
+            ));
+        }
         for (column_index, column) in schema.columns.iter().enumerate() {
-            let raw = record.get(map[column_index]).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "CSV record missing mapped field")
-            })?;
+            let Some(raw) = record.get(map[column_index]) else {
+                effective_schema.columns[column_index].nullable = true;
+                continue;
+            };
             if column.is_null_literal(raw) {
                 continue;
             }
@@ -340,8 +353,8 @@ where
         ));
     }
 
-    let mut cardinalities = Vec::with_capacity(schema.columns.len());
-    for (column_index, column) in schema.columns.iter().enumerate() {
+    let mut cardinalities = Vec::with_capacity(effective_schema.columns.len());
+    for (column_index, column) in effective_schema.columns.iter().enumerate() {
         let sorted = temp.join(format!("c{column_index:04}.sorted"));
         let run_dir = temp.join(format!("runs-c{column_index:04}"));
         external_sort_dictionary(&raw_paths[column_index], &sorted, &run_dir, max_run_bytes)?;
@@ -357,7 +370,7 @@ where
         let _ = fs::remove_file(&raw_paths[column_index]);
         let _ = fs::remove_file(sorted);
     }
-    Ok((rows, cardinalities))
+    Ok((rows, cardinalities, effective_schema))
 }
 
 struct CsvTokenBatches {
@@ -428,16 +441,23 @@ impl Iterator for CsvTokenBatches {
             self.row_number += 1;
             for column_index in 0..columns {
                 let column = &self.schema.columns[column_index];
-                let Some(raw) = record.get(self.map[column_index]) else {
-                    return self.fail(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "CSV record missing mapped field",
-                    ));
-                };
-                let token = if column.is_null_literal(raw) {
+                let raw = record.get(self.map[column_index]);
+                let token = if raw.is_none() {
+                    if !column.nullable {
+                        return self.fail(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "CSV row {}, column {} is missing but the column is not nullable",
+                                self.row_number + 1,
+                                column.name
+                            ),
+                        ));
+                    }
+                    0u32
+                } else if column.is_null_literal(raw.unwrap()) {
                     0u32
                 } else {
-                    let canonical = match column.canonicalize(raw) {
+                    let canonical = match column.canonicalize(raw.unwrap()) {
                         Ok(value) => value,
                         Err(error) => {
                             return self.fail(contextual(error, self.row_number + 1, &column.name))
@@ -516,20 +536,20 @@ where
     progress(CsvImportProgress { stage: CsvImportStage::Validating, rows_parsed: None });
     schema.validate()?;
     progress(CsvImportProgress { stage: CsvImportStage::Parsing, rows_parsed: None });
-    let (expected_rows, cardinalities) =
+    let (expected_rows, cardinalities, effective_schema) =
         first_pass(csv_path, schema, stage, config.dictionary_run_bytes, progress)?;
 
     progress(CsvImportProgress { stage: CsvImportStage::Building, rows_parsed: Some(expected_rows) });
     let error = Rc::new(RefCell::new(None));
     let batches = CsvTokenBatches::new(
         csv_path,
-        schema.clone(),
+        effective_schema.clone(),
         stage,
         config.batch_rows,
         Rc::clone(&error),
     )?;
     let build_cfg = BuildConfig {
-        columns: schema.columns.len(),
+        columns: effective_schema.columns.len(),
         page_rows: config.page_rows,
         cardinalities: cardinalities.clone(),
         hierarchies: Vec::new(),
@@ -550,9 +570,9 @@ where
     }
 
     progress(CsvImportProgress { stage: CsvImportStage::Indexing, rows_parsed: Some(expected_rows) });
-    let specs = exact_specs(schema.columns.len(), &config.accelerators)?;
+    let specs = exact_specs(effective_schema.columns.len(), &config.accelerators)?;
     add_exact_hierarchies(stage, &specs, config.max_sort_records)?;
-    write_schema(stage, schema)?;
+    write_schema(stage, &effective_schema)?;
     Ok((expected_rows, cardinalities, specs.len()))
 }
 

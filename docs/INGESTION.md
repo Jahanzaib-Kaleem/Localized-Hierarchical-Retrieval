@@ -13,7 +13,9 @@ Studio:
 3. review the inferred schema;
 4. create the dataset.
 
-The strict Rust importer is two-pass and bounded-memory. Dictionary values are externally sorted using bounded runs, canonical rows are encoded in bounded batches, exact indexes are built on disk, the staged generation is verified/sealed, and only then is `CURRENT` atomically replaced.
+The Rust importer is two-pass and bounded-memory. Dictionary values are externally sorted using bounded runs, canonical rows are encoded in bounded batches, exact indexes are built on disk, the staged generation is verified/sealed, and only then is `CURRENT` atomically replaced.
+
+CSV headers define column identity. A shorter data record is treated as having missing trailing fields: those cells become NULL and the affected columns are automatically widened to nullable in the published schema. A record containing more fields than the header is still rejected because those extra cells have no safe column names to map to.
 
 `import_csv_initial_with_progress` performs the empty-bucket check while holding the catalog writer lock. Two concurrent initial-import jobs therefore cannot both initialize the same bucket.
 
@@ -21,15 +23,16 @@ The strict Rust importer is two-pass and bounded-memory. Dictionary values are e
 
 A populated bucket uses **Append CSV** rather than replacement semantics.
 
-Append requires the incoming schema to be compatible by column name:
+Append uses **automatic additive schema evolution by column name**:
 
-- no missing columns;
-- no extra columns;
-- logical types must match;
-- nullable settings must match;
-- normalization rules must match;
-- explicit null literals must match;
-- CSV column order may differ because headers are mapped by name.
+- CSV column order may differ;
+- existing columns may be absent from the new file; those values read as NULL for the appended rows;
+- newly named columns are added to the logical schema automatically; older rows read NULL for those columns;
+- shared columns must keep the same logical type, normalization rule, and explicit null-literal semantics;
+- nullability may widen when a column is absent from a layer or a shorter CSV record;
+- unnamed cells beyond the CSV header are rejected rather than guessed.
+
+The versioned reader exposes the deterministic union of the base and delta schemas. Columns missing from a physical layer are projected as NULL, so adding a column does not rewrite millions of existing rows. Streaming compaction later materializes that union into a new clean base generation.
 
 Append is implemented as a new immutable indexed delta layer. LHR hard-links the currently published generation into staging, builds/indexes only the incoming CSV, assigns new monotonically increasing logical row IDs, adds the new delta to `overlay.json`, and publishes the resulting generation atomically.
 
@@ -102,7 +105,7 @@ Automatic full-row or key-based deduplication is not enabled in this release. Fu
 
 ## Combine is different from append
 
-Append extends one existing bucket with compatible rows and preserves its identity.
+Append extends one existing bucket with rows matched by column name and preserves its identity; additive/missing columns evolve that bucket's logical schema automatically.
 
 Bucket combine intentionally merges one or more independent source buckets into a **new** target bucket and leaves the sources unchanged. See [BUCKETS.md](BUCKETS.md).
 

@@ -125,10 +125,16 @@ export function DataPage() {
     [buckets.data, selectedBucket],
   )
 
+  const existingColumnNames = useMemo(
+    () => new Set((datasetSchema.data?.columns ?? []).map((column) => column.name)),
+    [datasetSchema.data],
+  )
+
   const invalidateData = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ['buckets'] }),
       queryClient.invalidateQueries({ queryKey: ['stats'] }),
+      queryClient.invalidateQueries({ queryKey: ['schema'] }),
       queryClient.invalidateQueries({ queryKey: ['bucket-browse'] }),
       queryClient.invalidateQueries({ queryKey: ['ready'] }),
       queryClient.invalidateQueries({ queryKey: ['generations'] }),
@@ -196,18 +202,17 @@ export function DataPage() {
       const nextPreview = await previewCsv(next)
       if (selectedReady) {
         const existing = datasetSchema.data ?? await api.schema(undefined, selectedBucket)
-        const expected = new Set(existing.columns.map((column) => column.name))
-        const incoming = new Set(nextPreview.headers)
-        const missing = existing.columns.map((column) => column.name).filter((name) => !incoming.has(name))
-        const extra = nextPreview.headers.filter((name) => !expected.has(name))
-        if (missing.length || extra.length) {
-          const details = [
-            missing.length ? 'Missing: ' + missing.join(', ') : '',
-            extra.length ? 'Unexpected: ' + extra.join(', ') : '',
-          ].filter(Boolean).join(' · ')
-          throw new Error('CSV is not compatible with the existing bucket schema. ' + details)
+        if (!datasetSchema.data) queryClient.setQueryData(['schema', selectedBucket], existing)
+        const existingByName = new Map(existing.columns.map((column) => [column.name, column]))
+        nextPreview.schema = {
+          ...nextPreview.schema,
+          columns: nextPreview.schema.columns.map((column) => {
+            const current = existingByName.get(column.name)
+            // Shared columns retain their established semantics. New named columns keep the
+            // preview-inferred schema and are added automatically by the append path.
+            return current ? { ...current } : column
+          }),
         }
-        nextPreview.schema = existing
       }
       setFile(next)
       setPreview(nextPreview)
@@ -461,7 +466,7 @@ export function DataPage() {
         </div>
         {fileError ? <Notice title="Could not read CSV">{fileError}</Notice> : null}
         <p className="field-hint">Studio previews only a small sample in the browser. The file is uploaded in bounded 4 MiB chunks, staged under the LHR data volume, then parsed and built on the server.</p>
-        {selectedReady ? <p className="field-hint">Append uses the bucket's existing types, nullability, normalization and null rules. Header order may differ; missing or extra columns are rejected.</p> : null}
+        {selectedReady ? <p className="field-hint">Append matches columns by name. Existing column semantics stay stable; newly named columns are added automatically, and columns absent from this file read as NULL for the appended rows.</p> : null}
       </div>
     </Panel>
 
@@ -492,13 +497,13 @@ export function DataPage() {
     {importJobError ? <Notice title="Import failed">{importJobError}</Notice> : null}
 
     {preview ? <>
-      <Panel title={selectedReady ? 'Verify append schema' : 'Review columns'} eyebrow={preview.schema.columns.length + ' detected'} action={<button className="button button--primary" disabled={importData.isPending} type="button" onClick={startImport}>{importData.isPending ? (importJob ? importStageLabels[importJob.stage] + '…' : 'Importing…') : selectedReady ? 'Append CSV' : 'Create dataset'}</button>}>
+      <Panel title={selectedReady ? 'Review append columns' : 'Review columns'} eyebrow={preview.schema.columns.length + ' detected'} action={<button className="button button--primary" disabled={importData.isPending} type="button" onClick={startImport}>{importData.isPending ? (importJob ? importStageLabels[importJob.stage] + '…' : 'Importing…') : selectedReady ? 'Append CSV' : 'Create dataset'}</button>}>
         <div className="table-wrap schema-editor-wrap"><table className="data-table schema-editor"><thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Normalization</th></tr></thead><tbody>
           {preview.schema.columns.map((column, index) => <tr key={column.name + '-' + index}>
             <td className="data-table__primary">{column.name}</td>
-            <td><select disabled={selectedReady} value={column.logical_type} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, logical_type: event.target.value as LogicalType } : item) }))}>{logicalTypes.map((type) => <option value={type.value} key={type.value}>{type.label}</option>)}</select></td>
-            <td><label className="toggle-field"><input disabled={selectedReady} type="checkbox" checked={column.nullable} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, nullable: event.target.checked, null_values: event.target.checked ? [''] : [] } : item) }))} /><span>{column.nullable ? 'Yes' : 'No'}</span></label></td>
-            <td><select disabled={selectedReady} value={column.normalization} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, normalization: event.target.value as Normalization } : item) }))}>{normalizations.map((normalization) => <option value={normalization.value} key={normalization.value}>{normalization.label}</option>)}</select></td>
+            <td><select disabled={selectedReady && existingColumnNames.has(column.name)} value={column.logical_type} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, logical_type: event.target.value as LogicalType } : item) }))}>{logicalTypes.map((type) => <option value={type.value} key={type.value}>{type.label}</option>)}</select></td>
+            <td><label className="toggle-field"><input disabled={selectedReady && existingColumnNames.has(column.name)} type="checkbox" checked={column.nullable} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, nullable: event.target.checked, null_values: event.target.checked ? [''] : [] } : item) }))} /><span>{column.nullable ? 'Yes' : 'No'}</span></label></td>
+            <td><select disabled={selectedReady && existingColumnNames.has(column.name)} value={column.normalization} onChange={(event) => updateSchema((schema) => ({ ...schema, columns: schema.columns.map((item, i) => i === index ? { ...item, normalization: event.target.value as Normalization } : item) }))}>{normalizations.map((normalization) => <option value={normalization.value} key={normalization.value}>{normalization.label}</option>)}</select></td>
           </tr>)}
         </tbody></table></div>
         {importData.error && !importJobError ? <Notice title="Import failed">{importData.error.message}</Notice> : null}
@@ -536,8 +541,11 @@ export function DataPage() {
       </div>
     </Panel>
 
-    {stats.data ? <Panel title="Schema" eyebrow={numberFormat.format(stats.data.rows) + ' rows · ' + formatBytes(stats.data.total_bytes)}>
-      <div className="table-wrap"><table className="data-table"><thead><tr><th>Column</th><th>Type</th><th>Cardinality</th><th>Nullable</th></tr></thead><tbody>{stats.data.column_stats.map((column) => <tr key={column.id}><td className="data-table__primary">{column.name}</td><td><span className="code-chip">{column.logical_type}</span></td><td className="mono">{numberFormat.format(column.cardinality)}</td><td>{column.nullable ? 'Yes' : 'No'}</td></tr>)}</tbody></table></div>
+    {datasetSchema.data ? <Panel title="Schema" eyebrow={stats.data ? numberFormat.format(stats.data.rows) + ' rows · ' + formatBytes(stats.data.total_bytes) : datasetSchema.data.columns.length + ' columns'}>
+      <div className="table-wrap"><table className="data-table"><thead><tr><th>Column</th><th>Type</th><th>Cardinality</th><th>Nullable</th></tr></thead><tbody>{datasetSchema.data.columns.map((column, index) => {
+        const physicalStats = stats.data?.column_stats.find((item) => item.name === column.name)
+        return <tr key={column.name + '-' + index}><td className="data-table__primary">{column.name}</td><td><span className="code-chip">{column.logical_type}</span></td><td className="mono">{physicalStats ? numberFormat.format(physicalStats.cardinality) : '—'}</td><td>{column.nullable ? 'Yes' : 'No'}</td></tr>
+      })}</tbody></table></div>
     </Panel> : null}
   </div>
 }

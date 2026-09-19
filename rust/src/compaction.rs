@@ -1,5 +1,5 @@
 use crate::{
-    abandon_generation, begin_generation, import_csv, publish_generation, read_schema, write_schema,
+    abandon_generation, begin_generation, import_csv, publish_generation, write_schema,
     CsvImportConfig, GenerationInfo, Manifest, RowIdWriter, VersionedDataset, ROW_IDS_FILE,
 };
 use serde::Serialize;
@@ -132,7 +132,7 @@ pub fn compact_dataset(
             return Err(invalid("compaction cannot materialize an empty LHR/1 dataset"));
         }
         let source_root = dataset.root().to_path_buf();
-        let schema = read_schema(&source_root)?;
+        let schema = dataset.schema().clone();
         let manifest: Manifest = serde_json::from_slice(&fs::read(source_root.join("manifest.json"))?)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let bytes_before = crate::dataset_status(&source_root)?.total_bytes;

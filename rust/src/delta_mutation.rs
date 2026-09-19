@@ -33,6 +33,45 @@ fn exact_accelerators(manifest: &Manifest) -> Vec<Vec<usize>> {
     out.into_iter().collect()
 }
 
+fn mapped_exact_accelerators(
+    manifest: &Manifest,
+    base_schema: &crate::DatasetSchema,
+    incoming_schema: &crate::DatasetSchema,
+) -> Vec<Vec<usize>> {
+    let mut out = BTreeSet::new();
+    for hierarchy in &manifest.hierarchies {
+        if hierarchy.columns.len() < 2
+            || !matches!(
+                hierarchy.kind.as_str(),
+                "postings" | "densepost" | "deltapost" | "flatpost" | "bitslice"
+            )
+        {
+            continue;
+        }
+        let mut mapped = Vec::with_capacity(hierarchy.columns.len());
+        let mut complete = true;
+        for &physical in &hierarchy.columns {
+            let Some(base_column) = base_schema.columns.get(physical) else {
+                complete = false;
+                break;
+            };
+            let Some(incoming) = incoming_schema.column_index(&base_column.name) else {
+                complete = false;
+                break;
+            };
+            mapped.push(incoming);
+        }
+        if complete {
+            mapped.sort_unstable();
+            mapped.dedup();
+            if mapped.len() == hierarchy.columns.len() {
+                out.insert(mapped);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 fn clone_tree_link(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -226,7 +265,7 @@ pub fn apply_mutations_delta(
     let result = (|| {
         let dataset = VersionedDataset::open(catalog_root)?;
         let source_root = dataset.root().to_path_buf();
-        let schema = read_schema(&source_root)?;
+        let schema = dataset.schema().clone();
         let manifest: Manifest = serde_json::from_slice(&fs::read(source_root.join("manifest.json"))?)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let prepared = prepare(&dataset, mutations)?;
@@ -379,45 +418,26 @@ fn ensure_append_schema_compatible(
     existing: &crate::DatasetSchema,
     incoming: &crate::DatasetSchema,
 ) -> io::Result<()> {
-    if existing.columns.len() != incoming.columns.len() {
-        return Err(invalid(format!(
-            "append schema column count mismatch: existing {}, incoming {}",
-            existing.columns.len(),
-            incoming.columns.len()
-        )));
-    }
-    for expected in &existing.columns {
-        let Some(index) = incoming.column_index(&expected.name) else {
-            return Err(invalid(format!(
-                "append schema is missing existing column {:?}",
-                expected.name
-            )));
+    incoming.validate()?;
+    for actual in &incoming.columns {
+        let Some(index) = existing.column_index(&actual.name) else {
+            // New named columns are valid schema evolution. Older layers expose NULL for them.
+            continue;
         };
-        let actual = &incoming.columns[index];
+        let expected = &existing.columns[index];
         if actual.logical_type != expected.logical_type
-            || actual.nullable != expected.nullable
             || actual.normalization != expected.normalization
             || actual.null_values != expected.null_values
         {
             return Err(invalid(format!(
-                "append schema mismatch for column {:?}: existing type={:?} nullable={} normalization={:?} null_values={:?}; incoming type={:?} nullable={} normalization={:?} null_values={:?}",
+                "append schema conflict for column {:?}: existing type={:?} normalization={:?} null_values={:?}; incoming type={:?} normalization={:?} null_values={:?}",
                 expected.name,
                 expected.logical_type,
-                expected.nullable,
                 expected.normalization,
                 expected.null_values,
                 actual.logical_type,
-                actual.nullable,
                 actual.normalization,
                 actual.null_values
-            )));
-        }
-    }
-    for actual in &incoming.columns {
-        if existing.column_index(&actual.name).is_none() {
-            return Err(invalid(format!(
-                "append schema contains unexpected column {:?}",
-                actual.name
             )));
         }
     }
@@ -458,8 +478,9 @@ where
         progress(CsvImportProgress { stage: CsvImportStage::Validating, rows_parsed: None });
         let dataset = VersionedDataset::open(catalog_root)?;
         let source_root = dataset.root().to_path_buf();
-        let schema = read_schema(&source_root)?;
-        ensure_append_schema_compatible(&schema, incoming_schema)?;
+        let logical_schema = dataset.schema().clone();
+        let base_schema = read_schema(&source_root)?;
+        ensure_append_schema_compatible(&logical_schema, incoming_schema)?;
         let manifest: Manifest = serde_json::from_slice(&fs::read(source_root.join("manifest.json"))?)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -473,12 +494,12 @@ where
             batch_rows: config.batch_rows,
             max_sort_records: config.max_sort_records,
             dictionary_run_bytes: config.dictionary_run_bytes,
-            accelerators: exact_accelerators(&manifest),
+            accelerators: mapped_exact_accelerators(&manifest, &base_schema, incoming_schema),
         };
         let built = import_csv_with_progress(
             &build_catalog,
             csv_path,
-            &schema,
+            incoming_schema,
             &import_config,
             |event| {
                 if event.stage != CsvImportStage::Publishing {
@@ -519,7 +540,6 @@ where
             )?;
         }
         row_ids.finish()?;
-        write_schema(&destination, &schema)?;
 
         overlay.deltas.push(DeltaLayerMeta {
             id: layer_id,
