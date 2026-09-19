@@ -16,23 +16,31 @@ impl DeltaPostingHierarchy{
  fn find(&self,key:u64)->Option<(u64,u32)>{let(mut l,mut r)=(0,self.keys as usize);while l<r{let m=(l+r)/2;if self.entry(m).0<key{l=m+1}else{r=m}}if l<self.keys as usize{let(k,o,c)=self.entry(l);if k==key{return Some((o,c))}}None}
  pub fn row_count(&self,key:u64)->usize{self.find(key).map(|x|x.1 as usize).unwrap_or(0)}
  pub fn rows(&self,key:u64)->Vec<u32>{let Some((off,count))=self.find(key)else{return vec![]};let mut p=self.body+off as usize;let mut out=Vec::with_capacity(count as usize);while out.len()<count as usize{if p+8>self.map.len(){return vec![]}let base=u32::from_le_bytes(self.map[p..p+4].try_into().unwrap());let n=u16::from_le_bytes(self.map[p+4..p+6].try_into().unwrap())as usize;let bw=self.map[p+6];p+=8;if n==0||n>BLOCK{return vec![]}out.push(base);let Some(gaps)=unpack(&self.map,&mut p,n-1,bw)else{return vec![]};let mut row=base;for gap in gaps{let Some(next)=row.checked_add(gap)else{return vec![]};row=next;out.push(row)}if out.len()>count as usize{return vec![]}}out}
- /// Intersect directly against compressed blocks. No full posting Vec is allocated.
- /// Because seed is sorted, blocks whose base is already beyond seed's maximum can stop early;
- /// within each block gaps are decoded one-at-a-time and seed advances monotonically.
+ pub fn rows_from(&self,key:u64,first_row:u32,limit:usize)->Vec<u32>{
+  if limit==0{return vec![]}let Some((off,count))=self.find(key)else{return vec![]};let mut p=self.body+off as usize;let mut seen=0usize;let mut out=Vec::with_capacity(limit.min(count as usize));
+  while seen<count as usize&&out.len()<limit{
+   if p+8>self.map.len(){return vec![]}let base=u32::from_le_bytes(self.map[p..p+4].try_into().unwrap());let n=u16::from_le_bytes(self.map[p+4..p+6].try_into().unwrap())as usize;let bw=self.map[p+6];p+=8;
+   if n==0||n>BLOCK||seen+n>count as usize{return vec![]}let bytes=packed_bytes(n-1,bw);if p+bytes>self.map.len(){return vec![]}let next_p=p+bytes;
+   if seen+n<count as usize{if next_p+8>self.map.len(){return vec![]}let next_base=u32::from_le_bytes(self.map[next_p..next_p+4].try_into().unwrap());if next_base<=first_row{p=next_p;seen+=n;continue}}
+   let mut q=p;let mut row=base;if row>=first_row{out.push(row);if out.len()==limit{return out}}
+   let Some(gaps)=unpack(&self.map,&mut q,n-1,bw)else{return vec![]};for gap in gaps{let Some(next)=row.checked_add(gap)else{return vec![]};row=next;if row>=first_row{out.push(row);if out.len()==limit{return out}}}
+   p=next_p;seen+=n;
+  }out
+ }
+ /// Intersect directly against compressed blocks. Blocks wholly before the current seed can be
+ /// skipped from their headers alone; only overlapping blocks decode their packed gaps.
  pub fn intersect_rows(&self,key:u64,seed:&[u32])->Vec<u32>{
   if seed.is_empty(){return vec![]}let Some((off,count))=self.find(key)else{return vec![]};
-  let mut p=self.body+off as usize;let mut seen=0usize;let mut si=0usize;let mut out=Vec::new();let seed_max=*seed.last().unwrap();
-  while seen<count as usize && si<seed.len(){
+  let mut p=self.body+off as usize;let mut seen=0usize;let mut si=0usize;let mut out=Vec::with_capacity(seed.len().min(count as usize));let seed_max=*seed.last().unwrap();
+  while seen<count as usize&&si<seed.len(){
    if p+8>self.map.len(){return vec![]}let base=u32::from_le_bytes(self.map[p..p+4].try_into().unwrap());let n=u16::from_le_bytes(self.map[p+4..p+6].try_into().unwrap())as usize;let bw=self.map[p+6];p+=8;
-   if n==0||n>BLOCK||seen+n>count as usize{return vec![]}let bytes=packed_bytes(n-1,bw);if p+bytes>self.map.len(){return vec![]}
-   if base>seed_max{break}
-   while si<seed.len()&&seed[si]<base{si+=1}if si>=seed.len(){break}
-   let mut row=base;if seed[si]==row{out.push(row);si+=1}
-   if bw==0{p+=bytes;seen+=n;continue}
-   let mask=if bw==32{u64::MAX}else{(1u64<<bw)-1};let(mut acc,mut have)=(0u64,0u32);let mut q=p;
-   for _ in 1..n{while have<bw as u32{acc|=(self.map[q]as u64)<<have;q+=1;have+=8}let gap=(acc&mask)as u32;acc>>=bw;have-=bw as u32;let Some(next)=row.checked_add(gap)else{return vec![]};row=next;while si<seed.len()&&seed[si]<row{si+=1}if si>=seed.len(){break}if seed[si]==row{out.push(row);si+=1}}
-   p+=bytes;seen+=n;
+   if n==0||n>BLOCK||seen+n>count as usize{return vec![]}let bytes=packed_bytes(n-1,bw);if p+bytes>self.map.len(){return vec![]}let next_p=p+bytes;
+   if base>seed_max{break}while si<seed.len()&&seed[si]<base{si+=1}if si>=seed.len(){break}
+   if seen+n<count as usize{if next_p+8>self.map.len(){return vec![]}let next_base=u32::from_le_bytes(self.map[next_p..next_p+4].try_into().unwrap());if seed[si]>=next_base{p=next_p;seen+=n;continue}}
+   let mut q=p;let mut row=base;if seed[si]==row{out.push(row);si+=1}
+   let Some(gaps)=unpack(&self.map,&mut q,n-1,bw)else{return vec![]};for gap in gaps{let Some(next)=row.checked_add(gap)else{return vec![]};row=next;while si<seed.len()&&seed[si]<row{si+=1}if si>=seed.len(){break}if seed[si]==row{out.push(row);si+=1}}
+   p=next_p;seen+=n;
   }out
  }
 }
-#[cfg(test)]mod tests{use super::*;#[test]fn roundtrip_blocks(){let d=tempfile::tempdir().unwrap();let s=d.path().join("s");let o=d.path().join("o");let mut f=File::create(&s).unwrap();for i in 0..400u32{let k=if i<300{2u64}else{7};let row=if k==2{100+i*3}else{5000+(i-300)*1001};f.write_all(&k.to_le_bytes()).unwrap();f.write_all(&row.to_le_bytes()).unwrap()}drop(f);DeltaPostingHierarchy::build_from_sorted(&s,&o).unwrap();let x=DeltaPostingHierarchy::open(o).unwrap();assert_eq!(x.row_count(2),300);assert_eq!(x.rows(2)[299],997);assert_eq!(x.row_count(7),100);assert_eq!(x.rows(7)[99],104099);assert_eq!(x.intersect_rows(2,&[99,100,103,997,999]),vec![100,103,997]);assert_eq!(x.intersect_rows(7,&[1,5000,6001,104099,200000]),vec![5000,6001,104099]);}}
+#[cfg(test)]mod tests{use super::*;#[test]fn roundtrip_blocks(){let d=tempfile::tempdir().unwrap();let s=d.path().join("s");let o=d.path().join("o");let mut f=File::create(&s).unwrap();for i in 0..400u32{let k=if i<300{2u64}else{7};let row=if k==2{100+i*3}else{5000+(i-300)*1001};f.write_all(&k.to_le_bytes()).unwrap();f.write_all(&row.to_le_bytes()).unwrap()}drop(f);DeltaPostingHierarchy::build_from_sorted(&s,&o).unwrap();let x=DeltaPostingHierarchy::open(o).unwrap();assert_eq!(x.row_count(2),300);assert_eq!(x.rows(2)[299],997);assert_eq!(x.row_count(7),100);assert_eq!(x.rows(7)[99],104099);assert_eq!(x.rows_from(2, 700, 3), vec![700,703,706]);assert_eq!(x.intersect_rows(2,&[99,100,103,997,999]),vec![100,103,997]);assert_eq!(x.intersect_rows(7,&[1,5000,6001,104099,200000]),vec![5000,6001,104099]);}}

@@ -51,11 +51,25 @@ impl PostingHierarchy {
     fn dir(&self,i:usize)->(u64,usize,usize){let o=HEADER+i*DIR;(u64::from_le_bytes(self.map[o..o+8].try_into().unwrap()),u64::from_le_bytes(self.map[o+8..o+16].try_into().unwrap()) as usize,u32::from_le_bytes(self.map[o+16..o+20].try_into().unwrap()) as usize)}
     fn bounds(&self,key:u64)->Option<(usize,usize)>{let(mut l,mut r)=(0,self.keys);while l<r{let m=l+(r-l)/2;if self.dir(m).0<key{l=m+1}else{r=m}}if l>=self.keys{return None}let(k,s,n)=self.dir(l);if k==key{Some((s,n))}else{None}}
     fn row_at(&self,i:usize)->u32{let o=self.body+i*4;u32::from_le_bytes(self.map[o..o+4].try_into().unwrap())}
+    fn lower_bound_row(&self,start:usize,end:usize,target:u32)->usize{let(mut l,mut r)=(start,end);while l<r{let m=l+(r-l)/2;if self.row_at(m)<target{l=m+1}else{r=m}}l}
     pub fn row_count(&self,key:u64)->usize{self.bounds(key).map(|x|x.1).unwrap_or(0)}
     pub fn rows(&self,key:u64)->Vec<u32>{let Some((s,n))=self.bounds(key)else{return Vec::new()};(s..s+n).map(|i|self.row_at(i)).collect()}
-    pub fn intersect_rows(&self,key:u64,seed:&[u32])->Vec<u32>{let Some((s,n))=self.bounds(key)else{return Vec::new()};let(mut i,mut j)=(0usize,s);let end=s+n;let mut out=Vec::with_capacity(seed.len().min(n));while i<seed.len()&&j<end{let r=self.row_at(j);match seed[i].cmp(&r){std::cmp::Ordering::Less=>i+=1,std::cmp::Ordering::Greater=>j+=1,std::cmp::Ordering::Equal=>{out.push(r);i+=1;j+=1}}}out}
+    pub fn rows_from(&self,key:u64,first_row:u32,limit:usize)->Vec<u32>{if limit==0{return Vec::new()}let Some((s,n))=self.bounds(key)else{return Vec::new()};let end=s+n;let start=self.lower_bound_row(s,end,first_row);(start..end).take(limit).map(|i|self.row_at(i)).collect()}
+    pub fn contains_row(&self,key:u64,row:u32)->bool{let Some((s,n))=self.bounds(key)else{return false};let end=s+n;let pos=self.lower_bound_row(s,end,row);pos<end&&self.row_at(pos)==row}
+    pub fn intersect_rows(&self,key:u64,seed:&[u32])->Vec<u32>{
+        if seed.is_empty(){return Vec::new()}
+        let Some((s,n))=self.bounds(key)else{return Vec::new()};
+        let end=s+n;let mut out=Vec::with_capacity(seed.len().min(n));
+        if n>seed.len().saturating_mul(16){
+            for &row in seed{let pos=self.lower_bound_row(s,end,row);if pos<end&&self.row_at(pos)==row{out.push(row)}}
+            return out;
+        }
+        let(mut i,mut j)=(0usize,self.lower_bound_row(s,end,seed[0]));
+        while i<seed.len()&&j<end{let r=self.row_at(j);match seed[i].cmp(&r){std::cmp::Ordering::Less=>i+=1,std::cmp::Ordering::Greater=>j+=1,std::cmp::Ordering::Equal=>{out.push(r);i+=1;j+=1}}}
+        out
+    }
     pub fn total_rows(&self)->usize{self.rows}
 }
 fn write_dir(map:&mut [u8],i:usize,key:u64,start:usize,len:usize){let o=HEADER+i*DIR;map[o..o+8].copy_from_slice(&key.to_le_bytes());map[o+8..o+16].copy_from_slice(&(start as u64).to_le_bytes());map[o+16..o+20].copy_from_slice(&(len as u32).to_le_bytes());map[o+20..o+24].fill(0);}
 
-#[cfg(test)]mod tests{use super::*;use std::io::Write;#[test]fn builds_and_intersects(){let d=tempfile::tempdir().unwrap();let s=d.path().join("s");let p=d.path().join("p");let mut f=File::create(&s).unwrap();for(k,r)in[(1u64,0u32),(1,3),(1,9),(4,1),(4,8)]{f.write_all(&k.to_le_bytes()).unwrap();f.write_all(&r.to_le_bytes()).unwrap()}drop(f);PostingHierarchy::build_from_sorted(&s,&p,5).unwrap();let x=PostingHierarchy::open(p).unwrap();assert_eq!(x.row_count(1),3);assert_eq!(x.rows(4),vec![1,8]);assert_eq!(x.intersect_rows(1,&[0,2,3,8]),vec![0,3]);}}
+#[cfg(test)]mod tests{use super::*;use std::io::Write;#[test]fn builds_and_intersects(){let d=tempfile::tempdir().unwrap();let s=d.path().join("s");let p=d.path().join("p");let mut f=File::create(&s).unwrap();for(k,r)in[(1u64,0u32),(1,3),(1,9),(4,1),(4,8)]{f.write_all(&k.to_le_bytes()).unwrap();f.write_all(&r.to_le_bytes()).unwrap()}drop(f);PostingHierarchy::build_from_sorted(&s,&p,5).unwrap();let x=PostingHierarchy::open(p).unwrap();assert_eq!(x.row_count(1),3);assert_eq!(x.rows(4),vec![1,8]);assert_eq!(x.rows_from(1,3,2),vec![3,9]);assert!(x.contains_row(1,9));assert!(!x.contains_row(1,8));assert_eq!(x.intersect_rows(1,&[0,2,3,8]),vec![0,3]);}}

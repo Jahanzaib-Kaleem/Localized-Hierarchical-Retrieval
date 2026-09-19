@@ -367,6 +367,22 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
             .all(|column| dataset.has_exact_singleton(*column))
     {
         const CANDIDATE_BATCH: usize = 4096;
+        let mut materialized_columns = projection.clone();
+        for filter in &prepared {
+            let column = match filter {
+                PreparedFilter::Eq { column, .. }
+                | PreparedFilter::In { column, .. }
+                | PreparedFilter::Range { column, .. } => *column,
+            };
+            materialized_columns.push(column);
+        }
+        materialized_columns.sort_unstable();
+        materialized_columns.dedup();
+        let candidate_select = materialized_columns
+            .iter()
+            .map(|&column| dataset.schema().columns[column].name.clone())
+            .collect::<Vec<_>>();
+
         let mut rows_examined = 0u64;
         let mut hits = 0u64;
         let mut pages_touched = 0u64;
@@ -376,9 +392,9 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
 
         loop {
             enforce_deadline(deadline)?;
-            let result = dataset.query_values_after(
+            let result = dataset.query_values_page_after(
                 &candidate_predicates,
-                None,
+                Some(&candidate_select),
                 candidate_after,
                 CANDIDATE_BATCH,
             )?;
@@ -402,11 +418,17 @@ pub fn execute_query(dataset: &VersionedDataset, request: &QueryRequest) -> io::
                 }
 
                 last_row_id = Some(candidate.row_id);
-                let values = candidate
-                    .values
-                    .into_iter()
-                    .map(|value| value.value)
-                    .collect::<Vec<_>>();
+                let mut values = vec![None; dataset.schema().columns.len()];
+                for value in candidate.values {
+                    let column = dataset
+                        .schema()
+                        .column_index(&value.column)
+                        .ok_or_else(|| invalid(format!(
+                            "candidate projection returned unknown column {}",
+                            value.column
+                        )))?;
+                    values[column] = value.value;
+                }
                 if !matches_filters(dataset.schema(), &values, &prepared)? {
                     continue;
                 }
