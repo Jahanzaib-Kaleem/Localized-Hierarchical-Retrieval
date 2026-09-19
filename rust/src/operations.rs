@@ -1,4 +1,4 @@
-use crate::{Engine, Manifest, Segment};
+use crate::{dictionary_filename, read_schema, Dictionary, Engine, Manifest, Segment};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -157,6 +157,149 @@ fn sha256_file(path: &Path) -> io::Result<(u64, String)> {
     Ok((bytes, hex))
 }
 
+pub fn integrity_entry_for_file(
+    root: impl AsRef<Path>,
+    relative: impl AsRef<Path>,
+) -> io::Result<IntegrityEntry> {
+    let root = root.as_ref();
+    let relative = relative.as_ref();
+    if relative.is_absolute()
+        || relative.components().any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "integrity entry path must be a normal relative path",
+        ));
+    }
+    let path = root.join(relative);
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("integrity entry file is missing: {}", relative.display()),
+        ));
+    }
+    let (bytes, sha256) = sha256_file(&path)?;
+    Ok(IntegrityEntry {
+        path: relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+        bytes,
+        sha256,
+    })
+}
+
+pub fn install_integrity_manifest(
+    root: impl AsRef<Path>,
+    mut entries: Vec<IntegrityEntry>,
+) -> io::Result<IntegrityManifest> {
+    let root = root.as_ref();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    for pair in entries.windows(2) {
+        if pair[0].path == pair[1].path {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate integrity entry {}", pair[0].path),
+            ));
+        }
+    }
+
+    let current = collect_stable_files(root)?;
+    let current_set: BTreeSet<_> = current
+        .iter()
+        .map(|path| relative_string(root, path))
+        .collect::<io::Result<_>>()?;
+    let supplied_set: BTreeSet<_> = entries.iter().map(|entry| entry.path.clone()).collect();
+    if current_set != supplied_set {
+        let missing = current_set
+            .difference(&supplied_set)
+            .cloned()
+            .collect::<Vec<_>>();
+        let extra = supplied_set
+            .difference(&current_set)
+            .cloned()
+            .collect::<Vec<_>>();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "composed integrity file set mismatch; missing={missing:?} extra={extra:?}"
+            ),
+        ));
+    }
+
+    for entry in &entries {
+        let length = fs::metadata(root.join(&entry.path))?.len();
+        if length != entry.bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "composed integrity size mismatch {}: {} != {}",
+                    entry.path, length, entry.bytes
+                ),
+            ));
+        }
+    }
+
+    let manifest = IntegrityManifest {
+        format: INTEGRITY_FORMAT.into(),
+        entries,
+    };
+    let data = serde_json::to_vec_pretty(&manifest).map_err(json_error)?;
+    atomic_write(&root.join("integrity.json"), &data)?;
+    Ok(manifest)
+}
+
+pub fn verify_integrity_metadata(root: impl AsRef<Path>) -> io::Result<VerificationReport> {
+    let root = root.as_ref();
+    let mut report = verify_dataset_structure(root)?;
+    if !report.valid {
+        return Ok(report);
+    }
+    let Some(seal) = read_integrity_manifest(root)? else {
+        report.valid = false;
+        report.errors.push("dataset has no integrity seal".into());
+        return Ok(report);
+    };
+    if seal.format != INTEGRITY_FORMAT {
+        report.valid = false;
+        report
+            .errors
+            .push(format!("unsupported integrity format {}", seal.format));
+        return Ok(report);
+    }
+    let current = collect_stable_files(root)?;
+    let current_set: BTreeSet<_> = current
+        .iter()
+        .map(|path| relative_string(root, path))
+        .collect::<io::Result<_>>()?;
+    let sealed_set: BTreeSet<_> = seal.entries.iter().map(|entry| entry.path.clone()).collect();
+    if current_set != sealed_set {
+        report.valid = false;
+        report.errors.push("integrity file set does not match dataset".into());
+        return Ok(report);
+    }
+    for entry in &seal.entries {
+        match fs::metadata(root.join(&entry.path)) {
+            Ok(metadata) if metadata.len() == entry.bytes => report.checked_files += 1,
+            Ok(metadata) => {
+                report.valid = false;
+                report.errors.push(format!(
+                    "size mismatch {}: {} != {}",
+                    entry.path,
+                    metadata.len(),
+                    entry.bytes
+                ));
+            }
+            Err(error) => {
+                report.valid = false;
+                report.errors.push(format!("{}: {error}", entry.path));
+            }
+        }
+    }
+    Ok(report)
+}
+
 fn compute_integrity(root: &Path) -> io::Result<IntegrityManifest> {
     let mut entries = Vec::new();
     for path in collect_stable_files(root)? {
@@ -205,7 +348,7 @@ pub fn read_integrity_manifest(root: impl AsRef<Path>) -> io::Result<Option<Inte
     Ok(Some(manifest))
 }
 
-fn verify_structure(root: &Path) -> io::Result<VerificationReport> {
+pub fn verify_dataset_structure(root: &Path) -> io::Result<VerificationReport> {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     let mut checked_files = 0usize;
@@ -279,6 +422,43 @@ fn verify_structure(root: &Path) -> io::Result<VerificationReport> {
         errors.push(format!("manifest pages {} != segment pages {}", manifest.pages, expected_page));
     }
 
+    match read_schema(root) {
+        Ok(schema) => {
+            if schema.columns.len() != manifest.columns {
+                errors.push("schema column count does not match manifest".into());
+            } else {
+                for (column, spec) in schema.columns.iter().enumerate() {
+                    let path = root.join("dictionaries").join(dictionary_filename(column));
+                    match Dictionary::open(&path) {
+                        Ok(dictionary) => {
+                            checked_files += 1;
+                            if dictionary.nullable() != spec.nullable {
+                                errors.push(format!(
+                                    "dictionary nullability mismatch for {}",
+                                    spec.name
+                                ));
+                            }
+                            if dictionary.cardinality() != manifest.cardinalities[column] {
+                                errors.push(format!(
+                                    "dictionary cardinality mismatch for {}",
+                                    spec.name
+                                ));
+                            }
+                            if let Err(error) = dictionary.verify_offsets() {
+                                errors.push(format!("dictionary {}: {error}", spec.name));
+                            }
+                        }
+                        Err(error) => errors.push(format!(
+                            "dictionary {}: {error}",
+                            spec.name
+                        )),
+                    }
+                }
+            }
+        }
+        Err(error) => errors.push(format!("schema: {error}")),
+    }
+
     for hierarchy in &manifest.hierarchies {
         if hierarchy.columns.is_empty()
             || hierarchy.columns.iter().any(|&c| c >= manifest.columns)
@@ -312,7 +492,7 @@ fn verify_structure(root: &Path) -> io::Result<VerificationReport> {
 
 pub fn verify_dataset(root: impl AsRef<Path>) -> io::Result<VerificationReport> {
     let root = root.as_ref();
-    let mut report = verify_structure(root)?;
+    let mut report = verify_dataset_structure(root)?;
     if !report.valid {
         return Ok(report);
     }
@@ -365,7 +545,7 @@ pub fn verify_dataset(root: impl AsRef<Path>) -> io::Result<VerificationReport> 
 
 pub fn seal_dataset(root: impl AsRef<Path>) -> io::Result<IntegrityManifest> {
     let root = root.as_ref();
-    let report = verify_structure(root)?;
+    let report = verify_dataset_structure(root)?;
     if !report.valid {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
