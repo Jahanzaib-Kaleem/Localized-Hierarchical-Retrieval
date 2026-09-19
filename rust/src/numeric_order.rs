@@ -13,6 +13,7 @@ use std::{
 const MAGIC: &[u8; 8] = b"LHRNORD1";
 const HEADER: usize = 56;
 const NULL_RANK: u32 = u32::MAX;
+const DEFAULT_STORAGE_BUDGET_BYTES_PER_ROW: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumericKind {
@@ -553,8 +554,14 @@ pub fn build_numeric_orders(
     max_sort_records: usize,
 ) -> io::Result<usize> {
     let root = root.as_ref();
+    let manifest: crate::manifest::Manifest =
+        serde_json::from_slice(&fs::read(root.join("manifest.json"))?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let routing = root.join("routing");
     fs::create_dir_all(&routing)?;
+    let storage_budget = manifest
+        .rows
+        .saturating_mul(DEFAULT_STORAGE_BUDGET_BYTES_PER_ROW);
     let mut built = 0usize;
     for (column, spec) in schema.columns.iter().enumerate() {
         let Some(kind) = NumericKind::from_logical_type(&spec.logical_type) else {
@@ -564,6 +571,15 @@ pub fn build_numeric_orders(
             root.join("dictionaries")
                 .join(crate::logical::dictionary_filename(column)),
         )?;
+        // The sidecar stores sorted numeric values, token-by-rank, and rank-by-token. Keep this
+        // accelerator adaptive: a nearly unique numeric ID should not silently add a large
+        // storage tax to every import. Queries remain exact through the fallback when skipped.
+        let estimated_bytes = (HEADER as u64)
+            .saturating_add(dictionary.value_count().saturating_mul(12))
+            .saturating_add(dictionary.cardinality().saturating_mul(4));
+        if estimated_bytes > storage_budget {
+            continue;
+        }
         build_numeric_order(
             &dictionary,
             kind,
