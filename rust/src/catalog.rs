@@ -343,7 +343,9 @@ pub fn vacuum_generations(
         let stale_work = name.starts_with(".mutation-work-")
             || name.starts_with(".restore-work-")
             || name.starts_with(".delta-work-")
-            || name.starts_with(".compaction-work-");
+            || name.starts_with(".compaction-work-")
+            || name.starts_with(".segmented-import-work-")
+            || name.starts_with(".segmented-append-work-");
         if entry.file_type()?.is_dir() && stale_work {
             bytes_reclaimed = bytes_reclaimed.saturating_add(directory_bytes(&entry.path())?);
             fs::remove_dir_all(entry.path())?;
