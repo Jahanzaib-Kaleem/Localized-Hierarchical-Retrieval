@@ -541,8 +541,11 @@ export function DataPage() {
       </div>
     </Panel>
 
-    {stats.data ? <Panel title="Schema" eyebrow={numberFormat.format(stats.data.rows) + ' rows · ' + formatBytes(stats.data.total_bytes)}>
-      <div className="table-wrap"><table className="data-table"><thead><tr><th>Column</th><th>Type</th><th>Cardinality</th><th>Nullable</th></tr></thead><tbody>{stats.data.column_stats.map((column) => <tr key={column.id}><td className="data-table__primary">{column.name}</td><td><span className="code-chip">{column.logical_type}</span></td><td className="mono">{numberFormat.format(column.cardinality)}</td><td>{column.nullable ? 'Yes' : 'No'}</td></tr>)}</tbody></table></div>
+    {datasetSchema.data ? <Panel title="Schema" eyebrow={stats.data ? numberFormat.format(stats.data.rows) + ' rows · ' + formatBytes(stats.data.total_bytes) : datasetSchema.data.columns.length + ' columns'}>
+      <div className="table-wrap"><table className="data-table"><thead><tr><th>Column</th><th>Type</th><th>Cardinality</th><th>Nullable</th></tr></thead><tbody>{datasetSchema.data.columns.map((column, index) => {
+        const physicalStats = stats.data?.column_stats.find((item) => item.name === column.name)
+        return <tr key={column.name + '-' + index}><td className="data-table__primary">{column.name}</td><td><span className="code-chip">{column.logical_type}</span></td><td className="mono">{physicalStats ? numberFormat.format(physicalStats.cardinality) : '—'}</td><td>{column.nullable ? 'Yes' : 'No'}</td></tr>
+      })}</tbody></table></div>
     </Panel> : null}
   </div>
 }
