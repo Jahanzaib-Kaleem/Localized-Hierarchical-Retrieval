@@ -9,7 +9,7 @@ use fs2::available_space;
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
 };
@@ -337,7 +337,11 @@ where
     F: FnMut(&Path, u32, u64, u64) -> io::Result<()>,
     P: FnMut(CsvImportProgress),
 {
-    let source = File::open(csv_path)?;
+    let source = if config.reclaim_consumed_source {
+        OpenOptions::new().read(true).write(true).open(csv_path)?
+    } else {
+        File::open(csv_path)?
+    };
     let mut reader = ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
