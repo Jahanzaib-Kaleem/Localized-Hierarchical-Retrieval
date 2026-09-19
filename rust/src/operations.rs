@@ -456,11 +456,9 @@ pub fn verify_dataset_structure(root: &Path) -> io::Result<VerificationReport> {
                 }
             }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            warnings.push(
-                "dataset has no logical schema; dictionary deep verification was skipped".into(),
-            );
-        }
+        // Physical engine-only datasets predate the logical schema layer and remain valid.
+        // Deep dictionary verification applies only when schema metadata is present.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => errors.push(format!("schema: {error}")),
     }
 
