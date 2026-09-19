@@ -686,9 +686,9 @@ where
     }
 }
 
-pub fn segmented_import_disk_floor(bytes_total: u64) -> u64 {
+pub fn segmented_import_disk_floor(bytes_total: u64, part_bytes: u64) -> u64 {
     bytes_total
         .saturating_mul(2)
-        .saturating_add(DEFAULT_SEGMENTED_PART_BYTES.saturating_mul(4))
+        .saturating_add(part_bytes.saturating_mul(SEGMENTED_PART_HEADROOM_MULTIPLIER))
         .saturating_add(SEGMENTED_IMPORT_FIXED_HEADROOM_BYTES)
 }
