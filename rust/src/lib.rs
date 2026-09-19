@@ -80,8 +80,10 @@ pub use maintenance::restore_backup;
 pub use manifest::{ensure_supported_format, HierarchyMeta, Manifest, SegmentMeta, DATASET_FORMAT};
 pub use mutation::{apply_mutations, Mutation, MutationConfig, MutationReport};
 pub use operations::{
-    backup_dataset, dataset_status, read_integrity_manifest, seal_dataset, verify_dataset,
-    DatasetStatus, IntegrityEntry, IntegrityManifest, VerificationReport,
+    backup_dataset, dataset_status, install_integrity_manifest, integrity_entry_for_file,
+    read_integrity_manifest, seal_dataset, verify_dataset, verify_dataset_structure,
+    verify_integrity_metadata, DatasetStatus, IntegrityEntry, IntegrityManifest,
+    VerificationReport,
 };
 pub use overlay::{
     delta_path, read_overlay, write_overlay, write_visibility, DeltaLayerMeta, OverlayCatalog,
