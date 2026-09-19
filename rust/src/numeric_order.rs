@@ -109,6 +109,7 @@ pub struct NumericOrder {
     kind: NumericKind,
     tokens: u64,
     values: u64,
+    nullable: bool,
     values_offset: usize,
     tokens_offset: usize,
     ranks_offset: usize,
@@ -127,12 +128,14 @@ impl NumericOrder {
         let kind = NumericKind::from_code(u32::from_le_bytes(
             map[8..12].try_into().unwrap(),
         ))?;
-        if u32::from_le_bytes(map[12..16].try_into().unwrap()) != 0 {
+        let flags = u32::from_le_bytes(map[12..16].try_into().unwrap());
+        if flags & !1 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unknown numeric-order flags",
             ));
         }
+        let nullable = flags & 1 != 0;
         let tokens = u64::from_le_bytes(map[16..24].try_into().unwrap());
         let values = u64::from_le_bytes(map[24..32].try_into().unwrap());
         let values_offset = u64::from_le_bytes(map[32..40].try_into().unwrap()) as usize;
@@ -165,7 +168,7 @@ impl NumericOrder {
             || tokens_offset != expected_tokens_offset
             || ranks_offset != expected_ranks_offset
             || map.len() != expected_len
-            || !(tokens == values || tokens == values.saturating_add(1))
+            || tokens != values.saturating_add(u64::from(nullable))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -178,6 +181,7 @@ impl NumericOrder {
             kind,
             tokens,
             values,
+            nullable,
             values_offset,
             tokens_offset,
             ranks_offset,
@@ -226,7 +230,11 @@ impl NumericOrder {
             .ranks_offset
             .checked_add((token as usize).checked_mul(4)?)?;
         let rank = u32::from_le_bytes(self.map.get(offset..offset + 4)?.try_into().ok()?);
-        (rank != NULL_RANK).then_some(rank)
+        if self.nullable && token == 0 {
+            None
+        } else {
+            Some(rank)
+        }
     }
 
     fn lower_bound(&self, target: u64) -> u64 {
@@ -296,6 +304,7 @@ impl NumericOrder {
         if self.kind != expected_kind
             || self.tokens != dictionary.cardinality()
             || self.values != dictionary.value_count()
+            || self.nullable != dictionary.nullable()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -471,7 +480,7 @@ pub fn build_numeric_order(
         let mut final_writer = BufWriter::new(final_file);
         final_writer.write_all(MAGIC)?;
         final_writer.write_all(&kind.code().to_le_bytes())?;
-        final_writer.write_all(&0u32.to_le_bytes())?;
+        final_writer.write_all(&(if dictionary.nullable() { 1u32 } else { 0u32 }).to_le_bytes())?;
         final_writer.write_all(&tokens.to_le_bytes())?;
         final_writer.write_all(&values.to_le_bytes())?;
         final_writer.write_all(&values_offset.to_le_bytes())?;
