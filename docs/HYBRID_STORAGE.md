@@ -1,10 +1,12 @@
 # Hybrid Parquet Storage
 
-Status: runtime implementation branch for `feature/hybrid-parquet-storage`.
+Status: implemented on `feature/hybrid-parquet-storage`.
 
-Hybrid storage reduces canonical storage amplification for wide datasets without putting Parquet on LHR's exact equality filtering path.
+This design reduces canonical storage amplification for large lead datasets without putting Parquet on LHR's exact filtering path.
 
 ## Non-negotiable performance contract
+
+Hybrid storage does not put Parquet on the exact-index filtering path.
 
 For a fully covered equality query the route remains:
 
@@ -16,26 +18,25 @@ external values
     -> exact physical/logical row IDs
 ```
 
-Parquet is not consulted to prove the result. It is used only after row IDs are known when selected output columns are cold, or on an existing canonical verification/fallback route.
+Only materialization of requested cold values consults the Parquet payload. Equality planning, posting representations, bit-slice intersections, row-count lookup, and bounded row-ID pagination remain LHR-native.
 
-The regression test `rust/tests/hybrid_storage.rs` enforces this for a predicate on a Parquet-backed column by requiring `rows_checked == 0` and `pages_touched == 0`. A second regression compares native and hybrid canonical bytes on repetitive cold columns and requires hybrid storage to be smaller.
+A regression test enforces that an exact equality predicate on a cold Parquet-backed column returns with `rows_checked == 0` and `pages_touched == 0`.
 
 ## Physical model
 
-A hybrid generation is still an `LHR/1` logical dataset:
+A hybrid generation contains:
 
 ```text
 generation/
   manifest.json
   schema.json
+  integrity.json
   storage.json
   dictionaries/
   routing/
   canonical/
     segment-000000.lhr
     segment-000000.parquet
-    segment-000001.lhr
-    segment-000001.parquet
     ...
   rowids.bin          # when required
   overlay.json        # when required
@@ -45,122 +46,64 @@ generation/
 
 `storage.json` uses `LHR-STORAGE/1` and partitions every logical column exactly once into:
 
-- `hot_columns`: native fixed-width mmap token storage;
-- `cold_columns`: Parquet-backed token storage.
+- `hot_columns`: fixed-width mmap-native LHR token storage;
+- `cold_columns`: Snappy-compressed Parquet token storage.
 
-Existing LHR/1 generations without `storage.json` are interpreted exactly as before with every column hot, so no existing dataset needs migration.
+Existing LHR/1 generations without `storage.json` remain legacy native storage with every column hot. They require no migration.
 
-## Hybrid segment format
+## Canonical representation
 
-Native segments retain `LHRSEG01` unchanged. Hybrid segments use `LHRHYB01`.
+Both hot and cold stores contain the same LHR dictionary token IDs. Parquet does not introduce an independent value encoding. Dictionaries remain the single mapping between external values and internal tokens, and exact indexes continue to use those same tokens.
 
-A hybrid `.lhr` segment records the full logical column count, the hot/cold logical column partition, row-group size, and the name of its immutable Parquet sidecar. Its payload contains only hot fixed-width tokens.
+Hybrid native segments use the `LHRHYB01` format. They expose the same logical `Segment` API as legacy segments, so the planner, query engine, verification, index construction, backup, and recovery code do not need a separate query model.
 
-`Segment::open` hides the physical split from the engine:
+## Direct source-Parquet ingestion
 
-- hot values remain direct mmap arithmetic;
-- cold values are materialized from the matching Parquet sidecar;
-- `Segment::cols()` still reports the full logical column count;
-- callers such as `Engine`, exact-index construction, verification, and fallback scans continue to use the existing logical segment API.
-
-This is intentional: the equality planner and exact-index code are not rewritten around Parquet.
-
-## Parquet representation
-
-Cold payloads store LHR dictionary token IDs, not duplicated external strings. Columns are required Parquet `INT32` values with unsigned 32-bit logical semantics; the raw bit pattern is the LHR `u32` token.
-
-The implementation uses Parquet's low-level typed column API rather than Arrow. LHR only requires integer token columns, and avoiding the Arrow bridge materially reduces build/runtime footprint under the project's constrained-hardware target. Snappy is the initial codec because decode speed is prioritized over maximum compression.
-
-Cold reads are localized by row group. Requested rows are grouped by row group, requested columns are decoded once for that group, and each hybrid `Segment` caches the most recently used cold row group. Hot reads do not acquire the cold cache lock.
-
-## Build path
-
-`build_hybrid_u32_batches` accepts the same complete logical token stream as the native builder plus a sorted set of cold columns and a row-group size.
-
-The builder first sees the complete logical token rows, so page-routing metadata retains existing semantics. Each emitted segment is then split physically:
+Existing Parquet shards can be imported directly with `lhr-parquet-import`. The importer performs two bounded passes over the source shards:
 
 ```text
-complete token rows
-    -> hot columns  -> segment-NNNNNN.lhr
-    -> cold columns -> segment-NNNNNN.parquet
+Pass 1: source Parquet -> canonical values -> external-sort dictionary runs -> LHR dictionaries
+Pass 2: source Parquet -> dictionary tokens -> hot native segments + cold Parquet sidecars
+                                      -> exact LHR indexes -> verify -> publish
 ```
 
-Exact singleton and optional wider indexes are built afterward through the unchanged `Segment` interface. Cold columns therefore receive the same exact index coverage as hot columns.
+No decoded CSV staging copy is created. Source Parquet files are opened read-only and remain untouched at their original paths.
 
-## Query behavior
+The importer accepts a saved hot/cold profile and additional multi-column exact accelerators. It prints the final storage report and verification result after publication.
 
-### Fully indexed equality
+See `docs/PARQUET_IMPORT.md`.
 
-No canonical verification and no Parquet filtering:
+## Row groups and materialization
 
-```text
-predicate tokens -> exact LHR indexes -> row IDs
-```
+Cold payload row-group size is configurable; the default is 65,536 rows. Requested cold rows are grouped by row group, and a segment caches the most recently decoded cold row group. Exact filtering still happens before any cold payload access.
 
-Only requested cold result values require Parquet materialization.
+## Compaction
 
-### Candidate-first mixed predicates
+Compaction no longer creates a full temporary CSV. It performs two bounded passes over visible logical rows:
 
-Equality indexes remain the driver. Residual predicates on cold columns may require Parquet reads for the bounded candidate stream, but an available exact equality seed must not turn into a whole-dataset Parquet scan.
+1. rebuild dictionaries;
+2. stream dictionary tokens into a new canonical generation.
 
-### General fallback
+Native generations remain native. Hybrid generations preserve their cold-column profile and Parquet row-group size. Columns introduced by schema evolution default to hot storage until a future explicit profile change.
 
-An unaccelerated cold predicate can require Parquet canonical reads and will be slower than fixed-width mmap scanning. This remains a correctness path under the existing timeout / rows-examined controls, not the preferred query plan.
-
-### Empty-filter browsing
-
-Hot-only browsing remains native. Cold projections should be consumed in batches/row groups, not by independently opening Parquet per returned cell.
+Logical row IDs are preserved through `rowids.bin`.
 
 ## Durability
 
-Hybrid Parquet sidecars are generation-owned stable files. Because they live inside the generation tree, existing recursive integrity sealing, backup/restore, recovery and immutable-generation lifecycle include them automatically.
+LHR-owned Parquet sidecars are immutable generation files. They are included in integrity sealing, verification, backup/restore, recovery, snapshot/lease lifecycle, and vacuum behavior through the existing recursive stable-file handling.
 
-`storage.json` validates that hot/cold columns partition the logical schema exactly once and that declared Parquet payload ranges cover the physical layer contiguously.
+Arbitrary mutable external Parquet paths are not used as live canonical storage. Source Parquet is imported into generation-owned token sidecars so a published generation is self-contained and durable.
 
-Arbitrary mutable external Parquet paths are not part of the durable format. Source Parquet can be read during ingestion, but published generations own their canonical payloads.
+## Compatibility and resource constraints
 
-## Import direction
+The implementation uses the low-level Parquet INT32 API rather than Arrow. This keeps the build/runtime footprint compatible with LHR's constrained-hardware goals while preserving full `u32` token bit patterns.
 
-The intended Apollo-scale flow is:
+Parquet 60's MSRV is Rust 1.88; the appliance builder uses Rust 1.90.
 
-```text
-source Parquet
-    -> dictionary/cardinality pass
-    -> token batches
-    -> hybrid LHR builder
-       -> hot mmap tokens
-       -> cold owned Parquet tokens
-    -> exact LHR indexes
-    -> verification + integrity seal
-    -> atomic publication
-```
+The existing LHR release suite continues to run under the 1 GiB virtual-memory ceiling, and the unchanged mixed-cardinality, lead-like, Hybrid-7, and topology benchmark gates remain in CI.
 
-The ~145 GB CSV representation should never need to exist just because the source arrives as ~25 GB of Parquet.
+## Production acceptance
 
-## Acceptance gates
+Before importing a very large real dataset, choose a profile based on which columns must have cheap arbitrary materialization. Exact indexed filtering is independent of hot/cold placement, but frequently returned or residual-scanned columns should remain hot.
 
-Before enabling hybrid storage for a production bucket, benchmark native and hybrid representations on the same real shard and report at least:
-
-- final bytes by hot canonical / cold Parquet / dictionaries / indexes / metadata;
-- peak staging bytes during ingestion;
-- warm and cold exact equality latency;
-- equality pagination latency;
-- materialization for 1, 10, 100, 1,000 and 10,000 rows;
-- hot-only vs cold projection;
-- candidate-first mixed predicates;
-- fallback scan cost;
-- RSS/HWM, major faults, process reads/writes;
-- exact result equivalence.
-
-### Hard acceptance rule
-
-The fully indexed equality row-ID path may not regress because of Parquet. Any cost introduced by cold result materialization must remain isolated to materialization and be measured separately.
-
-## Remaining production enablement
-
-The hybrid segment backend and token builder are implemented. Remaining work before using this for the Apollo bucket is:
-
-1. direct source-Parquet ingestion so the 145 GB CSV intermediate is never created;
-2. a user-facing import/profile entry point for choosing hot/cold columns;
-3. compaction behavior that preserves or deliberately reselects the hybrid profile instead of silently expanding the dataset back to all-native storage;
-4. representative Apollo-shard storage and latency benchmarks to choose the production hot/cold column set and row-group size.
+The direct importer reports the actual published `canonical_bytes`, `routing_bytes`, and `total_bytes`. This lets the real dataset's storage footprint be measured immediately after import without constructing a CSV intermediate.
