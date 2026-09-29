@@ -9,6 +9,7 @@ pub mod delta_mutation;
 pub mod delta_postings;
 pub mod dense_postings;
 pub mod dictionary;
+mod dictionary_build;
 pub mod engine;
 pub mod exact;
 pub mod external;
@@ -24,6 +25,7 @@ pub mod manifest;
 pub mod mutation;
 pub mod operations;
 pub mod overlay;
+pub mod parquet_import;
 pub mod parquet_payload;
 pub mod planner;
 pub mod postings;
@@ -36,6 +38,7 @@ pub mod segment;
 pub mod service;
 pub mod snapshot;
 pub mod storage;
+mod stream_builder;
 pub mod telemetry;
 pub mod versioned;
 
@@ -92,6 +95,9 @@ pub use operations::{
 pub use overlay::{
     delta_path, read_overlay, write_overlay, write_visibility, DeltaLayerMeta, OverlayCatalog,
     VisibilityMap, VisibilityTarget, DELTAS_DIR, OVERLAY_FILE, VISIBILITY_FILE,
+};
+pub use parquet_import::{
+    import_parquet_shards_initial, ParquetImportConfig, ParquetImportReport,
 };
 pub use parquet_payload::{read_token_projection, ParquetTokenWriter};
 pub use planner::choose_hierarchies;
