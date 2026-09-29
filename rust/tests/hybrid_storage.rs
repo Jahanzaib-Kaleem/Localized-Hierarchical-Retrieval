@@ -1,7 +1,23 @@
 use lhr::{
-    add_exact_hierarchies, build_hybrid_u32_batches, read_storage_layout, verify_dataset_structure,
-    BuildConfig, Engine, HierarchySpec, Predicate, StorageMode,
+    add_exact_hierarchies, build_hybrid_u32_batches, build_u32_batches, read_storage_layout,
+    verify_dataset_structure, BuildConfig, Engine, HierarchySpec, Predicate, StorageMode,
 };
+use std::fs;
+
+fn tree_bytes(path: &std::path::Path) -> u64 {
+    fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                tree_bytes(&entry.path())
+            } else {
+                metadata.len()
+            }
+        })
+        .sum()
+}
 
 #[test]
 fn cold_parquet_columns_keep_exact_equality_off_canonical_path() {
@@ -69,4 +85,36 @@ fn cold_parquet_columns_keep_exact_equality_off_canonical_path() {
 
     let verification = verify_dataset_structure(root).unwrap();
     assert!(verification.valid, "{:?}", verification.errors);
+}
+
+#[test]
+fn repetitive_cold_columns_reduce_canonical_storage() {
+    let rows = 65_536usize;
+    let mut tokens = Vec::with_capacity(rows * 4);
+    for row in 0..rows {
+        tokens.push((row % 4) as u32);
+        tokens.push((row % 32) as u32);
+        tokens.push((row % 8) as u32);
+        tokens.push((row % 16) as u32);
+    }
+    let cfg = BuildConfig {
+        columns: 4,
+        page_rows: 1_024,
+        cardinalities: vec![4, 32, 8, 16],
+        hierarchies: Vec::new(),
+        max_sort_records: 2_048,
+    };
+
+    let native = tempfile::tempdir().unwrap();
+    build_u32_batches([tokens.clone()], native.path(), &cfg).unwrap();
+    let native_bytes = tree_bytes(&native.path().join("canonical"));
+
+    let hybrid = tempfile::tempdir().unwrap();
+    build_hybrid_u32_batches([tokens], hybrid.path(), &cfg, &[1, 3], 4_096).unwrap();
+    let hybrid_bytes = tree_bytes(&hybrid.path().join("canonical"));
+
+    assert!(
+        hybrid_bytes < native_bytes,
+        "hybrid canonical bytes {hybrid_bytes} must be below native {native_bytes}"
+    );
 }
