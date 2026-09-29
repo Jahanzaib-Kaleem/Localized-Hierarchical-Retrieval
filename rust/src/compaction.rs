@@ -1,7 +1,10 @@
 use crate::{
-    abandon_generation, begin_generation, import_csv, publish_generation, write_schema,
-    CsvImportConfig, GenerationInfo, Manifest, RowIdWriter, VersionedDataset, ROW_IDS_FILE,
+    abandon_generation, add_exact_hierarchies, begin_generation, dictionary_filename,
+    publish_generation, read_schema, read_storage_layout, write_schema, BuildConfig, Dictionary,
+    GenerationInfo, HierarchySpec, Manifest, RowIdWriter, StorageMode, VersionedDataset, ROW_IDS_FILE,
 };
+use crate::dictionary_build::DictionarySpool;
+use crate::stream_builder::U32StreamBuilder;
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
@@ -22,7 +25,7 @@ impl Default for CompactionConfig {
         Self {
             batch_rows: 16_384,
             max_sort_records: 250_000,
-            dictionary_run_bytes: 64 * 1024 * 1024,
+            dictionary_run_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -41,74 +44,109 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-fn exact_accelerators(manifest: &Manifest) -> Vec<Vec<usize>> {
-    let mut out = BTreeSet::new();
+fn read_manifest(root: &Path) -> io::Result<Manifest> {
+    serde_json::from_slice(&fs::read(root.join("manifest.json"))?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn exact_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "postings" | "densepost" | "deltapost" | "flatpost" | "bitslice"
+    )
+}
+
+fn exact_specs(
+    manifest: &Manifest,
+    base_schema: &crate::DatasetSchema,
+    logical_schema: &crate::DatasetSchema,
+) -> io::Result<Vec<HierarchySpec>> {
+    let mut set = BTreeSet::<Vec<usize>>::new();
+    for column in 0..logical_schema.columns.len() {
+        set.insert(vec![column]);
+    }
     for hierarchy in &manifest.hierarchies {
-        if hierarchy.columns.len() < 2 {
+        if hierarchy.columns.len() < 2 || !exact_kind(&hierarchy.kind) {
             continue;
         }
-        if matches!(
-            hierarchy.kind.as_str(),
-            "postings" | "densepost" | "deltapost" | "flatpost" | "bitslice"
-        ) {
-            out.insert(hierarchy.columns.clone());
+        let mut mapped = Vec::with_capacity(hierarchy.columns.len());
+        for &base_column in &hierarchy.columns {
+            let name = base_schema
+                .columns
+                .get(base_column)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "base accelerator references an out-of-range column",
+                    )
+                })?
+                .name
+                .as_str();
+            mapped.push(logical_schema.column_index(name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("compaction union schema lost indexed column {name:?}"),
+                )
+            })?);
+        }
+        mapped.sort_unstable();
+        mapped.dedup();
+        if mapped.len() == hierarchy.columns.len() {
+            set.insert(mapped);
         }
     }
-    out.into_iter().collect()
+    Ok(set
+        .into_iter()
+        .map(|columns| HierarchySpec { columns })
+        .collect())
 }
 
-fn null_sentinels(dataset: &VersionedDataset) -> Vec<Option<String>> {
-    dataset
-        .schema()
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(column, schema)| {
-            if !schema.nullable {
-                return None;
-            }
-            if let Some(raw) = schema.null_values.first() {
-                return Some(raw.clone());
-            }
-            for attempt in 0u64.. {
-                let candidate = format!("\0LHR_COMPACTION_NULL_{column}_{attempt}\0");
-                if !dataset.contains_canonical_value(column, &candidate) {
-                    return Some(candidate);
-                }
-            }
-            unreachable!()
-        })
-        .collect()
-}
-
-fn temp_schema(
-    schema: &crate::DatasetSchema,
-    sentinels: &[Option<String>],
-) -> crate::DatasetSchema {
-    let mut schema = schema.clone();
-    for (column, sentinel) in sentinels.iter().enumerate() {
-        if schema.columns[column].nullable {
-            if let Some(sentinel) = sentinel {
-                if !schema.columns[column].null_values.iter().any(|x| x == sentinel) {
-                    schema.columns[column].null_values = vec![sentinel.clone()];
-                }
-            }
+fn preserved_hybrid_profile(
+    source_root: &Path,
+    manifest: &Manifest,
+    base_schema: &crate::DatasetSchema,
+    logical_schema: &crate::DatasetSchema,
+) -> io::Result<(Option<Vec<usize>>, usize)> {
+    let layout = read_storage_layout(source_root, manifest.columns, manifest.rows)?;
+    if layout.mode != StorageMode::HybridParquet {
+        return Ok((None, 0));
+    }
+    let mut cold = Vec::with_capacity(layout.cold_columns.len());
+    for base_column in layout.cold_columns {
+        let name = base_schema
+            .columns
+            .get(base_column)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "hybrid layout references an out-of-range base column",
+                )
+            })?
+            .name
+            .as_str();
+        if let Some(logical) = logical_schema.column_index(name) {
+            cold.push(logical);
         }
     }
-    schema
-}
-
-fn remove_dir_if_exists(path: &Path) -> io::Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+    cold.sort_unstable();
+    cold.dedup();
+    if cold.is_empty() {
+        return Ok((None, 0));
     }
+    // Newly evolved columns default hot. This is conservative for latency and avoids silently
+    // pushing a new field to cold storage merely because older generations never contained it.
+    if cold.len() == logical_schema.columns.len() {
+        cold.pop();
+    }
+    Ok((Some(cold), layout.row_group_rows.max(1)))
 }
 
 /// Merge all immutable delta layers and visibility overrides into one clean base generation.
-/// Visible rows are streamed in stable logical-row-ID order, so compaction does not need a
-/// database-sized in-memory row-ID set.
+///
+/// Compaction is fully streaming: it performs one visible-row pass to rebuild dictionaries and a
+/// second pass to emit dictionary tokens. It never creates a decoded CSV copy of the database.
+/// Existing hybrid generations preserve their cold-column profile and Parquet row-group setting;
+/// native generations remain native.
 pub fn compact_dataset(
     catalog_root: impl AsRef<Path>,
     config: &CompactionConfig,
@@ -119,89 +157,133 @@ pub fn compact_dataset(
         ));
     }
     let catalog_root = catalog_root.as_ref();
+    let dataset = VersionedDataset::open(catalog_root)?;
+    if dataset.visible_rows() == 0 {
+        return Err(invalid("compaction cannot materialize an empty LHR/1 dataset"));
+    }
+    let source_root = dataset.root().to_path_buf();
+    let base_schema = read_schema(&source_root)?;
+    let logical_schema = dataset.schema().clone();
+    let manifest = read_manifest(&source_root)?;
+    let specs = exact_specs(&manifest, &base_schema, &logical_schema)?;
+    let (cold_columns, row_group_rows) = preserved_hybrid_profile(
+        &source_root,
+        &manifest,
+        &base_schema,
+        &logical_schema,
+    )?;
+    let bytes_before = crate::dataset_status(&source_root)?.total_bytes;
+    let delta_layers_before = dataset.delta_meta().len();
+    let visibility_overrides_before = dataset.visibility().len();
+    let rows = dataset.visible_rows();
+
     let stage = begin_generation(catalog_root)?;
-    let work = catalog_root.join(format!(
-        ".compaction-work-{}-{}",
-        stage.id,
-        std::process::id()
-    ));
-
     let result = (|| {
-        let dataset = VersionedDataset::open(catalog_root)?;
-        if dataset.visible_rows() == 0 {
-            return Err(invalid("compaction cannot materialize an empty LHR/1 dataset"));
-        }
-        let source_root = dataset.root().to_path_buf();
-        let schema = dataset.schema().clone();
-        let manifest: Manifest = serde_json::from_slice(&fs::read(source_root.join("manifest.json"))?)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let bytes_before = crate::dataset_status(&source_root)?.total_bytes;
-        let delta_layers_before = dataset.delta_meta().len();
-        let visibility_overrides_before = dataset.visibility().len();
-        let sentinels = null_sentinels(&dataset);
-        let internal_schema = temp_schema(&schema, &sentinels);
-
-        fs::create_dir_all(&work)?;
-        let csv_path = work.join("compaction.csv");
-        let row_ids_path = work.join(ROW_IDS_FILE);
-        let mut csv = csv::WriterBuilder::new()
-            .from_path(&csv_path)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        csv.write_record(schema.columns.iter().map(|x| x.name.as_str()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut row_ids = RowIdWriter::create(&row_ids_path, dataset.visible_rows())?;
-        let mut written = 0u64;
-        dataset.for_each_visible_row(|row_id, values| {
-            let record: Vec<&str> = values
-                .iter()
-                .enumerate()
-                .map(|(column, value)| match value {
-                    Some(value) => value.as_str(),
-                    None => sentinels[column].as_deref().unwrap(),
-                })
-                .collect();
-            csv.write_record(record)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            row_ids.push(row_id)?;
-            written += 1;
+        let mut spool = DictionarySpool::create(&stage.path, logical_schema.columns.len())?;
+        let mut first_rows = 0u64;
+        dataset.for_each_visible_row(|_, values| {
+            if values.len() != logical_schema.columns.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "versioned row width does not match union schema during compaction",
+                ));
+            }
+            for (column, value) in values.iter().enumerate() {
+                if let Some(value) = value {
+                    spool.push(column, value)?;
+                } else if !logical_schema.columns[column].nullable {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "visible row contains NULL in non-nullable column {}",
+                            logical_schema.columns[column].name
+                        ),
+                    ));
+                }
+            }
+            first_rows += 1;
             Ok(())
         })?;
-        if written != dataset.visible_rows() {
+        if first_rows != rows {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "visible row count changed during immutable compaction snapshot",
+                "visible row count changed during dictionary compaction pass",
             ));
         }
-        csv.flush()?;
-        row_ids.finish()?;
+        let cardinalities = spool.finish(&logical_schema, config.dictionary_run_bytes)?;
+        let dictionaries = (0..logical_schema.columns.len())
+            .map(|column| {
+                Dictionary::open(stage.path.join("dictionaries").join(dictionary_filename(column)))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
 
-        let build_catalog = work.join("build-catalog");
-        let import_config = CsvImportConfig {
+        let build_cfg = BuildConfig {
+            columns: logical_schema.columns.len(),
             page_rows: manifest.page_rows,
-            batch_rows: config.batch_rows,
+            cardinalities,
+            hierarchies: Vec::new(),
             max_sort_records: config.max_sort_records,
-            dictionary_run_bytes: config.dictionary_run_bytes,
-            accelerators: exact_accelerators(&manifest),
         };
-        let built = import_csv(&build_catalog, &csv_path, &internal_schema, &import_config)?;
-
-        fs::remove_dir_all(&stage.path)?;
-        fs::rename(&built.generation.path, &stage.path)?;
-        let _ = fs::remove_file(stage.path.join("integrity.json"));
-        fs::rename(&row_ids_path, stage.path.join(ROW_IDS_FILE))?;
-        write_schema(&stage.path, &schema)?;
-
-        Ok((
-            dataset.visible_rows(),
-            delta_layers_before,
-            visibility_overrides_before,
-            bytes_before,
-        ))
+        let mut builder = U32StreamBuilder::create(
+            &stage.path,
+            build_cfg,
+            cold_columns.clone(),
+            row_group_rows,
+        )?;
+        let mut row_ids = RowIdWriter::create(stage.path.join(ROW_IDS_FILE), rows)?;
+        let columns = logical_schema.columns.len();
+        let mut batch = Vec::<u32>::with_capacity(config.batch_rows.saturating_mul(columns));
+        let mut second_rows = 0u64;
+        dataset.for_each_visible_row(|row_id, values| {
+            for (column, value) in values.iter().enumerate() {
+                let token = match value {
+                    None => 0,
+                    Some(value) => dictionaries[column].token(value).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "compaction value for column {} is absent from rebuilt dictionary",
+                                logical_schema.columns[column].name
+                            ),
+                        )
+                    })?,
+                };
+                batch.push(token);
+            }
+            row_ids.push(row_id)?;
+            second_rows += 1;
+            if batch.len() / columns >= config.batch_rows {
+                builder.push_batch(std::mem::take(&mut batch))?;
+                batch = Vec::with_capacity(config.batch_rows.saturating_mul(columns));
+            }
+            Ok(())
+        })?;
+        if !batch.is_empty() {
+            builder.push_batch(batch)?;
+        }
+        row_ids.finish()?;
+        if second_rows != rows {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "visible row count changed during token compaction pass",
+            ));
+        }
+        let built = builder.finish()?;
+        if built.rows != rows {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("compaction stream wrote {} rows, expected {rows}", built.rows),
+            ));
+        }
+        add_exact_hierarchies(&stage.path, &specs, config.max_sort_records)?;
+        write_schema(&stage.path, &logical_schema)?;
+        let _ = fs::remove_dir_all(stage.path.join("temp"));
+        Ok(())
     })();
 
     match result {
-        Ok((rows, delta_layers_before, visibility_overrides_before, bytes_before)) => {
-            let _ = remove_dir_if_exists(&work);
+        Ok(()) => {
+            drop(dataset);
             let generation = publish_generation(stage)?;
             let bytes_after = crate::dataset_status(&generation.path)?.total_bytes;
             Ok(CompactionReport {
@@ -214,7 +296,7 @@ pub fn compact_dataset(
             })
         }
         Err(error) => {
-            let _ = remove_dir_if_exists(&work);
+            drop(dataset);
             let _ = abandon_generation(stage);
             Err(error)
         }

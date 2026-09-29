@@ -2,7 +2,7 @@ use crate::{
     bitmap::BitmapHierarchy,
     external::external_sort,
     manifest::{HierarchyMeta, Manifest, SegmentMeta},
-    Segment,
+    write_storage_layout, ParquetPayloadFile, ParquetTokenWriter, Segment, StorageLayout,
 };
 use std::{
     fs::{self, File},
@@ -40,12 +40,12 @@ fn keyspace(spec: &HierarchySpec, card: &[u64]) -> io::Result<u64> {
 }
 
 fn read_token(data: &[u8], token_index: usize, width: usize) -> u64 {
-    let o = token_index * width;
+    let offset = token_index * width;
     match width {
-        1 => data[o] as u64,
-        2 => u16::from_le_bytes(data[o..o + 2].try_into().unwrap()) as u64,
-        4 => u32::from_le_bytes(data[o..o + 4].try_into().unwrap()) as u64,
-        8 => u64::from_le_bytes(data[o..o + 8].try_into().unwrap()),
+        1 => data[offset] as u64,
+        2 => u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as u64,
+        4 => u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as u64,
+        8 => u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()),
         _ => unreachable!(),
     }
 }
@@ -60,11 +60,11 @@ fn page_keys(
     let row_bytes = columns * width;
     let rows = page.len() / row_bytes;
     let mut keys = Vec::with_capacity(rows);
-    for r in 0..rows {
+    for row in 0..rows {
         let mut key = 0u64;
-        for &c in &spec.columns {
-            let value = read_token(page, r * columns + c, width);
-            let radix = card[c];
+        for &column in &spec.columns {
+            let value = read_token(page, row * columns + column, width);
+            let radix = card[column];
             if value >= radix {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -73,7 +73,7 @@ fn page_keys(
             }
             key = key
                 .checked_mul(radix)
-                .and_then(|x| x.checked_add(value))
+                .and_then(|value_so_far| value_so_far.checked_add(value))
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "hierarchy key overflow")
                 })?;
@@ -99,7 +99,7 @@ fn validate_config(cfg: &BuildConfig, max_cardinality: u64) -> io::Result<()> {
     if cfg
         .cardinalities
         .iter()
-        .any(|&x| x == 0 || x > max_cardinality)
+        .any(|&value| value == 0 || value > max_cardinality)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -109,7 +109,10 @@ fn validate_config(cfg: &BuildConfig, max_cardinality: u64) -> io::Result<()> {
     if cfg
         .hierarchies
         .iter()
-        .any(|h| h.columns.is_empty() || h.columns.iter().any(|&c| c >= cfg.columns))
+        .any(|hierarchy| {
+            hierarchy.columns.is_empty()
+                || hierarchy.columns.iter().any(|&column| column >= cfg.columns)
+        })
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -119,12 +122,42 @@ fn validate_config(cfg: &BuildConfig, max_cardinality: u64) -> io::Result<()> {
     Ok(())
 }
 
+fn hybrid_partition(columns: usize, cold_columns: &[usize]) -> io::Result<Vec<usize>> {
+    if cold_columns.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hybrid storage requires at least one cold column",
+        ));
+    }
+    let mut ordered = cold_columns.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+    if ordered != cold_columns || ordered.iter().any(|&column| column >= columns) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hybrid cold columns must be sorted, unique, and in range",
+        ));
+    }
+    let hot = (0..columns)
+        .filter(|column| ordered.binary_search(column).is_err())
+        .collect::<Vec<_>>();
+    if hot.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hybrid storage requires at least one hot column",
+        ));
+    }
+    Ok(hot)
+}
+
 fn build_encoded_batches<I>(
     batches: I,
     root: impl AsRef<Path>,
     cfg: &BuildConfig,
     width: usize,
     max_cardinality: u64,
+    cold_columns: Option<&[usize]>,
+    row_group_rows: usize,
 ) -> io::Result<Manifest>
 where
     I: IntoIterator<Item = Vec<u8>>,
@@ -137,6 +170,18 @@ where
         ));
     }
 
+    let hot_columns = if let Some(cold) = cold_columns {
+        if width != 4 || row_group_rows == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hybrid storage currently requires u32 tokens and row_group_rows > 0",
+            ));
+        }
+        hybrid_partition(cfg.columns, cold)?
+    } else {
+        (0..cfg.columns).collect::<Vec<_>>()
+    };
+
     let root = root.as_ref();
     let canonical = root.join("canonical");
     let routing = root.join("routing");
@@ -146,7 +191,7 @@ where
     fs::create_dir_all(&temp)?;
 
     let spool_paths: Vec<PathBuf> = (0..cfg.hierarchies.len())
-        .map(|i| temp.join(format!("h{i:04}.raw")))
+        .map(|index| temp.join(format!("h{index:04}.raw")))
         .collect();
     let mut spools: Vec<BufWriter<File>> = spool_paths
         .iter()
@@ -166,9 +211,10 @@ where
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "page size overflow"))?;
     let mut carry: Vec<u8> = Vec::with_capacity(page_bytes * 2);
     let mut segments = Vec::new();
+    let mut payloads = Vec::<ParquetPayloadFile>::new();
     let mut page_id = 0u32;
     let mut row_start = 0u64;
-    let mut seg_no = 0usize;
+    let mut segment_number = 0usize;
 
     let mut emit_segment = |data: &[u8], final_partial: bool| -> io::Result<()> {
         if data.is_empty() {
@@ -191,26 +237,72 @@ where
         for page_start in (0..rows).step_by(cfg.page_rows) {
             let page_end = (page_start + cfg.page_rows).min(rows);
             let page = &data[page_start * row_bytes..page_end * row_bytes];
-            for (hi, spec) in cfg.hierarchies.iter().enumerate() {
+            for (hierarchy_index, spec) in cfg.hierarchies.iter().enumerate() {
                 for key in page_keys(page, cfg.columns, width, spec, &cfg.cardinalities)? {
-                    write_record(&mut spools[hi], key, page_id)?;
+                    write_record(&mut spools[hierarchy_index], key, page_id)?;
                 }
             }
             page_id = page_id.checked_add(1).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "page id overflow")
             })?;
         }
-        let name = format!("segment-{seg_no:06}.lhr");
-        seg_no += 1;
-        Segment::write(
-            canonical.join(&name),
-            rows as u64,
-            cfg.columns as u32,
-            width as u32,
-            data,
-        )?;
+
+        let segment_name = format!("segment-{segment_number:06}.lhr");
+        if let Some(cold) = cold_columns {
+            let parquet_name = format!("segment-{segment_number:06}.parquet");
+            let mut hot_data = Vec::with_capacity(rows * hot_columns.len() * width);
+            let mut cold_data = vec![Vec::<u32>::with_capacity(rows); cold.len()];
+            for row in 0..rows {
+                for &column in &hot_columns {
+                    let token = read_token(data, row * cfg.columns + column, width) as u32;
+                    hot_data.extend_from_slice(&token.to_le_bytes());
+                }
+                for (slot, &column) in cold.iter().enumerate() {
+                    cold_data[slot]
+                        .push(read_token(data, row * cfg.columns + column, width) as u32);
+                }
+            }
+            let mut writer = ParquetTokenWriter::create(
+                canonical.join(&parquet_name),
+                cold,
+                row_group_rows,
+            )?;
+            writer.write_columns(&cold_data)?;
+            let written = writer.finish()?;
+            if written != rows as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "hybrid Parquet sidecar row count mismatch",
+                ));
+            }
+            Segment::write_hybrid(
+                canonical.join(&segment_name),
+                rows as u64,
+                cfg.columns as u32,
+                width as u32,
+                &hot_columns,
+                cold,
+                row_group_rows,
+                &parquet_name,
+                &hot_data,
+            )?;
+            payloads.push(ParquetPayloadFile {
+                file: format!("canonical/{parquet_name}"),
+                row_start,
+                rows: rows as u64,
+            });
+        } else {
+            Segment::write(
+                canonical.join(&segment_name),
+                rows as u64,
+                cfg.columns as u32,
+                width as u32,
+                data,
+            )?;
+        }
+        segment_number += 1;
         segments.push(SegmentMeta {
-            file: name,
+            file: segment_name,
             row_start,
             rows: rows as u64,
             first_page,
@@ -238,21 +330,21 @@ where
         emit_segment(&carry, true)?;
     }
     drop(emit_segment);
-    for s in &mut spools {
-        s.flush()?;
+    for spool in &mut spools {
+        spool.flush()?;
     }
     drop(spools);
 
     let mut hierarchies = Vec::new();
-    for (i, spec) in cfg.hierarchies.iter().enumerate() {
-        let sparse_tmp = routing.join(format!("h{i:04}.sparse.tmp"));
-        let entries = external_sort(&spool_paths[i], &sparse_tmp, cfg.max_sort_records)?;
-        let _ = fs::remove_file(&spool_paths[i]);
+    for (index, spec) in cfg.hierarchies.iter().enumerate() {
+        let sparse_tmp = routing.join(format!("h{index:04}.sparse.tmp"));
+        let entries = external_sort(&spool_paths[index], &sparse_tmp, cfg.max_sort_records)?;
+        let _ = fs::remove_file(&spool_paths[index]);
         let space = keyspace(spec, &cfg.cardinalities)?;
         let sparse_bytes = entries.saturating_mul(12);
         let bitmap_bytes = BitmapHierarchy::estimated_bytes(space, page_id).unwrap_or(u64::MAX);
         if bitmap_bytes < sparse_bytes && bitmap_bytes <= MAX_AUTO_BITMAP_BYTES {
-            let file = format!("h{i:04}.bit");
+            let file = format!("h{index:04}.bit");
             BitmapHierarchy::build_from_sparse(&sparse_tmp, routing.join(&file), space, page_id)?;
             fs::remove_file(&sparse_tmp)?;
             hierarchies.push(HierarchyMeta {
@@ -263,7 +355,7 @@ where
                 keyspace: space,
             });
         } else {
-            let file = format!("h{i:04}.bin");
+            let file = format!("h{index:04}.bin");
             fs::rename(&sparse_tmp, routing.join(&file))?;
             hierarchies.push(HierarchyMeta {
                 file,
@@ -289,9 +381,16 @@ where
     fs::write(
         &tmp_manifest,
         serde_json::to_vec_pretty(&manifest)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
     )?;
     fs::rename(tmp_manifest, root.join("manifest.json"))?;
+
+    if let Some(cold) = cold_columns {
+        let mut layout = StorageLayout::hybrid(hot_columns, cold.to_vec(), payloads);
+        layout.row_group_rows = row_group_rows;
+        layout.validate(cfg.columns, row_start)?;
+        write_storage_layout(root, &layout)?;
+    }
     Ok(manifest)
 }
 
@@ -303,7 +402,7 @@ pub fn build_u8_batches<I>(
 where
     I: IntoIterator<Item = Vec<u8>>,
 {
-    build_encoded_batches(batches, root, cfg, 1, 256)
+    build_encoded_batches(batches, root, cfg, 1, 256, None, 0)
 }
 
 pub fn build_u32_batches<I>(
@@ -321,5 +420,44 @@ where
         }
         bytes
     });
-    build_encoded_batches(encoded, root, cfg, 4, u32::MAX as u64 + 1)
+    build_encoded_batches(
+        encoded,
+        root,
+        cfg,
+        4,
+        u32::MAX as u64 + 1,
+        None,
+        0,
+    )
+}
+
+/// Build the same logical LHR/1 dataset while keeping selected cold columns in Parquet token
+/// sidecars. Hot columns remain fixed-width mmap segments, and exact/page indexes are still built
+/// from the complete logical token stream before the physical split.
+pub fn build_hybrid_u32_batches<I>(
+    batches: I,
+    root: impl AsRef<Path>,
+    cfg: &BuildConfig,
+    cold_columns: &[usize],
+    row_group_rows: usize,
+) -> io::Result<Manifest>
+where
+    I: IntoIterator<Item = Vec<u32>>,
+{
+    let encoded = batches.into_iter().map(|batch| {
+        let mut bytes = Vec::with_capacity(batch.len() * 4);
+        for token in batch {
+            bytes.extend_from_slice(&token.to_le_bytes());
+        }
+        bytes
+    });
+    build_encoded_batches(
+        encoded,
+        root,
+        cfg,
+        4,
+        u32::MAX as u64 + 1,
+        Some(cold_columns),
+        row_group_rows,
+    )
 }

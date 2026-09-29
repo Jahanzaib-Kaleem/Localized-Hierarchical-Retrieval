@@ -9,6 +9,7 @@ pub mod delta_mutation;
 pub mod delta_postings;
 pub mod dense_postings;
 pub mod dictionary;
+mod dictionary_build;
 pub mod engine;
 pub mod exact;
 pub mod external;
@@ -24,6 +25,8 @@ pub mod manifest;
 pub mod mutation;
 pub mod operations;
 pub mod overlay;
+pub mod parquet_import;
+pub mod parquet_payload;
 pub mod planner;
 pub mod postings;
 pub mod query_api;
@@ -34,6 +37,8 @@ pub mod segmented_import;
 pub mod segment;
 pub mod service;
 pub mod snapshot;
+pub mod storage;
+mod stream_builder;
 pub mod telemetry;
 pub mod versioned;
 
@@ -43,7 +48,9 @@ pub use admin::{
 };
 pub use bitmap::BitmapHierarchy;
 pub use bitslice_postings::BitSlicePostingHierarchy;
-pub use builder::{build_u32_batches, build_u8_batches, BuildConfig, HierarchySpec};
+pub use builder::{
+    build_hybrid_u32_batches, build_u32_batches, build_u8_batches, BuildConfig, HierarchySpec,
+};
 pub use buckets::{
     bucket_root, combine_buckets, create_bucket, delete_bucket, list_buckets, rename_bucket,
     require_bucket_root, transfer_rows, validate_bucket_id, BucketCombineReport, BucketInfo,
@@ -52,8 +59,7 @@ pub use buckets::{
 pub use catalog::{
     abandon_generation, begin_generation, list_generations, publish_generation,
     publish_presealed_generation, resolve_dataset_root, rollback_generation,
-    vacuum_generations, GenerationInfo,
-    StagedGeneration, VacuumReport,
+    vacuum_generations, GenerationInfo, StagedGeneration, VacuumReport,
 };
 pub use compaction::{compact_dataset, CompactionConfig, CompactionReport};
 pub use delta_mutation::{
@@ -90,6 +96,10 @@ pub use overlay::{
     delta_path, read_overlay, write_overlay, write_visibility, DeltaLayerMeta, OverlayCatalog,
     VisibilityMap, VisibilityTarget, DELTAS_DIR, OVERLAY_FILE, VISIBILITY_FILE,
 };
+pub use parquet_import::{
+    import_parquet_shards_initial, ParquetImportConfig, ParquetImportReport,
+};
+pub use parquet_payload::{read_token_projection, ParquetTokenWriter};
 pub use planner::choose_hierarchies;
 pub use postings::PostingHierarchy;
 pub use query_api::{execute_query, QueryApiRow, QueryApiStats, QueryFilter, QueryRequest, QueryResponse};
@@ -109,6 +119,10 @@ pub use segment::Segment;
 pub use service::{serve, ServiceApiKey, ServiceConfig, ServiceRole};
 pub use snapshot::{
     leased_generation_ids, vacuum_with_reader_leases, SafeVacuumReport, SnapshotLease,
+};
+pub use storage::{
+    read_storage_layout, write_storage_layout, ParquetPayloadFile, StorageLayout, StorageMode,
+    STORAGE_LAYOUT_FILE, STORAGE_LAYOUT_FORMAT,
 };
 pub use telemetry::{
     append_query_event, load_query_events, planner_indexes_for_request, query_event, record_query,
