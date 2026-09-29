@@ -18,7 +18,7 @@ external values
 
 Parquet is not consulted to prove the result. It is used only after row IDs are known when selected output columns are cold, or on an existing canonical verification/fallback route.
 
-The regression test `rust/tests/hybrid_storage.rs` enforces this for a predicate on a Parquet-backed column by requiring `rows_checked == 0` and `pages_touched == 0`.
+The regression test `rust/tests/hybrid_storage.rs` enforces this for a predicate on a Parquet-backed column by requiring `rows_checked == 0` and `pages_touched == 0`. A second regression compares native and hybrid canonical bytes on repetitive cold columns and requires hybrid storage to be smaller.
 
 ## Physical model
 
