@@ -45,7 +45,9 @@ pub use admin::{
 };
 pub use bitmap::BitmapHierarchy;
 pub use bitslice_postings::BitSlicePostingHierarchy;
-pub use builder::{build_u32_batches, build_u8_batches, BuildConfig, HierarchySpec};
+pub use builder::{
+    build_hybrid_u32_batches, build_u32_batches, build_u8_batches, BuildConfig, HierarchySpec,
+};
 pub use buckets::{
     bucket_root, combine_buckets, create_bucket, delete_bucket, list_buckets, rename_bucket,
     require_bucket_root, transfer_rows, validate_bucket_id, BucketCombineReport, BucketInfo,
