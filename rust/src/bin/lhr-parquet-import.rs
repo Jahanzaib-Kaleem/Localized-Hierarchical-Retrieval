@@ -1,7 +1,7 @@
 use clap::Parser;
 use lhr::{
-    import_parquet_shards_initial, read_schema_file, verify_versioned_dataset, DatasetSchema,
-    ParquetImportConfig,
+    dataset_status, import_parquet_shards_initial, read_schema_file, verify_versioned_dataset,
+    DatasetSchema, ParquetImportConfig,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -183,8 +183,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         row_group_rows,
     };
     let report = import_parquet_shards_initial(&cli.root, &cli.sources, &schema, &config)?;
+    let storage = dataset_status(&report.generation.path)?;
     if cli.no_verify {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "import": report,
+                "storage": storage,
+            }))?
+        );
         return Ok(());
     }
 
@@ -193,6 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "{}",
         serde_json::to_string_pretty(&json!({
             "import": report,
+            "storage": storage,
             "verification": verification,
         }))?
     );
