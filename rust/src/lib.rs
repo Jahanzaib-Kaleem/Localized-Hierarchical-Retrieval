@@ -24,6 +24,7 @@ pub mod manifest;
 pub mod mutation;
 pub mod operations;
 pub mod overlay;
+pub mod parquet_payload;
 pub mod planner;
 pub mod postings;
 pub mod query_api;
@@ -90,6 +91,7 @@ pub use overlay::{
     delta_path, read_overlay, write_overlay, write_visibility, DeltaLayerMeta, OverlayCatalog,
     VisibilityMap, VisibilityTarget, DELTAS_DIR, OVERLAY_FILE, VISIBILITY_FILE,
 };
+pub use parquet_payload::{read_token_projection, ParquetTokenWriter};
 pub use planner::choose_hierarchies;
 pub use postings::PostingHierarchy;
 pub use query_api::{execute_query, QueryApiRow, QueryApiStats, QueryFilter, QueryRequest, QueryResponse};
