@@ -34,6 +34,7 @@ pub mod segmented_import;
 pub mod segment;
 pub mod service;
 pub mod snapshot;
+pub mod storage;
 pub mod telemetry;
 pub mod versioned;
 
@@ -52,8 +53,7 @@ pub use buckets::{
 pub use catalog::{
     abandon_generation, begin_generation, list_generations, publish_generation,
     publish_presealed_generation, resolve_dataset_root, rollback_generation,
-    vacuum_generations, GenerationInfo,
-    StagedGeneration, VacuumReport,
+    vacuum_generations, GenerationInfo, StagedGeneration, VacuumReport,
 };
 pub use compaction::{compact_dataset, CompactionConfig, CompactionReport};
 pub use delta_mutation::{
@@ -109,6 +109,10 @@ pub use segment::Segment;
 pub use service::{serve, ServiceApiKey, ServiceConfig, ServiceRole};
 pub use snapshot::{
     leased_generation_ids, vacuum_with_reader_leases, SafeVacuumReport, SnapshotLease,
+};
+pub use storage::{
+    read_storage_layout, write_storage_layout, ParquetPayloadFile, StorageLayout, StorageMode,
+    STORAGE_LAYOUT_FILE, STORAGE_LAYOUT_FORMAT,
 };
 pub use telemetry::{
     append_query_event, load_query_events, planner_indexes_for_request, query_event, record_query,
