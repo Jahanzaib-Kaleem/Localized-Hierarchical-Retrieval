@@ -12,6 +12,7 @@ LHR can import existing flat primitive Parquet shards directly into hybrid canon
 - Additional multi-column accelerators can be supplied with `--index`.
 - Fully indexed equality filtering remains an LHR-index operation; cold Parquet is only read when a cold value must be materialized or a fallback canonical read is required.
 - The published generation is verified by default.
+- The command prints final `canonical_bytes`, `routing_bytes`, and `total_bytes`, so a real import immediately shows its actual disk footprint.
 
 ## Source requirements
 
@@ -70,7 +71,7 @@ lhr-parquet-import \
   /apollo/apollo_data_*.parquet
 ```
 
-The command refuses to replace a non-empty catalog. It prints the import report and post-publish verification report as JSON. A failed build abandons the staged generation and leaves the existing catalog and source shards unchanged.
+The command refuses to replace a non-empty catalog. It prints the import report, final storage report, and post-publish verification report as JSON. A failed build abandons the staged generation and leaves the existing catalog and source shards unchanged.
 
 ## Compaction
 
