@@ -31,7 +31,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -182,7 +182,7 @@ struct ServiceState {
     next_request_id: Arc<AtomicU64>,
     import_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     import_builds: Arc<Semaphore>,
-    dataset_cache: Arc<Mutex<HashMap<String, Arc<VersionedDataset>>>>,
+    dataset_cache: Arc<Mutex<HashMap<String, Weak<VersionedDataset>>>>,
 }
 
 fn hash_token(token: &str) -> [u8; 32] { Sha256::digest(token.as_bytes()).into() }
@@ -407,7 +407,7 @@ fn run_import_job(
     root: PathBuf,
     mut config: SegmentedCsvImportConfig,
     id: String,
-    dataset_cache: Arc<Mutex<HashMap<String, Arc<VersionedDataset>>>>,
+    dataset_cache: Arc<Mutex<HashMap<String, Weak<VersionedDataset>>>>,
 ) {
     let Ok(mut job) = load_import_job(&root, &id) else {
         return;
@@ -660,7 +660,7 @@ fn selected_bucket_root(state: &ServiceState, bucket: &str, request_id: u64) -> 
 }
 
 fn cached_dataset(
-    cache: &Mutex<HashMap<String, Arc<VersionedDataset>>>,
+    cache: &Mutex<HashMap<String, Weak<VersionedDataset>>>,
     bucket: &str,
     root: &Path,
 ) -> io::Result<Arc<VersionedDataset>> {
@@ -669,9 +669,9 @@ fn cached_dataset(
         let guard = cache
             .lock()
             .map_err(|_| io::Error::other("dataset cache lock poisoned"))?;
-        if let Some(dataset) = guard.get(bucket) {
+        if let Some(dataset) = guard.get(bucket).and_then(Weak::upgrade) {
             if dataset.root() == resolved {
-                return Ok(Arc::clone(dataset));
+                return Ok(dataset);
             }
         }
     }
@@ -680,12 +680,12 @@ fn cached_dataset(
     let mut guard = cache
         .lock()
         .map_err(|_| io::Error::other("dataset cache lock poisoned"))?;
-    if let Some(dataset) = guard.get(bucket) {
+    if let Some(dataset) = guard.get(bucket).and_then(Weak::upgrade) {
         if dataset.root() == resolved {
-            return Ok(Arc::clone(dataset));
+            return Ok(dataset);
         }
     }
-    guard.insert(bucket.to_owned(), Arc::clone(&opened));
+    guard.insert(bucket.to_owned(), Arc::downgrade(&opened));
     Ok(opened)
 }
 
@@ -1427,6 +1427,10 @@ async fn bucket_delete(
             "confirm must exactly match the bucket id",
         ));
     }
+    // Drop the service's cache entry before checking reader leases. The cache stores only weak
+    // references, but proactively removing the entry also ensures a failed concurrent delete can
+    // be retried without any stale cache bookkeeping.
+    invalidate_cached_dataset(&state, &request.id);
     let root = state.root.clone();
     let id = request.id.clone();
     let result = tokio::task::spawn_blocking(move || delete_bucket(root, &id))
@@ -1434,7 +1438,6 @@ async fn bucket_delete(
         .map_err(|error| join_error(guard.request_id, error))?;
     match result {
         Ok(()) => {
-            invalidate_cached_dataset(&state, &request.id);
             state.metrics.admin_actions.fetch_add(1, Ordering::Relaxed);
             let _ = append_audit(&state, &AuditEvent {
                 timestamp_ms: now_ms(), request_id: guard.request_id, actor: &guard.actor,
@@ -1748,5 +1751,38 @@ mod tests {
     fn studio_mime_types_are_stable() {
         assert_eq!(studio_content_type(Path::new("app.js")), "text/javascript; charset=utf-8");
         assert_eq!(studio_content_type(Path::new("app.css")), "text/css; charset=utf-8");
+    }
+
+    #[test]
+    fn dataset_cache_does_not_pin_snapshot_after_request() {
+        use crate::{bucket_root, ColumnSchema, LogicalType, Normalization};
+
+        let root = tempfile::tempdir().unwrap();
+        create_bucket(root.path(), "victim", "Victim").unwrap();
+        let bucket = bucket_root(root.path(), "victim").unwrap();
+        let source = root.path().join("victim.csv");
+        fs::write(&source, "email\na@example.com\n").unwrap();
+        let schema = DatasetSchema::new(vec![ColumnSchema {
+            name: "email".into(),
+            logical_type: LogicalType::Text,
+            nullable: false,
+            normalization: Normalization::TrimLowercase,
+            null_values: vec![],
+        }])
+        .unwrap();
+
+        import_csv(&bucket, &source, &schema, &CsvImportConfig::default()).unwrap();
+        let cache = Mutex::new(HashMap::<String, Weak<VersionedDataset>>::new());
+
+        let dataset = cached_dataset(&cache, "victim", &bucket).unwrap();
+        assert!(!leased_generation_ids(&bucket).unwrap().is_empty());
+        drop(dataset);
+
+        assert!(leased_generation_ids(&bucket).unwrap().is_empty());
+        delete_bucket(root.path(), "victim").unwrap();
+        assert!(list_buckets(root.path())
+            .unwrap()
+            .into_iter()
+            .all(|bucket| bucket.id != "victim"));
     }
 }
