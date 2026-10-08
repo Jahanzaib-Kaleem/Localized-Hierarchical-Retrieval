@@ -286,8 +286,8 @@ pub(super) fn create_export(
     let structured = json!({
         "bucket":args.bucket,
         "format":args.format.as_str(),
-        "file_name":file_name,
-        "download_url":uri,
+        "file_name":file_name.clone(),
+        "download_url":uri.clone(),
         "expires_at_epoch":expires_at_epoch,
         "expires_minutes":args.expires_minutes,
         "max_rows":args.max_rows,
@@ -463,7 +463,7 @@ fn encode_csv_rows(
 ) -> io::Result<Vec<u8>> {
     let mut writer = csv::WriterBuilder::new().from_writer(Vec::new());
     for row in rows {
-        let mut record = Vec::with_capacity(row.values.len() + usize::from(include_row_id));
+        let mut record = Vec::with_capacity(row.values.len() + if include_row_id { 1 } else { 0 });
         if include_row_id {
             record.push(row.row_id.to_string());
         }
