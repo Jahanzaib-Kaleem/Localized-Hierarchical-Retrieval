@@ -93,6 +93,12 @@ fn all_tools() -> Vec<(ServiceRole, Value)> {
             "inputSchema":query_schema(),"annotations":annotation(true,false,true)
         })),
         (ServiceRole::Read, json!({
+            "name":"lhr_export","title":"Export LHR data",
+            "description":"Create a short-lived streamed download for a query result without placing bulk rows in model context. Returns a standard MCP resource_link plus an HTTPS fallback URL. CSV and JSONL downloads are generated on demand with bounded memory and are suitable for very large exports, including files larger than 1 GB.",
+            "inputSchema":super::export::tool_schema(),
+            "annotations":annotation(true,false,false)
+        })),
+        (ServiceRole::Read, json!({
             "name":"lhr_row","title":"Fetch row",
             "description":"Fetch one visible logical row by stable row ID.",
             "inputSchema":{"type":"object","required":["row_id"],"properties":{"bucket":{"type":"string","default":"default"},"row_id":{"type":"integer","minimum":0}},"additionalProperties":false},
@@ -241,9 +247,41 @@ pub(super) fn required_role(name: &str) -> Option<ServiceRole> {
     })
 }
 
-pub(super) fn tool_ok(value: Value) -> Value {
-    let text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
-    json!({"content":[{"type":"text","text":text}],"structuredContent":value,"isError":false})
+pub(super) enum ToolOutcome {
+    Json(Value),
+    ResourceLink {
+        structured: Value,
+        uri: String,
+        name: String,
+        mime_type: String,
+        description: String,
+    },
+}
+
+pub(super) fn tool_ok(outcome: ToolOutcome) -> Value {
+    match outcome {
+        ToolOutcome::Json(value) => {
+            let text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
+            json!({"content":[{"type":"text","text":text}],"structuredContent":value,"isError":false})
+        }
+        ToolOutcome::ResourceLink { structured, uri, name, mime_type, description } => {
+            let text = serde_json::to_string(&structured).unwrap_or_else(|_| "{}".into());
+            json!({
+                "content":[
+                    {"type":"text","text":text},
+                    {
+                        "type":"resource_link",
+                        "uri":uri,
+                        "name":name,
+                        "mimeType":mime_type,
+                        "description":description
+                    }
+                ],
+                "structuredContent":structured,
+                "isError":false
+            })
+        }
+    }
 }
 
 pub(super) fn tool_error(message: impl Into<String>) -> Value {
@@ -587,13 +625,28 @@ pub(super) fn call_tool(
     role: ServiceRole,
     name: &str,
     arguments: Value,
-) -> Result<Value, String> {
+    public_base_url: Option<&str>,
+) -> Result<ToolOutcome, String> {
     let required = required_role(name).ok_or_else(|| format!("unknown MCP tool {name}"))?;
     if role < required {
         return Err("insufficient API-key role for tool".into());
     }
 
-    match name {
+    if name == "lhr_export" {
+        let base_url = public_base_url.ok_or_else(|| {
+            "cannot create a downloadable export URL because the public MCP host is unknown; forward Host/X-Forwarded-Host or set LHR_PUBLIC_BASE_URL".to_string()
+        })?;
+        let link = super::export::create_export(state, arguments, base_url)?;
+        return Ok(ToolOutcome::ResourceLink {
+            structured: link.structured,
+            uri: link.uri,
+            name: link.name,
+            mime_type: link.mime_type,
+            description: link.description,
+        });
+    }
+
+    let value = match name {
         "lhr_query" => {
             let args: BucketQueryArgs = parse(arguments)?;
             let root = selected_root(state, &args.bucket)?;
@@ -828,7 +881,8 @@ pub(super) fn call_tool(
             }
         }
         _ => Err(format!("unknown MCP tool {name}")),
-    }
+    }?;
+    Ok(ToolOutcome::Json(value))
 }
 
 fn diagnostics(state: &McpState, bucket: &str) -> Result<Value, String> {
@@ -979,6 +1033,7 @@ mod tests {
         assert!(names.contains(&"lhr_mutate".to_string()));
         assert!(names.contains(&"lhr_bucket_transfer_rows".to_string()));
         assert!(names.contains(&"lhr_buckets".to_string()));
+        assert!(names.contains(&"lhr_export".to_string()));
         assert!(!names.contains(&"lhr_vacuum".to_string()));
         assert!(!names.contains(&"lhr_update".to_string()));
 
@@ -994,5 +1049,19 @@ mod tests {
     fn percentile_is_bounded() {
         assert_eq!(percentile(&[1, 2, 3, 4], 0.50), 3);
         assert_eq!(percentile(&[1, 2, 3, 4], 0.99), 4);
+    }
+
+    #[test]
+    fn resource_link_result_keeps_standard_content_shape() {
+        let value = tool_ok(ToolOutcome::ResourceLink {
+            structured: json!({"download_url":"https://example.test/export.csv"}),
+            uri: "https://example.test/export.csv".into(),
+            name: "export.csv".into(),
+            mime_type: "text/csv".into(),
+            description: "download".into(),
+        });
+        assert_eq!(value["content"][1]["type"], "resource_link");
+        assert_eq!(value["content"][1]["mimeType"], "text/csv");
+        assert_eq!(value["structuredContent"]["download_url"], "https://example.test/export.csv");
     }
 }

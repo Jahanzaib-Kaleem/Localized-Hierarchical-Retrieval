@@ -123,6 +123,18 @@ The legacy `POST /v1/admin/import/csv` endpoint remains for compatible clients a
 
 See [INGESTION.md](INGESTION.md) for append atomicity, cleanup, duplicate behavior and reverse-proxy guidance.
 
+### Large MCP exports
+
+The appliance MCP listener exposes `lhr_export` for result sets that should be downloaded rather than paged into model context. The tool accepts the same typed filter shapes as `lhr_query`, optional projection, an optional starting row ID, an optional maximum row count, and CSV or JSONL output.
+
+`lhr_export` does not build the whole file inside the MCP response. It mints a cryptographically random, short-lived capability URL and returns it both as a standard MCP `resource_link` and as `download_url` in structured/text output for clients that do not yet render resource links. The download endpoint streams query pages with bounded memory, so multi-gigabyte exports do not require an equally large temporary file or model context.
+
+Capability URLs are bearer secrets. They contain no database filters or API credentials, expire automatically (60 minutes by default, configurable per export up to 24 hours), and are stored only in appliance memory. They stop working after expiry or an appliance restart. The endpoint intentionally does not require the normal MCP Authorization header because browser/native-host download fetches do not reliably forward MCP credentials.
+
+By default the appliance derives the public download origin from `X-Forwarded-Proto` / `X-Forwarded-Host` (falling back to `Host`). Set `LHR_PUBLIC_BASE_URL=https://your-public-host` when a reverse proxy rewrites hosts or mounts LHR behind a nonstandard external origin. The returned path is under `/mcp/exports/<token>`; `/exports/<token>` is also served for direct-origin deployments.
+
+The server itself does not impose a file-size ceiling on streamed exports. The consuming AI product may still impose its own attachment or ingestion limit; the capability URL remains usable as a normal download even when a host will not ingest the entire file into model context.
+
 ## Query protocol
 
 `POST /v1/query` accepts the same `QueryRequest` used by the Rust library and `lhr query-json`.
