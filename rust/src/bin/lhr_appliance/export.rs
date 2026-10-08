@@ -332,11 +332,22 @@ pub(super) async fn download(
             .into_response();
     };
 
+    let permit = match state.export_downloads.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "too many export downloads are already active; retry shortly",
+            )
+                .into_response();
+        }
+    };
     let content_type = grant.format.mime_type();
     let file_name = grant.file_name.clone();
     let root = state.root.clone();
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(2);
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         if let Err(error) = stream_export(&root, &grant, &tx) {
             let _ = tx.blocking_send(Err(error));
         }
@@ -362,6 +373,10 @@ pub(super) async fn download(
     response.headers_mut().insert(
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
     );
     response
 }
