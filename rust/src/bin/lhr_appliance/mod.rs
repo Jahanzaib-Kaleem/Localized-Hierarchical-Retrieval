@@ -1,3 +1,4 @@
+mod export;
 mod tools;
 
 use axum::{
@@ -58,6 +59,7 @@ pub(super) struct McpState {
     rates: Arc<Mutex<HashMap<String, RateWindow>>>,
     semaphore: Arc<Semaphore>,
     pub counters: Arc<McpCounters>,
+    pub exports: export::ExportRegistry,
 }
 
 struct RequestGuard {
@@ -112,6 +114,7 @@ impl McpServer {
                 rates: Arc::new(Mutex::new(HashMap::new())),
                 semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
                 counters: Arc::new(McpCounters::default()),
+                exports: export::new_registry(),
             },
             bind,
             max_body_bytes,
@@ -122,6 +125,8 @@ impl McpServer {
         let app = Router::new()
             .route("/healthz", get(health))
             .route("/mcp", post(mcp))
+            .route("/mcp/exports/{token}", get(export::download))
+            .route("/exports/{token}", get(export::download))
             .layer(DefaultBodyLimit::max(self.max_body_bytes))
             .with_state(self.state);
         let listener = tokio::net::TcpListener::bind(self.bind).await?;
@@ -230,6 +235,43 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str
     headers.get(name)?.to_str().ok()
 }
 
+fn forwarded_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
+    header_text(headers, name)?
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn public_base_url(headers: &HeaderMap, behind_tls_proxy: bool) -> Option<String> {
+    if let Ok(configured) = std::env::var("LHR_PUBLIC_BASE_URL") {
+        let configured = configured.trim().trim_end_matches('/');
+        if (configured.starts_with("https://") || configured.starts_with("http://"))
+            && !configured.chars().any(char::is_whitespace)
+        {
+            return Some(configured.to_owned());
+        }
+    }
+
+    let host = forwarded_value(headers, "x-forwarded-host")
+        .or_else(|| header_text(headers, header::HOST.as_str()).map(str::trim))?;
+    if host.is_empty()
+        || host.chars().any(char::is_whitespace)
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains('?')
+        || host.contains('#')
+    {
+        return None;
+    }
+    let proto = forwarded_value(headers, "x-forwarded-proto")
+        .unwrap_or(if behind_tls_proxy { "https" } else { "http" });
+    if proto != "https" && proto != "http" {
+        return None;
+    }
+    Some(format!("{proto}://{host}"))
+}
+
 fn validate_modern_headers(headers: &HeaderMap, request: &RpcRequest) -> Result<bool, String> {
     let version = header_text(headers, MCP_PROTOCOL_HEADER);
     let modern = version == Some(MCP_CURRENT);
@@ -256,7 +298,7 @@ fn discover_result() -> Value {
     json!({
         "supportedVersions":[MCP_CURRENT,MCP_LEGACY],
         "capabilities":{"tools":{"listChanged":false}},
-        "instructions":"LHR is an exact structured database. Prefer bounded cursor-paginated lhr_query calls for lead retrieval. Diagnostics and benchmark tools expose real storage/process behavior; write/admin tools are role-gated.",
+        "instructions":"LHR is an exact structured database. Prefer bounded cursor-paginated lhr_query calls for small lead retrieval. Use lhr_export for downloadable large result sets instead of paging bulk data into model context. Diagnostics and benchmark tools expose real storage/process behavior; write/admin tools are role-gated.",
         "ttlMs":30000,
         "cacheScope":"private"
     })
@@ -267,7 +309,7 @@ fn initialize_result() -> Value {
         "protocolVersion":MCP_LEGACY,
         "capabilities":{"tools":{"listChanged":false}},
         "serverInfo":server_meta(),
-        "instructions":"LHR is an exact structured database. Prefer bounded cursor-paginated lhr_query calls."
+        "instructions":"LHR is an exact structured database. Prefer bounded cursor-paginated lhr_query calls for small retrieval and lhr_export for large downloadable result sets."
     })
 }
 
@@ -345,8 +387,16 @@ async fn mcp(
                 let role = guard.role;
                 let tool_name = params.name;
                 let arguments = params.arguments;
+                let base_url = public_base_url(&headers, state.config.behind_tls_proxy);
                 match tokio::task::spawn_blocking(move || {
-                    tools::call_tool(&state_copy, &actor, role, &tool_name, arguments)
+                    tools::call_tool(
+                        &state_copy,
+                        &actor,
+                        role,
+                        &tool_name,
+                        arguments,
+                        base_url.as_deref(),
+                    )
                 })
                 .await
                 {
