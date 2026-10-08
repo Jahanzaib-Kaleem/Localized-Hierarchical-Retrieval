@@ -60,6 +60,7 @@ pub(super) struct McpState {
     semaphore: Arc<Semaphore>,
     pub counters: Arc<McpCounters>,
     pub exports: export::ExportRegistry,
+    pub export_downloads: Arc<Semaphore>,
 }
 
 struct RequestGuard {
@@ -115,6 +116,7 @@ impl McpServer {
                 semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
                 counters: Arc::new(McpCounters::default()),
                 exports: export::new_registry(),
+                export_downloads: Arc::new(Semaphore::new(2)),
             },
             bind,
             max_body_bytes,
