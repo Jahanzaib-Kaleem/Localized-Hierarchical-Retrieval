@@ -254,7 +254,7 @@ fn public_base_url(headers: &HeaderMap, behind_tls_proxy: bool) -> Option<String
     }
 
     let host = forwarded_value(headers, "x-forwarded-host")
-        .or_else(|| header_text(headers, header::HOST.as_str()).map(str::trim))?;
+        .or_else(|| header_text(headers, "host").map(str::trim))?;
     if host.is_empty()
         || host.chars().any(char::is_whitespace)
         || host.contains('/')
