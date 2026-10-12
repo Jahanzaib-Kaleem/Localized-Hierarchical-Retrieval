@@ -170,7 +170,7 @@ fn start_job(state:&McpState,args:Args)->Result<Value,String>{
         .open(control.join(".active.lock")).map_err(|e|e.to_string())?;
     lock.try_lock_exclusive().map_err(|_|"another Parquet import is active".to_string())?;
 
-    let bucket=create_bucket(&state.root,&id,&name).map_err(|e|e.to_string())?;
+    create_bucket(&state.root,&id,&name).map_err(|e|e.to_string())?;
     let root=state.root.clone();
     let bucket_root=root.join("buckets").join(&id);
     let job=random_id();
@@ -181,6 +181,7 @@ fn start_job(state:&McpState,args:Args)->Result<Value,String>{
     });
     save_status(&root,&job,&initial)?;
     let job_clone=job.clone();
+    let source_count=files.len();
     thread::Builder::new().name("lhr-parquet-import-monitor".into()).spawn(move ||{
         let _lock=lock;
         let outcome=run_import(&root,&job_clone,&bucket_root,&schema,&profile,&files,max_gib);
@@ -192,7 +193,7 @@ fn start_job(state:&McpState,args:Args)->Result<Value,String>{
     }).map_err(|e|e.to_string())?;
     Ok(json!({
         "job_id":job,"status":"queued","bucket_id":id,"bucket_name":name,
-        "source_files":files.len(),"max_bucket_gib":max_gib,
+        "source_files":source_count,"max_bucket_gib":max_gib,
         "note":"Native Parquet import runs with a hard bucket-size cap and free-disk reserve. Monitor with action=status."
     }))
 }
