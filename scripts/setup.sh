@@ -247,6 +247,85 @@ EOF
 
 install_self_update_agent
 
+install_sandbox_sidecar() {
+  # Commands run only in their own network-enabled Docker container.
+  # No host root, LHR data volume, or Docker socket is available to the worker.
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "LHR sandbox not enabled: run setup.sh as root once to install the sidecar." >&2
+    return 0
+  fi
+  SANDBOX_NAME="$CONTAINER_NAME-sandbox"
+  SANDBOX_VOLUME="${LHR_SANDBOX_VOLUME:-lhr-sandbox-workspace}"
+  IMPORTS_DIR="${LHR_SANDBOX_IMPORTS_DIR:-}"
+  if docker ps -a --filter "name=^/$SANDBOX_NAME$" --format '{{.Names}}' | grep -qx "$SANDBOX_NAME"; then
+    if [ "${LHR_SANDBOX_VOLUME+x}" != x ]; then
+      PREVIOUS_VOLUME="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}{{end}}{{end}}' "$SANDBOX_NAME" 2>/dev/null || true)"
+      [ -n "$PREVIOUS_VOLUME" ] && SANDBOX_VOLUME="$PREVIOUS_VOLUME"
+    fi
+    if [ "${LHR_SANDBOX_IMPORTS_DIR+x}" != x ]; then
+      IMPORTS_DIR="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/imports"}}{{.Source}}{{end}}{{end}}' "$SANDBOX_NAME" 2>/dev/null || true)"
+    fi
+  fi
+
+  HOST_DATA_PATH="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+  if [ -z "$HOST_DATA_PATH" ] || [ ! -d "$HOST_DATA_PATH" ]; then
+    echo "LHR sandbox not enabled: cannot locate the persistent LHR volume." >&2
+    return 0
+  fi
+  SANDBOX_CONTROL="$HOST_DATA_PATH/control/sandbox"
+  install -d -m 0700 -o 10001 -g 10001 "$SANDBOX_CONTROL" "$SANDBOX_CONTROL/requests" "$SANDBOX_CONTROL/responses"
+  rm -f "$SANDBOX_CONTROL/enabled"
+
+  # Only chown the workspace mountpoint, not its possibly large contents.
+  if ! docker run --rm --user 0:0 --entrypoint /usr/bin/chown \
+      -v "$SANDBOX_VOLUME:/workspace" "$IMAGE" 10001:10001 /workspace >/dev/null; then
+    echo "LHR sandbox not enabled: failed to prepare its separate workspace." >&2
+    return 0
+  fi
+
+  if [ -n "$IMPORTS_DIR" ]; then
+    if [ ! -d "$IMPORTS_DIR" ]; then
+      echo "LHR sandbox not enabled: imports directory does not exist: $IMPORTS_DIR" >&2
+      return 0
+    fi
+    case "$IMPORTS_DIR" in
+      /|/etc|/root|/proc|/sys|/dev|/var/run)
+        echo "LHR sandbox not enabled: system directories cannot be mounted." >&2
+        return 0 ;;
+    esac
+  fi
+
+  if docker ps -a --filter "name=^/$SANDBOX_NAME$" --format '{{.Names}}' | grep -qx "$SANDBOX_NAME"; then
+    docker rm -f "$SANDBOX_NAME" >/dev/null || return 0
+  fi
+
+  set -- docker run -d --name "$SANDBOX_NAME" --restart unless-stopped \
+    --user 10001:10001 --read-only --cap-drop ALL \
+    --security-opt no-new-privileges --pids-limit 256 --memory 1g --cpus 2 \
+    --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+    -e HOME=/workspace -e PYTHONDONTWRITEBYTECODE=1 \
+    -v "$SANDBOX_CONTROL:/control" -v "$SANDBOX_VOLUME:/workspace"
+  if [ -n "$IMPORTS_DIR" ]; then
+    set -- "$@" -v "$IMPORTS_DIR:/imports:ro"
+  fi
+  if ! "$@" --entrypoint /usr/bin/python3 "$IMAGE" -u /usr/local/lib/lhr/sandbox_worker.py >/dev/null; then
+    echo "LHR sandbox not enabled: failed to launch sidecar." >&2
+    return 0
+  fi
+  sleep 1
+  if [ "$(docker inspect -f '{{.State.Running}}' "$SANDBOX_NAME" 2>/dev/null || true)" != "true" ]; then
+    echo "LHR sandbox not enabled: worker exited during startup." >&2
+    return 0
+  fi
+  : > "$SANDBOX_CONTROL/enabled"
+  chown 10001:10001 "$SANDBOX_CONTROL/enabled"
+  chmod 0600 "$SANDBOX_CONTROL/enabled"
+  echo "LHR sandbox ready: $SANDBOX_NAME (network-enabled, persistent workspace)."
+  [ -z "$IMPORTS_DIR" ] || echo "Sandbox imports (read-only): $IMPORTS_DIR -> /imports"
+}
+
+install_sandbox_sidecar
+
 printf '\nLHR is %s.\n' "$([ "$EXISTING" -eq 1 ] && printf 'upgraded' || printf 'installed')"
 printf 'Studio: http://127.0.0.1:%s\n' "$STUDIO_PORT"
 printf 'MCP:    http://127.0.0.1:%s/mcp\n' "$MCP_PORT"
