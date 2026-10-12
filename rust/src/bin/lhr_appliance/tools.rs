@@ -99,6 +99,12 @@ fn all_tools() -> Vec<(ServiceRole, Value)> {
             "annotations":annotation(true,false,false)
         })),
         (ServiceRole::Admin, json!({
+            "name":"lhr_parquet_import","title":"Capped Parquet import",
+            "description":"Import already staged Apollo Parquet shards into a new native LHR hybrid bucket. Uses the on-disk copied shards and schema/profile, supports ZSTD, enforces a maximum resulting bucket size up to 70 GiB, retains a free-disk reserve, and returns a job ID for status polling. Does not modify the source files.",
+            "inputSchema":super::parquet_job::tool_schema(),
+            "annotations":annotation(false,true,false)
+        })),
+        (ServiceRole::Admin, json!({
             "name":"sandbox","title":"Isolated Bash sandbox",
             "description":"Run Bash commands with Python, curl, git and Unix tools inside a network-enabled persistent sandbox container. No VPS root, LHR data volume, or Docker socket. Optional explicit host imports appear read-only at /imports. Use action=run then action=status.",
             "inputSchema":super::sandbox::tool_schema(),
@@ -636,6 +642,13 @@ pub(super) fn call_tool(
     let required = required_role(name).ok_or_else(|| format!("unknown MCP tool {name}"))?;
     if role < required {
         return Err("insufficient API-key role for tool".into());
+    }
+
+    if name == "lhr_parquet_import" {
+        let action = arguments.get("action").and_then(Value::as_str).unwrap_or("unknown").to_owned();
+        let result = super::parquet_job::call(state,arguments);
+        audit(state,actor,"parquet_import",result.is_ok(),json!({"action":action}));
+        return result.map(ToolOutcome::Json);
     }
 
     if name == "sandbox" {
