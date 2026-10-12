@@ -98,6 +98,12 @@ fn all_tools() -> Vec<(ServiceRole, Value)> {
             "inputSchema":super::export::tool_schema(),
             "annotations":annotation(true,false,false)
         })),
+        (ServiceRole::Admin, json!({
+            "name":"sandbox","title":"Isolated Bash sandbox",
+            "description":"Run Bash commands with Python, curl, git and Unix tools inside a network-enabled persistent sandbox container. No VPS root, LHR data volume, or Docker socket. Optional explicit host imports appear read-only at /imports. Use action=run then action=status.",
+            "inputSchema":super::sandbox::tool_schema(),
+            "annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}
+        })),
         (ServiceRole::Read, json!({
             "name":"lhr_row","title":"Fetch row",
             "description":"Fetch one visible logical row by stable row ID.",
@@ -632,6 +638,10 @@ pub(super) fn call_tool(
         return Err("insufficient API-key role for tool".into());
     }
 
+    if name == "sandbox" {
+        return Ok(ToolOutcome::Json(super::sandbox::call(state, arguments)?));
+    }
+
     if name == "lhr_export" {
         let base_url = public_base_url.ok_or_else(|| {
             "cannot create a downloadable export URL because the public MCP host is unknown; forward Host/X-Forwarded-Host or set LHR_PUBLIC_BASE_URL".to_string()
@@ -1042,6 +1052,8 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect();
         assert!(admin_names.contains(&"lhr_update".to_string()));
+        assert!(admin_names.contains(&"sandbox".to_string()));
+        assert!(!names.contains(&"sandbox".to_string()));
         assert!(admin_names.contains(&"lhr_bucket_combine".to_string()));
     }
 
