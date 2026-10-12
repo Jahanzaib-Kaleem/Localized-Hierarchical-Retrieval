@@ -104,7 +104,11 @@ def process_pending():
         if response_path.exists():
             try:
                 prior = json.loads(response_path.read_text(encoding="utf-8"))
-                if prior.get("status") in {"running", "complete", "timed_out", "failed"}:
+                if prior.get("status") == "running":
+                    save_response(key, {"status": "failed", "error": "sandbox worker interrupted before completing the command"})
+                    request_path.unlink(missing_ok=True)
+                    continue
+                if prior.get("status") in {"complete", "timed_out", "failed"}:
                     request_path.unlink(missing_ok=True)
                     continue
             except (OSError, ValueError):
@@ -128,6 +132,7 @@ def process_pending():
 if __name__ == "__main__":
     QUEUE.mkdir(parents=True, exist_ok=True)
     RESULTS.mkdir(parents=True, exist_ok=True)
+    Path("/control/enabled").touch()
     while True:
         process_pending()
         time.sleep(0.3)
