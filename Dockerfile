@@ -16,8 +16,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 lhr \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin lhr \
-    && mkdir -p /data/control/sandbox/requests /data/control/sandbox/responses /workspace /opt/lhr/studio /usr/local/lib/lhr \
-    && chown -R lhr:lhr /data /workspace
+    && mkdir -p /data/control/sandbox/requests /data/control/sandbox/responses /control/requests /control/responses /workspace /opt/lhr/studio /usr/local/lib/lhr \
+    && chown -R lhr:lhr /data /control /workspace
 COPY --from=rust-build /build/rust/target/release/lhr /usr/local/bin/lhr
 COPY --from=rust-build /build/rust/target/release/lhr-appliance /usr/local/bin/lhr-appliance
 COPY --from=rust-build /build/rust/target/release/lhr-parquet-import /usr/local/bin/lhr-parquet-import
