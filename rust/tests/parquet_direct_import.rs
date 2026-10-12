@@ -11,6 +11,14 @@ use parquet::{
 use std::{fs::File, path::Path, sync::Arc};
 
 fn write_source(path: &Path, rows: &[(&str, &str, i32, &str)]) {
+    write_source_with_compression(path, rows, parquet::basic::Compression::UNCOMPRESSED)
+}
+
+fn write_source_with_compression(
+    path: &Path,
+    rows: &[(&str, &str, i32, &str)],
+    compression: parquet::basic::Compression,
+) {
     let schema = Arc::new(
         parse_message_type(
             r#"
@@ -24,7 +32,7 @@ fn write_source(path: &Path, rows: &[(&str, &str, i32, &str)]) {
         )
         .unwrap(),
     );
-    let props = Arc::new(WriterProperties::builder().build());
+    let props = Arc::new(WriterProperties::builder().set_compression(compression).build());
     let mut writer = SerializedFileWriter::new(File::create(path).unwrap(), schema, props).unwrap();
     let mut row_group = writer.next_row_group().unwrap();
 
@@ -218,4 +226,42 @@ fn direct_parquet_shards_import_without_csv_and_compaction_stays_hybrid() {
     assert_eq!(result.hits, 1);
     assert_eq!(result.rows_checked, 0);
     assert_eq!(result.pages_touched, 0);
+}
+
+#[test]
+fn direct_zstd_parquet_import_and_exact_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("zstd-shard.parquet");
+    write_source_with_compression(
+        &source,
+        &[
+            ("zstd-one@example.com", "US", 10, "a zstd-compressed profile"),
+            ("zstd-two@example.com", "GB", 20, "another zstd-compressed profile"),
+        ],
+        parquet::basic::Compression::ZSTD(Default::default()),
+    );
+
+    let target = dir.path().join("zstd-lhr");
+    let config = ParquetImportConfig {
+        cold_columns: vec![1, 2, 3],
+        ..ParquetImportConfig::default()
+    };
+    let report = import_parquet_shards_initial(&target, &[source.clone()], &schema(), &config)
+        .expect("ZSTD sources should import without a CSV intermediate");
+    assert_eq!(report.rows, 2);
+    assert!(source.is_file());
+    let dataset = VersionedDataset::open(&target).unwrap();
+    let result = dataset
+        .query_values(
+            &[LogicalPredicate {
+                column: "email".into(),
+                value: Some("zstd-two@example.com".into()),
+            }],
+            Some(&["country".into(), "score".into()]),
+            10,
+        )
+        .unwrap();
+    assert_eq!(result.hits, 1);
+    assert_eq!(result.rows[0].values[0].value.as_deref(), Some("GB"));
+    assert_eq!(result.rows[0].values[1].value.as_deref(), Some("20"));
 }
