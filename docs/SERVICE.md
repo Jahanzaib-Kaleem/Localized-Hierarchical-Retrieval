@@ -135,6 +135,36 @@ By default the appliance derives the public download origin from `X-Forwarded-Pr
 
 The server itself does not impose a file-size ceiling on streamed exports. The consuming AI product may still impose its own attachment or ingestion limit; the capability URL remains usable as a normal download even when a host will not ingest the entire file into model context.
 
+### Isolated Bash sandbox (admin MCP)
+
+The MCP server advertises one admin-only tool named `sandbox`. Actions are `info`,
+`run`, and `status`. Use `run` with Bash commands and retrieve output with
+`status` and the returned `request_id`. Python, curl, git, Unix utilities, and
+outbound networking are available. Work persists in a dedicated `/workspace`
+Docker volume.
+
+The worker runs in a **separate unprivileged Docker container** with no host
+filesystem, Docker socket or LHR data mount. Its root filesystem is read-only,
+and process count, memory, output and execution time are bounded. It receives
+requests exclusively through a shared control queue and has no network listener.
+
+The normal root-run `scripts/setup.sh` installer provisions this sidecar and
+retains its workspace across upgrades. Operators can set
+`LHR_SANDBOX_IMPORTS_DIR=/srv/parquet` when running the installer to mount
+that explicitly chosen directory **read-only** at `/imports`. Without it, no
+host directory is mounted. The Docker Compose configuration uses separate
+persistent volumes; add an explicit read-only import mount there if desired.
+
+Example:
+
+```json
+{"action":"run","command":"pwd; ls -lah; python3 --version; curl -I https://example.com"}
+{"action":"status","request_id":"<32-character-id>"}
+```
+
+This tool cannot reboot the VPS or modify arbitrary host files. Only trusted
+admin connections should be granted the tool, since commands can reach the network.
+
 ## Query protocol
 
 `POST /v1/query` accepts the same `QueryRequest` used by the Rust library and `lhr query-json`.
