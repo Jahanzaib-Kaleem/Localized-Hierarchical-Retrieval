@@ -639,7 +639,20 @@ pub(super) fn call_tool(
     }
 
     if name == "sandbox" {
-        return Ok(ToolOutcome::Json(super::sandbox::call(state, arguments)?));
+        let action = arguments.get("action").and_then(Value::as_str).unwrap_or("unknown").to_owned();
+        let result = super::sandbox::call(state, arguments);
+        let request_id = result
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("request_id"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        // Record the actor and operation, never raw shell commands or output.
+        audit(state, actor, "sandbox", result.is_ok(), json!({
+            "action": action,
+            "request_id": request_id,
+        }));
+        return result.map(ToolOutcome::Json);
     }
 
     if name == "lhr_export" {
