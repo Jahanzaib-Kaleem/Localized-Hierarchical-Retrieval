@@ -206,7 +206,15 @@ def run():
     columns = [c["name"] for c in schema["columns"]]
     if len(columns) != 114 or len(columns) != manifest["columns"]:
         raise ValueError("attached schema changed")
-    con = duckdb.connect(config={"threads": 1, "memory_limit": "300MB", "preserve_insertion_order": True})
+    # Spill only to the dedicated data disk, with a strict scratch-space ceiling.
+    scratch = BASE / ".duckdb-query-temp"
+    con = duckdb.connect(config={
+        "threads": 1,
+        "memory_limit": "300MB",
+        "preserve_insertion_order": True,
+        "temp_directory": str(scratch),
+        "max_temp_directory_size": "1GB",
+    })
     timeout = max(1, min(120_000, int(request.get("timeout_ms") or 30_000)))
     timer = threading.Timer(timeout / 1000, con.interrupt)
     timer.daemon = True
