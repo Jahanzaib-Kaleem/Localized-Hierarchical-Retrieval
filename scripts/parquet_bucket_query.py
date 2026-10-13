@@ -181,7 +181,7 @@ def single_row(connection, request, manifest, columns):
     if selected_path is None:
         raise ValueError("could not resolve requested row")
     statement = (
-        f"SELECT * EXCLUDE (file_row_number, filename) "
+        f"SELECT {', '.join(identifier(c) for c in columns)} "
         f"FROM read_parquet({literal(selected_path)}, filename=true, file_row_number=true) "
         "WHERE file_row_number = ? LIMIT 1"
     )
