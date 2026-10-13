@@ -687,47 +687,64 @@ pub(super) fn call_tool(
             let args: BucketQueryArgs = parse(arguments)?;
             let root = selected_root(state, &args.bucket)?;
             let request = bounded_query(args.request, state)?;
-            let dataset = VersionedDataset::open(&root).map_err(|error| error.to_string())?;
-            let indexes = planner_indexes_for_request(&dataset, &request)
-                .map_err(|error| error.to_string())?;
-            let response = execute_query(&dataset, &request).map_err(|error| error.to_string())?;
-            record_query(&root, &request, &response, indexes)
-                .map_err(|error| error.to_string())?;
-            serde_json::to_value(response).map_err(|error| error.to_string())
+            if super::parquet_attached::attached(&root)?.is_some() {
+                let value = serde_json::to_value(request).map_err(|e| e.to_string())?;
+                super::parquet_attached::query(state, value)
+            } else {
+                let dataset = VersionedDataset::open(&root).map_err(|error| error.to_string())?;
+                let indexes = planner_indexes_for_request(&dataset, &request)
+                    .map_err(|error| error.to_string())?;
+                let response = execute_query(&dataset, &request).map_err(|error| error.to_string())?;
+                record_query(&root, &request, &response, indexes)
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_value(response).map_err(|error| error.to_string())
+            }
         }
         "lhr_row" => {
             let args: RowArgs = parse(arguments)?;
             let root = selected_root(state, &args.bucket)?;
-            let dataset = VersionedDataset::open(root).map_err(|error| error.to_string())?;
-            let values = dataset
-                .row_values(args.row_id)
-                .map_err(|error| error.to_string())?;
-            Ok(match values {
-                Some(values) => {
-                    let mut row = Map::new();
-                    for (column, value) in dataset.schema().columns.iter().zip(values.into_iter()) {
-                        row.insert(
-                            column.name.clone(),
-                            value.map(Value::String).unwrap_or(Value::Null),
-                        );
+            if super::parquet_attached::attached(&root)?.is_some() {
+                super::parquet_attached::row(state, &args.bucket, args.row_id)
+            } else {
+                let dataset = VersionedDataset::open(root).map_err(|error| error.to_string())?;
+                let values = dataset
+                    .row_values(args.row_id)
+                    .map_err(|error| error.to_string())?;
+                Ok(match values {
+                    Some(values) => {
+                        let mut row = Map::new();
+                        for (column, value) in dataset.schema().columns.iter().zip(values.into_iter()) {
+                            row.insert(
+                                column.name.clone(),
+                                value.map(Value::String).unwrap_or(Value::Null),
+                            );
+                        }
+                        json!({"bucket":args.bucket,"row_id":args.row_id,"found":true,"values":row})
                     }
-                    json!({"bucket":args.bucket,"row_id":args.row_id,"found":true,"values":row})
-                }
-                None => json!({"bucket":args.bucket,"row_id":args.row_id,"found":false}),
-            })
+                    None => json!({"bucket":args.bucket,"row_id":args.row_id,"found":false}),
+                })
+            }
         }
         "lhr_schema" => {
             let args: BucketArgs = parse(arguments)?;
             let root = selected_root(state, &args.bucket)?;
-            let root = resolve_dataset_root(root).map_err(|error| error.to_string())?;
-            let schema = read_schema(root).map_err(|error| error.to_string())?;
-            serde_json::to_value(schema).map_err(|error| error.to_string())
+            if super::parquet_attached::attached(&root)?.is_some() {
+                super::parquet_attached::schema(state)
+            } else {
+                let root = resolve_dataset_root(root).map_err(|error| error.to_string())?;
+                let schema = read_schema(root).map_err(|error| error.to_string())?;
+                serde_json::to_value(schema).map_err(|error| error.to_string())
+            }
         }
         "lhr_stats" => {
             let args: BucketArgs = parse(arguments)?;
             let root = selected_root(state, &args.bucket)?;
-            serde_json::to_value(dataset_stats(root).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())
+            if let Some(manifest) = super::parquet_attached::attached(&root)? {
+                Ok(super::parquet_attached::stats(&manifest))
+            } else {
+                serde_json::to_value(dataset_stats(root).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())
+            }
         }
         "lhr_explain" => {
             let args: ExplainArgs = parse(arguments)?;
@@ -776,15 +793,28 @@ pub(super) fn call_tool(
         "lhr_verify" => {
             let args: BucketArgs = parse(arguments)?;
             let root = selected_root(state, &args.bucket)?;
-            serde_json::to_value(
-                verify_versioned_dataset(root).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())
+            if super::parquet_attached::attached(&root)?.is_some() {
+                super::parquet_attached::verify(state)
+            } else {
+                serde_json::to_value(
+                    verify_versioned_dataset(root).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())
+            }
         }
-        "lhr_buckets" => serde_json::to_value(
-            list_buckets(&state.root).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string()),
+        "lhr_buckets" => {
+            let mut buckets = list_buckets(&state.root).map_err(|error| error.to_string())?;
+            for bucket in &mut buckets {
+                let root = state.root.join("buckets").join(&bucket.id);
+                if let Some(manifest) = super::parquet_attached::attached(&root)? {
+                    bucket.ready = true;
+                    bucket.rows = manifest.row_count;
+                    bucket.columns = manifest.columns;
+                    bucket.total_bytes = manifest.source_bytes;
+                }
+            }
+            serde_json::to_value(buckets).map_err(|error| error.to_string())
+        },
         "lhr_bucket_create" => {
             let args: BucketCreateArgs = parse(arguments)?;
             mutating(state, actor, "bucket_create", json!({"id":args.id.clone(),"name":args.name.clone()}), || {
