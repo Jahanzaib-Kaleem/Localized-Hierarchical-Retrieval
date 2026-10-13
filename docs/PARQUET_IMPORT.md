@@ -14,6 +14,49 @@ LHR can import existing flat primitive Parquet shards directly into hybrid canon
 - The published generation is verified by default.
 - The command prints final `canonical_bytes`, `routing_bytes`, and `total_bytes`, so a real import immediately shows its actual disk footprint.
 
+## Full Apollo dataset: compressed attached bucket
+
+For very wide 50M-row datasets, the legacy native importer first spools the entire
+uncompressed text contents to scratch files. That is not safe on the current
+142 GiB data volume: the source's uncompressed pages alone exceed 150 GiB.
+
+The **attached Parquet bucket** instead keeps the 27 verified ZSTD-compressed
+shards on the LHR data volume as its canonical storage. LHR exposes a normal
+named bucket with all 50,761,482 rows and 114 columns through the existing
+\`lhr_buckets\`, \`lhr_schema\`, \`lhr_stats\`, \`lhr_query\`, \`lhr_row\`,
+and \`lhr_verify\` tools. It creates no uncompressed import spool or duplicate
+canonical dataset.
+
+This mode is **read-only and scan-backed**. It has no LHR native exact indexes
+yet. Queries use DuckDB's Parquet column projection and predicate pushdown,
+enforce bounded output and execution time, and provide stable row IDs and cursor
+pagination. Equality lookups on columns without useful Parquet statistics may
+require scanning many row groups. Do not represent this mode as equivalent in
+latency or index capabilities to a native LHR generation.
+
+Attachment is operator-initiated. Stage the complete verified shards,
+\`apollo-schema.json\`, \`apollo-manifest.json\`, \`.source-sha256\`, and
+\`.copied-sha256\` under
+\`/data/control/sandbox/apollo-import-source\`. An administrator can queue
+exactly one attachment by writing the following one-shot marker there:
+
+\`\`\`json
+{"action":"attach","bucket_id":"apollo-full-50m"}
+\`\`\`
+
+Save this as \`.attach-now.json\` before the next normal LHR software restart.
+On startup, the server validates filenames, file sizes, row counts, column
+count, schema, and previously recorded checksum comparison before creating the
+\`apollo-full-50m\` bucket. It consumes the marker and writes
+\`.attach-result.json\` into the staging directory. Source files are not
+modified or moved. The original \`/apollo\` backup on the host system disk
+remains separate and untouched.
+
+The attached bucket currently does not support native LHR mutations,
+accelerator indexes, compaction, or native streaming \`lhr_export\`. These
+operations require a future compatible native generation or attached-bucket
+implementation; the read-only query path is supported now.
+
 ## Source requirements
 
 The source files must have the same flat primitive schema and column names as the supplied `LHR-SCHEMA/1` file. Nested/list/map columns are rejected rather than silently flattened. Binary values used as text must be valid UTF-8.
