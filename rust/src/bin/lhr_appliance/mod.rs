@@ -126,6 +126,9 @@ impl McpServer {
     }
 
     pub async fn serve(self) -> io::Result<()> {
+        // The operator may stage one bounded Apollo import through the shared
+        // control volume before requesting a normal, data-preserving update.
+        parquet_job::maybe_start_staged_job(&self.state);
         let app = Router::new()
             .route("/healthz", get(health))
             .route("/mcp", post(mcp))
