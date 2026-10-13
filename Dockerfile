@@ -13,6 +13,7 @@ RUN cargo build --manifest-path rust/Cargo.toml --release --bin lhr --bin lhr-ap
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 bash curl git python3 python3-venv python3-pip jq wget unzip procps \
+    && python3 -m pip install --no-cache-dir --break-system-packages 'duckdb==1.4.1' \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 lhr \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin lhr \
@@ -23,6 +24,7 @@ COPY --from=rust-build /build/rust/target/release/lhr-appliance /usr/local/bin/l
 COPY --from=rust-build /build/rust/target/release/lhr-parquet-import /usr/local/bin/lhr-parquet-import
 COPY --from=studio-build /build/studio/dist/ /opt/lhr/studio/
 COPY --chown=lhr:lhr scripts/sandbox_worker.py /usr/local/lib/lhr/sandbox_worker.py
+COPY --chown=lhr:lhr scripts/parquet_bucket_query.py /usr/local/lib/lhr/parquet_bucket_query.py
 COPY --chown=lhr:lhr docker/entrypoint.sh /usr/local/bin/lhr-entrypoint
 RUN chmod 0755 /usr/local/bin/lhr-entrypoint
 ENV LHR_ROOT=/data \
