@@ -20,7 +20,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const MAX_GIB: u64 = 70;
+const MAX_GIB: u64 = 100;
 const MIN_FREE_GIB: u64 = 10;
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -45,7 +45,7 @@ pub(super) fn tool_schema() -> Value {
             "action":{"type":"string","enum":["start","status","info"]},
             "bucket_id":{"type":"string","description":"New named LHR bucket ID, such as apollo-full, required for start"},
             "bucket_name":{"type":"string","description":"Display name for the new bucket, required for start"},
-            "max_bucket_gib":{"type":"integer","minimum":1,"maximum":70,"default":70,
+            "max_bucket_gib":{"type":"integer","minimum":1,"maximum":100,"default":100,
                 "description":"Hard cap on generated LHR bucket storage, not the original staged Parquet files. Aborts and cleans the new bucket if exceeded."},
             "job_id":{"type":"string","description":"Opaque import job ID returned by start, required for status"}
         },
@@ -64,7 +64,7 @@ fn random_id() -> String {
 fn valid_id(id:&str)->bool {
     id.len()==32 && id.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn job_dir(root:&Path)->PathBuf {root.join("control").join("parquet-import-jobs")}
+fn job_dir(root:&Path)->PathBuf {root.join("control").join("sandbox").join("parquet-import-jobs")}
 fn source_dir(root:&Path)->PathBuf {root.join("control").join("sandbox").join("apollo-import-source")}
 fn job_status_file(root:&Path,id:&str)->PathBuf {job_dir(root).join(format!("{id}.json"))}
 fn save_status(root:&Path,id:&str,value:&Value)->Result<(),String>{
@@ -148,12 +148,57 @@ pub(super) fn call(state:&McpState,arguments:Value)->Result<Value,String>{
     }
 }
 
+
+/// Start one explicitly queued import after a normal LHR software update.
+/// Only the fixed, previously staged Apollo directory is accepted.
+/// This is not a general-purpose filesystem command executor.
+pub(super) fn maybe_start_staged_job(state:&McpState) {
+    let dir=source_dir(&state.root);
+    let request=dir.join(".start-import.json");
+    if !request.is_file() {return;}
+    let consumed=dir.join(".last-import-request.json");
+    // Rename first so any subsequent service restart cannot launch it twice.
+    if fs::rename(&request,&consumed).is_err(){return;}
+    let result=(|| -> Result<Value,String> {
+        let data=fs::read(&consumed).map_err(|e|e.to_string())?;
+        if data.len()>4096{return Err("queued import request exceeds 4 KiB".into());}
+        let args:Value=serde_json::from_slice(&data).map_err(|e|e.to_string())?;
+        let expected_bucket=args.get("bucket_id").and_then(Value::as_str);
+        if expected_bucket!=Some("apollo-full-50m") {
+            return Err("startup imports are restricted to the approved apollo-full-50m bucket".into());
+        }
+        if args.get("action").and_then(Value::as_str)!=Some("start") {
+            return Err("startup import request must use action=start".into());
+        }
+        let max=args.get("max_bucket_gib").and_then(Value::as_u64);
+        if max.is_none_or(|value| value>MAX_GIB || value<1) {
+            return Err("startup import requires a valid explicit max_bucket_gib".into());
+        }
+        let files=source_files(&dir)?;
+        if files.len()!=27 {
+            return Err(format!("expected all 27 copied Apollo Parquet shards, found {}",files.len()));
+        }
+        call(state,args)
+    })();
+    let output=match result {
+        Ok(value)=>json!({"accepted":true,"result":value,"checked_at_epoch":now_epoch()}),
+        Err(error)=>json!({"accepted":false,"error":error,"checked_at_epoch":now_epoch()}),
+    };
+    let destination=dir.join(".last-import-response.json");
+    let temporary=dir.join(".last-import-response.tmp");
+    if let Ok(bytes)=serde_json::to_vec_pretty(&output) {
+        if fs::write(&temporary,bytes).is_ok() {
+            let _=fs::rename(temporary,destination);
+        }
+    }
+}
+
 fn start_job(state:&McpState,args:Args)->Result<Value,String>{
     let id=args.bucket_id.ok_or("bucket_id required")?;
     let name=args.bucket_name.ok_or("bucket_name required")?;
     if id=="default" || name.trim().is_empty(){return Err("a new named bucket is required".into());}
     let max_gib=args.max_bucket_gib.unwrap_or(MAX_GIB);
-    if !(1..=MAX_GIB).contains(&max_gib){return Err("max_bucket_gib must be 1..=70".into());}
+    if !(1..=MAX_GIB).contains(&max_gib){return Err(format!("max_bucket_gib must be 1..={MAX_GIB}"));}
     let source=source_dir(&state.root);
     let files=source_files(&source)?;
     let schema=source.join("apollo-schema.json");
@@ -271,5 +316,5 @@ fn run_import(root:&Path,job:&str,bucket:&Path,schema:&Path,profile:&Path,source
 mod tests {
     use super::*;
     #[test] fn validates_job_ids(){assert!(valid_id("1234567890abcdef1234567890abcdef"));assert!(!valid_id("../etc/passwd"));}
-    #[test] fn schema_is_bounded(){assert_eq!(tool_schema()["properties"]["max_bucket_gib"]["maximum"],70);}
+    #[test] fn schema_is_bounded(){assert_eq!(tool_schema()["properties"]["max_bucket_gib"]["maximum"],100);}
 }
