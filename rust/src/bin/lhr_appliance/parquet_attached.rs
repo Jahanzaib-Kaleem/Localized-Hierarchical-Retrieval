@@ -12,6 +12,9 @@ use std::{
     process::{Command, Stdio},
 };
 
+// The VPS has less than 1 GiB physical RAM; never run multiple DuckDB scans concurrently.
+static ATTACHED_QUERY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const FORMAT: &str = "LHR-ATTACHED-PARQUET/1";
 const BUCKET_ID: &str = "apollo-full-50m";
 const EXPECTED_ROWS: u64 = 50_761_482;
@@ -204,6 +207,8 @@ pub(super) fn row(state: &McpState, bucket_id: &str, row_id: u64) -> Result<Valu
 }
 
 fn run_worker(_state: &McpState, request: Value) -> Result<Value, String> {
+    let _guard = ATTACHED_QUERY_LOCK.lock()
+        .map_err(|_| "attached Parquet query lock poisoned".to_string())?;
     let bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     if bytes.len() > 256 * 1024 {
         return Err("attached Parquet query exceeds size limit".into());
