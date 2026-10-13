@@ -1,4 +1,5 @@
 mod export;
+mod parquet_attached;
 mod parquet_job;
 mod sandbox;
 mod tools;
@@ -126,6 +127,9 @@ impl McpServer {
     }
 
     pub async fn serve(self) -> io::Result<()> {
+        // Install the operator-approved, read-only Apollo attachment at startup.
+        // Without an explicit one-shot marker, all existing buckets are unchanged.
+        parquet_attached::attach_staged_at_startup(&self.state);
         let app = Router::new()
             .route("/healthz", get(health))
             .route("/mcp", post(mcp))
