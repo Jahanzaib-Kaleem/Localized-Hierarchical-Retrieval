@@ -686,8 +686,13 @@ pub(super) fn call_tool(
         "lhr_query" => {
             let args: BucketQueryArgs = parse(arguments)?;
             let root = selected_root(state, &args.bucket)?;
-            let request = bounded_query(args.request, state)?;
-            if super::parquet_attached::attached(&root)?.is_some() {
+            let attached = super::parquet_attached::attached(&root)?.is_some();
+            let attached_timeout_ms = args.request.timeout_ms.unwrap_or(90_000).min(120_000).max(1);
+            let mut request = bounded_query(args.request, state)?;
+            if attached {
+                // Attached Parquet scans are slower than native exact-index queries.
+                // Give this read-only provider its own bounded deadline.
+                request.timeout_ms = Some(attached_timeout_ms);
                 let value = serde_json::to_value(request).map_err(|e| e.to_string())?;
                 super::parquet_attached::query(state, value)
             } else {
